@@ -289,6 +289,18 @@ const PROJECT_PAYLOAD_PROPERTY = 'payload';
 // Datastore's hard entity limit is ~1 MiB; stay clear of it.
 const MAX_PAYLOAD_BYTES = 900 * 1024;
 
+// A gs:// URI is at most bucket(63) + a fixed path, so ~200 bytes is generous.
+// This matters because avatarImageGcsUri is client-supplied and gets written to
+// an INDEXED property, where Datastore rejects anything over 1500 bytes — the
+// same failure class that made every save fail when a base64 reference image
+// ended up indexed.
+const MAX_GCS_URI_LENGTH = 500;
+
+const isSaneGcsUri = (value) =>
+    typeof value === 'string' &&
+    value.startsWith('gs://') &&
+    value.length <= MAX_GCS_URI_LENGTH;
+
 /**
  * Remove data that must never be persisted in Datastore: inline base64 images
  * and blob/data URLs. They are either huge or meaningless outside the tab that
@@ -304,7 +316,7 @@ const stripHeavyFields = (payload) => {
     }
     if (Array.isArray(clone.avatarHistory)) {
         clone.avatarHistory = clone.avatarHistory
-            .filter(a => a && typeof a.gcsUri === 'string' && a.gcsUri.startsWith('gs://'))
+            .filter(a => a && isSaneGcsUri(a.gcsUri))
             .slice(0, 24)
             .map(a => ({
                 gcsUri: a.gcsUri,
@@ -313,8 +325,14 @@ const stripHeavyFields = (payload) => {
                 createdAt: a.createdAt || null,
             }));
     }
-    if (typeof clone.avatarImageGcsUri === 'string' && !clone.avatarImageGcsUri.startsWith('gs://')) {
+    if (clone.avatarImageGcsUri !== undefined && clone.avatarImageGcsUri !== null
+        && !isSaneGcsUri(clone.avatarImageGcsUri)) {
+        console.warn('[Projects] Dropping implausible avatarImageGcsUri');
         delete clone.avatarImageGcsUri;
+    }
+    if (clone.avatarConfig && clone.avatarConfig.referenceImageGcsUri !== undefined
+        && !isSaneGcsUri(clone.avatarConfig.referenceImageGcsUri)) {
+        delete clone.avatarConfig.referenceImageGcsUri;
     }
     if (Array.isArray(clone.segments)) {
         clone.segments = clone.segments.map(seg => {
@@ -325,12 +343,11 @@ const stripHeavyFields = (payload) => {
             delete s.generatedUsingPrevUrl;
             // A data: URL here means the clip was returned inline and never
             // reached GCS — it cannot be restored, so don't store megabytes of it.
-            if (typeof s.videoGcsUri === 'string' && !s.videoGcsUri.startsWith('gs://')) {
+            if (s.videoGcsUri !== undefined && !isSaneGcsUri(s.videoGcsUri)) {
                 delete s.videoGcsUri;
             }
             if (Array.isArray(s.videoOptionGcsUris)) {
-                s.videoOptionGcsUris = s.videoOptionGcsUris.map(u =>
-                    (typeof u === 'string' && u.startsWith('gs://')) ? u : null);
+                s.videoOptionGcsUris = s.videoOptionGcsUris.map(u => (isSaneGcsUri(u) ? u : null));
             }
             return s;
         });

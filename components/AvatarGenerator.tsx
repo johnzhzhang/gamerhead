@@ -1,6 +1,7 @@
 
 import React, { useState, useEffect } from 'react';
 import NeonButton from './NeonButton';
+import { TextArea } from './TextInput';
 import { AvatarConfig } from '../types';
 import { generateStreamerAvatar } from '../services/gemini';
 
@@ -91,6 +92,11 @@ const AvatarGenerator: React.FC<AvatarGeneratorProps> = ({ externalConfig, setEx
       return next;
     });
   }, [setExternalConfig]);
+
+  /** IME-safe commit for the free-text avatar fields. */
+  const handleConfigCommit = React.useCallback((name: string, value: string) => {
+    setConfig(prev => (prev[name as keyof AvatarConfig] === value ? prev : { ...prev, [name]: value }));
+  }, [setConfig]);
 
   const [generatedImage, setGeneratedImage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -240,9 +246,10 @@ const AvatarGenerator: React.FC<AvatarGeneratorProps> = ({ externalConfig, setEx
             <label className="block text-sm font-bold text-gray-300 mb-2">
               {config.referenceImage ? 'Avatar Description (Action/Pose)' : 'Streamer Appearance'}
             </label>
-            <textarea
+            <TextArea
+              name="appearance"
               value={config.appearance}
-              onChange={(e) => setConfig({ ...config, appearance: e.target.value })}
+              onCommit={handleConfigCommit}
               placeholder={config.referenceImage
                 ? "Describe what they are doing, e.g. Holding a mobile phone, wearing headphones, looking excited."
                 : "Female asian gamer in her 20s with blonde hair"}
@@ -253,9 +260,10 @@ const AvatarGenerator: React.FC<AvatarGeneratorProps> = ({ externalConfig, setEx
 
           <div>
             <label className="block text-sm font-bold text-gray-300 mb-2">Background Setting</label>
-            <textarea
+            <TextArea
+              name="setting"
               value={config.setting}
-              onChange={(e) => setConfig({ ...config, setting: e.target.value })}
+              onCommit={handleConfigCommit}
               placeholder="Dark futuristic gamer room"
               rows={3}
               className="w-full bg-[#2D2D2D] border border-gray-600 rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-google-blue focus:border-transparent outline-none transition-all resize-none placeholder-gray-500"

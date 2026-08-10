@@ -64,6 +64,56 @@ export interface VeoSegment {
   videoOptions?: string[];
   selectedOptionIndex?: number;
   generatedUsingPrevUrl?: string;
+  // gs:// URI of the generated clip, so the segment can be restored from
+  // history after the in-memory blob URL is gone.
+  videoGcsUri?: string;
+  videoOptionGcsUris?: (string | undefined)[];
+}
+
+/** A finished render that has been persisted to GCS. */
+export interface ExportRecord {
+  gcsUri: string;
+  kind: 'streamer' | 'composite';
+  subtitles: boolean;
+  aspectRatio: TargetAspectRatio;
+  layoutType?: LayoutType;
+  fileName: string;
+  createdAt: number;
+}
+
+/** Summary row used by the history list. */
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  gameTitle: string | null;
+  gameUrl: string | null;
+  targetAspectRatio: TargetAspectRatio | null;
+  layoutType: LayoutType | null;
+  segmentCount: number;
+  exportCount: number;
+  hasScript: boolean;
+  createdAt: number | null;
+  updatedAt: number | null;
+}
+
+/** Everything needed to restore a working session. */
+export interface ProjectPayload {
+  id?: string;
+  name: string;
+  gameInfo: Omit<GameInfo, 'videoFile'>;
+  avatarConfig: AvatarConfig | null;
+  scriptText: string | null;
+  segments: VeoSegment[];
+  exports: ExportRecord[];
+  avatarImageGcsUri?: string | null;
+  createdAt?: number | null;
+  updatedAt?: number | null;
+}
+
+export interface CurrentUserInfo {
+  email: string | null;
+  isAdmin: boolean;
+  adminEnabled: boolean;
 }
 
 export interface StudioState {

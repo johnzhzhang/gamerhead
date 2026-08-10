@@ -5,7 +5,7 @@ import AvatarGenerator from './components/AvatarGenerator';
 import Studio from './components/Studio';
 import AdminDashboard from './components/AdminDashboard';
 import ProjectHistory from './components/ProjectHistory';
-import { GameInfo, ScriptResult, AvatarConfig, TargetAspectRatio, VeoSegment, ExportRecord, CurrentUserInfo } from './types';
+import { GameInfo, ScriptResult, AvatarConfig, TargetAspectRatio, VeoSegment, ExportRecord, AvatarHistoryEntry, GameplayFileMeta, CurrentUserInfo } from './types';
 import { generateStreamerScript } from './services/gemini';
 import { getUserId } from './services/logging';
 import NeonButton from './components/NeonButton';
@@ -26,7 +26,8 @@ import {
     stripGameInfo,
     stripAvatarConfig,
     deriveProjectName,
-    getExportPreviewUrl,
+    fetchObjectAsBlobUrl,
+    fetchObjectAsDataUrl,
 } from './services/projects';
 
 // Internal Component containing the full app logic
@@ -86,6 +87,9 @@ const GameHeads: React.FC<{
   // regenerating every clip. The working set is now mirrored server-side.
   const [projectId, setProjectId] = useState<string | null>(null);
   const [exportRecords, setExportRecords] = useState<ExportRecord[]>([]);
+  const [avatarImageGcsUri, setAvatarImageGcsUri] = useState<string | null>(null);
+  const [avatarHistory, setAvatarHistory] = useState<AvatarHistoryEntry[]>([]);
+  const [savedGameplayMeta, setSavedGameplayMeta] = useState<GameplayFileMeta | null>(null);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [saveError, setSaveError] = useState<string | null>(null);
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
@@ -108,6 +112,17 @@ const GameHeads: React.FC<{
 
   const handleExportSaved = useCallback((record: ExportRecord) => {
     setExportRecords(prev => [record, ...prev].slice(0, 50));
+  }, []);
+
+  /** The avatar image itself, so a restored project has a streamer again. */
+  const handleAvatarImage = useCallback((imageUrl: string, gcsUri?: string) => {
+    setGeneratedAvatarImage(imageUrl || null);
+    if (!imageUrl) setAvatarImageGcsUri(null);
+    else if (gcsUri) setAvatarImageGcsUri(gcsUri);
+  }, []);
+
+  const handleAvatarGenerated = useCallback((entry: AvatarHistoryEntry) => {
+    setAvatarHistory(prev => [entry, ...prev.filter(a => a.gcsUri !== entry.gcsUri)].slice(0, 24));
   }, []);
 
   // Strip transient fields before persisting — blob URLs are meaningless once
@@ -135,6 +150,9 @@ const GameHeads: React.FC<{
           scriptText: result?.fullText || null,
           segments: serialisableSegments(segments),
           exports: exportRecords,
+          avatarImageGcsUri,
+          avatarHistory,
+          gameplayFileMeta: savedGameplayMeta,
         });
         if (!projectIdRef.current) setProjectId(res.id);
         setLastSavedAt(res.updatedAt);
@@ -154,6 +172,7 @@ const GameHeads: React.FC<{
     form.additionalInstructions, form.targetAspectRatio, form.layoutType,
     form.pipPlacement, form.stackedPlacement, form.searchGrounding,
     avatarConfig, result?.fullText, segments, exportRecords, hasSomethingWorthSaving,
+    avatarImageGcsUri, avatarHistory, savedGameplayMeta,
   ]);
 
   /** Restore a saved project into the editor. */
@@ -171,14 +190,32 @@ const GameHeads: React.FC<{
         videoFile: null,
       }));
       setCachedVideo(null);
-      if (project.avatarConfig) setAvatarConfig(project.avatarConfig);
+      setSavedGameplayMeta(project.gameplayFileMeta || null);
 
-      // Turn stored gs:// URIs back into playable URLs.
+      // Avatar config, with the reference image pulled back from storage so the
+      // "lock the character's look" workflow survives a restore.
+      if (project.avatarConfig) {
+        const cfg = { ...project.avatarConfig };
+        if (cfg.referenceImageGcsUri) {
+          try {
+            cfg.referenceImage = await fetchObjectAsDataUrl(cfg.referenceImageGcsUri);
+          } catch {
+            delete cfg.referenceImage;
+          }
+        }
+        setAvatarConfig(cfg);
+      }
+
+      // Clips come back through the same-origin proxy as blob: URLs rather than
+      // signed URLs. The bucket has no CORS config, so a signed URL can be
+      // played but not fetched for stitching, and a canvas draw for last-frame
+      // extraction fails outright — a restored project could be watched but not
+      // exported. blob: URLs behave exactly like freshly generated clips.
       const restoredSegments = await Promise.all(
         (project.segments || []).map(async (seg) => {
           if (!seg.videoGcsUri) return { ...seg, videoUrl: undefined };
           try {
-            return { ...seg, videoUrl: await getExportPreviewUrl(seg.videoGcsUri) };
+            return { ...seg, videoUrl: await fetchObjectAsBlobUrl(seg.videoGcsUri) };
           } catch {
             return { ...seg, videoUrl: undefined };
           }
@@ -200,6 +237,26 @@ const GameHeads: React.FC<{
         setHistoryIndex(-1);
       }
 
+      // Put the avatar back last, and suppress the invalidation effect so it
+      // does not wipe the clips we just restored.
+      setAvatarHistory(project.avatarHistory || []);
+      setAvatarImageGcsUri(project.avatarImageGcsUri || null);
+      let avatarRestored = false;
+      if (project.avatarImageGcsUri) {
+        try {
+          const dataUrl = await fetchObjectAsDataUrl(project.avatarImageGcsUri);
+          skipAvatarInvalidationRef.current = true;
+          setGeneratedAvatarImage(dataUrl);
+          avatarRestored = true;
+        } catch {
+          skipAvatarInvalidationRef.current = true;
+          setGeneratedAvatarImage(null);
+        }
+      } else {
+        skipAvatarInvalidationRef.current = true;
+        setGeneratedAvatarImage(null);
+      }
+
       setExportRecords(project.exports || []);
       setProjectId(project.id || id);
       projectIdRef.current = project.id || id;
@@ -207,7 +264,14 @@ const GameHeads: React.FC<{
       setSaveState('saved');
       setActiveTab('script');
       setShowInvalidationAlert(
-        'Project restored. Re-upload the gameplay video to export a Full Mix — video files cannot be saved in history.'
+        [
+          avatarRestored
+            ? 'Project restored, including the avatar and generated clips.'
+            : 'Project restored, but this project has no saved avatar — regenerate one before opening the Studio.',
+          project.gameplayFileMeta
+            ? `Re-attach the same gameplay video ("${project.gameplayFileMeta.name}") to keep the script and clips. Picking a different video regenerates from scratch.`
+            : 'Re-attach a gameplay video to export a Full Mix — video files cannot be saved in history.',
+        ].join(' ')
       );
     } finally {
       setIsRestoring(false);
@@ -217,8 +281,15 @@ const GameHeads: React.FC<{
     }
   }, []);
 
-  // Monitor avatar image changes to clear generated video clips from studio
+  // Monitor avatar image changes to clear generated video clips from studio.
+  // Restoring a project also changes the avatar, but there the clips are being
+  // deliberately put back — so the restore path sets this flag to skip one run.
+  const skipAvatarInvalidationRef = useRef(false);
   useEffect(() => {
+    if (skipAvatarInvalidationRef.current) {
+      skipAvatarInvalidationRef.current = false;
+      return;
+    }
     if (segments.length > 0) {
       setSegments(prev => prev.map(seg => ({
         ...seg,
@@ -284,9 +355,27 @@ const GameHeads: React.FC<{
         alert("File too large. Please select a video under 250MB.");
         return;
       }
+
+      // A restored project always has to have its gameplay video re-attached,
+      // because a File cannot be serialised. Wiping the script and every
+      // generated clip at that moment would make restoring pointless, so treat
+      // the same file (name + size + mtime) as a re-attach rather than a change.
+      const meta = { name: file.name, size: file.size, lastModified: file.lastModified };
+      const isSameFile = Boolean(
+        savedGameplayMeta &&
+        savedGameplayMeta.name === meta.name &&
+        savedGameplayMeta.size === meta.size
+      );
+
       setForm(prev => ({ ...prev, videoFile: file }));
       setCachedVideo(null);
-      invalidateDownstream();
+      setSavedGameplayMeta(meta);
+
+      if (isSameFile) {
+        setActiveTab(prev => (prev === 'script' ? prev : 'script'));
+      } else {
+        invalidateDownstream();
+      }
     }
   };
 
@@ -605,10 +694,13 @@ const GameHeads: React.FC<{
                 </div>
 
                 <div className={`${activeTab === 'avatar' ? 'block' : 'hidden'} animate-fade-in min-h-[calc(100vh-9rem)]`}>
-                <AvatarGenerator 
+                <AvatarGenerator
                         externalConfig={avatarConfig}
                         setExternalConfig={setAvatarConfig}
-                        onImageGenerated={setGeneratedAvatarImage}
+                        onImageGenerated={handleAvatarImage}
+                        onAvatarGenerated={handleAvatarGenerated}
+                        avatarHistory={avatarHistory}
+                        currentAvatarGcsUri={avatarImageGcsUri}
                         forcedAspectRatio={forcedAvatarRatio}
                         gamingDevice={form.gamingDevice}
                 />

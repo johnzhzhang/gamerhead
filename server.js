@@ -298,7 +298,23 @@ const stripHeavyFields = (payload) => {
     const clone = JSON.parse(JSON.stringify(payload ?? {}));
 
     if (clone.avatarConfig && typeof clone.avatarConfig === 'object') {
+        // The inline base64 goes; the gs:// URI it was uploaded to stays, so a
+        // restored project can put the reference image back.
         delete clone.avatarConfig.referenceImage;
+    }
+    if (Array.isArray(clone.avatarHistory)) {
+        clone.avatarHistory = clone.avatarHistory
+            .filter(a => a && typeof a.gcsUri === 'string' && a.gcsUri.startsWith('gs://'))
+            .slice(0, 24)
+            .map(a => ({
+                gcsUri: a.gcsUri,
+                prompt: typeof a.prompt === 'string' ? a.prompt.slice(0, 500) : '',
+                aspectRatio: a.aspectRatio || null,
+                createdAt: a.createdAt || null,
+            }));
+    }
+    if (typeof clone.avatarImageGcsUri === 'string' && !clone.avatarImageGcsUri.startsWith('gs://')) {
+        delete clone.avatarImageGcsUri;
     }
     if (Array.isArray(clone.segments)) {
         clone.segments = clone.segments.map(seg => {
@@ -340,6 +356,8 @@ const projectToJson = (entity, database) => {
         segments: payload.segments || [],
         exports: payload.exports || [],
         avatarImageGcsUri: payload.avatarImageGcsUri || null,
+        avatarHistory: payload.avatarHistory || [],
+        gameplayFileMeta: payload.gameplayFileMeta || null,
         createdAt: entity.createdAt ? new Date(entity.createdAt).getTime() : null,
         updatedAt: entity.updatedAt ? new Date(entity.updatedAt).getTime() : null,
     };
@@ -367,6 +385,8 @@ apiRouter.get('/projects', async (req, res) => {
                 segmentCount: e.segmentCount || 0,
                 exportCount: e.exportCount || 0,
                 hasScript: Boolean(e.hasScript),
+                hasAvatar: Boolean(e.hasAvatar),
+                avatarImageGcsUri: e.avatarImageGcsUri || null,
                 createdAt: e.createdAt ? new Date(e.createdAt).getTime() : null,
                 updatedAt: e.updatedAt ? new Date(e.updatedAt).getTime() : null,
             }))
@@ -411,7 +431,9 @@ apiRouter.post('/projects', async (req, res) => {
     const database = getDb();
     if (!database) return res.status(503).json({ error: 'Datastore unavailable; project not saved.' });
 
-    const { id, name, gameInfo, avatarConfig, scriptText, segments, exports: exportList, avatarImageGcsUri } = req.body || {};
+    const { id, name, gameInfo, avatarConfig, scriptText, segments,
+            exports: exportList, avatarImageGcsUri, avatarHistory,
+            gameplayFileMeta } = req.body || {};
 
     try {
         const now = new Date();
@@ -438,6 +460,8 @@ apiRouter.post('/projects', async (req, res) => {
             segments: Array.isArray(segments) ? segments : [],
             exports: Array.isArray(exportList) ? exportList : [],
             avatarImageGcsUri: avatarImageGcsUri || null,
+            avatarHistory: Array.isArray(avatarHistory) ? avatarHistory : [],
+            gameplayFileMeta: gameplayFileMeta || null,
         });
 
         const payload = JSON.stringify(body);
@@ -459,6 +483,8 @@ apiRouter.post('/projects', async (req, res) => {
             segmentCount: body.segments.length,
             exportCount: body.exports.length,
             hasScript: Boolean(body.scriptText),
+            hasAvatar: Boolean(body.avatarImageGcsUri),
+            avatarImageGcsUri: body.avatarImageGcsUri || null,
             createdAt,
             updatedAt: now,
             [PROJECT_PAYLOAD_PROPERTY]: payload,
@@ -760,6 +786,54 @@ const copyVideoToBucket = async (sourceUri) => {
 };
 
 /**
+ * Persist an image (data: URL or raw base64) to the customer bucket.
+ * Used for generated avatars and for user-supplied reference images, so that a
+ * restored project can put the streamer back on screen instead of forcing a
+ * paid regeneration. Best-effort: returns null instead of throwing.
+ */
+const uploadImageToBucket = async ({ dataUrl, base64, mimeType = 'image/png', label = 'image', prefix = 'avatars' }) => {
+    if (!GCS_BUCKET_NAME) {
+        console.log('[GCS] No bucket configured — image not persisted.');
+        return null;
+    }
+
+    let raw = base64;
+    let mime = mimeType;
+    if (dataUrl) {
+        const m = /^data:([^;]+);base64,(.*)$/s.exec(dataUrl);
+        if (!m) {
+            console.warn('[GCS] uploadImageToBucket: unrecognised data URL');
+            return null;
+        }
+        mime = m[1];
+        raw = m[2];
+    }
+    if (!raw) return null;
+
+    const ext = mime.includes('jpeg') || mime.includes('jpg') ? 'jpg'
+              : mime.includes('webp') ? 'webp'
+              : 'png';
+    const now = new Date();
+    const yyyy = now.getUTCFullYear();
+    const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const safeLabel = String(label).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || 'image';
+    const objectName = `${prefix}/${yyyy}/${mm}/${safeLabel}-${now.getTime()}-${randomUUID().slice(0, 8)}.${ext}`;
+
+    try {
+        await getStorage().bucket(GCS_BUCKET_NAME).file(objectName).save(Buffer.from(raw, 'base64'), {
+            contentType: mime,
+            resumable: false,
+        });
+        const uri = `gs://${GCS_BUCKET_NAME}/${objectName}`;
+        console.log(`[GCS] Image saved to ${uri}`);
+        return uri;
+    } catch (err) {
+        console.error('[GCS] Failed to persist image:', err.message);
+        return null;
+    }
+};
+
+/**
  * Persist a finished export (stitched / composited / subtitled video) to the
  * customer bucket under exports/YYYY/MM/. Returns the gs:// URI, or null when
  * no bucket is configured or the upload fails — callers must stay best-effort
@@ -976,7 +1050,16 @@ apiRouter.post('/gemini/generate-avatar', async (req, res) => {
         if (response.candidates?.[0]?.content?.parts) {
             for (const part of response.candidates[0].content.parts) {
                 if (part.inlineData) {
-                    return res.json({ imageData: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}` });
+                    const imageData = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+                    // Persist it: a generated avatar cannot be reproduced, and
+                    // without a durable copy a restored project has no streamer
+                    // and the Studio tab stays locked.
+                    const gcsUri = await uploadImageToBucket({
+                        base64: part.inlineData.data,
+                        mimeType: part.inlineData.mimeType,
+                        label: 'avatar',
+                    });
+                    return res.json({ imageData, gcsUri });
                 }
             }
         }
@@ -1544,6 +1627,72 @@ apiRouter.get('/media/export-url', async (req, res) => {
     } catch (err) {
         console.error('[Media] export-url error:', err);
         res.status(500).json({ error: 'Failed to generate URL: ' + err.message });
+    }
+});
+
+// POST /api/media/save-image
+// Body: { dataUrl: "data:image/png;base64,...", label?: string }
+// Returns: { gcsUri }
+// For images the server did not produce itself — currently the avatar reference
+// image the user picks from disk.
+apiRouter.post('/media/save-image', async (req, res) => {
+    const { dataUrl, label } = req.body || {};
+    if (!dataUrl || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) {
+        return res.status(400).json({ error: 'dataUrl (data: URL) is required' });
+    }
+    if (!GCS_BUCKET_NAME) {
+        return res.status(503).json({ error: 'No GCS bucket configured on this deployment.' });
+    }
+    const gcsUri = await uploadImageToBucket({ dataUrl, label: label || 'reference' });
+    if (!gcsUri) return res.status(500).json({ error: 'Upload to GCS failed.' });
+    res.json({ gcsUri });
+});
+
+// GET /api/media/object?uri=gs://appbucket/...
+// Streams an object from this deployment's own bucket, same-origin and
+// authenticated.
+//
+// Why this exists rather than reusing a signed URL: the bucket has no CORS
+// configuration, so a cross-origin `fetch()` of a signed URL is blocked and a
+// <video crossOrigin="anonymous"> will not load at all. Restored clips have to
+// behave exactly like freshly generated ones — playable, fetchable for
+// stitching, and safe to draw on a canvas for last-frame extraction — so the
+// client pulls them through here and wraps them in blob: URLs.
+apiRouter.get('/media/object', async (req, res) => {
+    const { uri } = req.query;
+    if (!uri || typeof uri !== 'string' || !uri.startsWith('gs://')) {
+        return res.status(400).json({ error: 'Invalid or missing gs:// uri' });
+    }
+    const withoutScheme = uri.slice(5);
+    const slashIdx = withoutScheme.indexOf('/');
+    if (slashIdx === -1) return res.status(400).json({ error: 'Invalid GCS URI' });
+    const bucketName = withoutScheme.slice(0, slashIdx);
+    const objectName = withoutScheme.slice(slashIdx + 1);
+
+    if (!GCS_BUCKET_NAME || bucketName !== GCS_BUCKET_NAME) {
+        return res.status(403).json({ error: 'URI is outside the configured application bucket.' });
+    }
+
+    try {
+        const file = getStorage().bucket(bucketName).file(objectName);
+        const [exists] = await file.exists();
+        if (!exists) return res.status(404).json({ error: 'Object not found' });
+
+        const [metadata] = await file.getMetadata();
+        res.setHeader('Content-Type', metadata.contentType || 'application/octet-stream');
+        if (metadata.size) res.setHeader('Content-Length', metadata.size);
+        res.setHeader('Cache-Control', 'private, max-age=300');
+
+        const stream = file.createReadStream();
+        stream.on('error', (err) => {
+            console.error('[Media] object stream error:', err.message);
+            if (!res.headersSent) res.status(500).json({ error: err.message });
+            else res.end();
+        });
+        stream.pipe(res);
+    } catch (err) {
+        console.error('[Media] object error:', err);
+        if (!res.headersSent) res.status(500).json({ error: 'Failed to read object: ' + err.message });
     }
 });
 

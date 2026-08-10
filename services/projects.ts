@@ -44,6 +44,48 @@ export const getExportPreviewUrl = async (gcsUri: string): Promise<string> => {
 };
 
 /**
+ * Pull an object from the app bucket through the same-origin authenticated
+ * proxy. A signed URL would be cross-origin, and the bucket has no CORS
+ * configuration, so `fetch()` on it is blocked and `<video crossOrigin>` will
+ * not load — which would leave restored clips playable but impossible to export
+ * or chain. Going through the proxy and wrapping in a blob: URL makes a restored
+ * clip behave exactly like a freshly generated one.
+ */
+const fetchObject = async (gcsUri: string): Promise<Blob> => {
+    const res = await apiFetch(`/api/media/object?uri=${encodeURIComponent(gcsUri)}`);
+    if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `Failed to read ${gcsUri} (${res.status})`);
+    }
+    return res.blob();
+};
+
+/** gs:// → blob: URL (videos). */
+export const fetchObjectAsBlobUrl = async (gcsUri: string): Promise<string> =>
+    URL.createObjectURL(await fetchObject(gcsUri));
+
+/** gs:// → data: URL (images, which downstream code feeds to Veo as base64). */
+export const fetchObjectAsDataUrl = async (gcsUri: string): Promise<string> => {
+    const blob = await fetchObject(gcsUri);
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(new Error('Failed to decode image'));
+        reader.readAsDataURL(blob);
+    });
+};
+
+/** Persist an image the server never produced (the avatar reference image). */
+export const saveImage = async (dataUrl: string, label = 'reference'): Promise<string> => {
+    const data = await json(await apiFetch('/api/media/save-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dataUrl, label }),
+    }));
+    return data.gcsUri;
+};
+
+/**
  * `File` objects cannot be serialised, so the uploaded gameplay video is never
  * part of a saved project. Everything else in the form is.
  */

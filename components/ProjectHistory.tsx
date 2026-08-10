@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { ProjectSummary } from '../types';
-import { listProjects, deleteProject } from '../services/projects';
+import { ProjectSummary, ExportRecord } from '../types';
+import { listProjects, deleteProject, loadProject, getExportPreviewUrl } from '../services/projects';
+import GcsImage from './GcsImage';
 
 interface ProjectHistoryProps {
     open: boolean;
@@ -20,11 +21,70 @@ const formatWhen = (ts: number | null): string => {
     return d.toLocaleDateString();
 };
 
+/** Lazily loaded detail: the exports belonging to one project. */
+const ProjectExports: React.FC<{ projectId: string }> = ({ projectId }) => {
+    const [exports, setExports] = useState<ExportRecord[] | null>(null);
+    const [error, setError] = useState<string | null>(null);
+    const [openUrl, setOpenUrl] = useState<{ uri: string; url: string } | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        loadProject(projectId)
+            .then(p => { if (!cancelled) setExports(p.exports || []); })
+            .catch(e => { if (!cancelled) setError(e.message || 'Failed to load exports'); });
+        return () => { cancelled = true; };
+    }, [projectId]);
+
+    if (error) return <p className="text-[11px] text-red-400 mt-2">{error}</p>;
+    if (!exports) return <p className="text-[11px] text-gray-500 mt-2">Loading renders…</p>;
+    if (exports.length === 0) return <p className="text-[11px] text-gray-500 mt-2">No finished renders yet.</p>;
+
+    return (
+        <div className="mt-2 flex flex-col gap-2">
+            {exports.map(x => (
+                <div key={x.gcsUri} className="text-[11px] text-gray-400 flex flex-wrap items-center gap-2">
+                    <span className="text-gray-300">
+                        {x.kind === 'composite' ? 'Full Mix' : 'Streamer Only'}
+                        {x.subtitles ? ' · subtitled' : ''}
+                        {x.aspectRatio ? ` · ${x.aspectRatio}` : ''}
+                    </span>
+                    <span className="text-gray-600 truncate max-w-[220px]">{x.fileName}</span>
+                    <button
+                        type="button"
+                        onClick={async () => {
+                            try {
+                                setOpenUrl({ uri: x.gcsUri, url: await getExportPreviewUrl(x.gcsUri) });
+                            } catch (e: any) {
+                                setError(e.message || 'Could not open that render');
+                            }
+                        }}
+                        className="text-google-blue hover:underline"
+                    >
+                        ▶ Play
+                    </button>
+                </div>
+            ))}
+            {openUrl && (
+                <video
+                    key={openUrl.uri}
+                    src={openUrl.url}
+                    controls
+                    autoPlay
+                    playsInline
+                    aria-label="Stored render playback"
+                    className="w-full max-h-64 rounded-lg bg-black mt-1"
+                />
+            )}
+        </div>
+    );
+};
+
 const ProjectHistory: React.FC<ProjectHistoryProps> = ({ open, onClose, currentProjectId, onLoad }) => {
     const [projects, setProjects] = useState<ProjectSummary[]>([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [busyId, setBusyId] = useState<string | null>(null);
+    const [expandedId, setExpandedId] = useState<string | null>(null);
 
     const refresh = useCallback(async () => {
         setLoading(true);
@@ -125,12 +185,29 @@ const ProjectHistory: React.FC<ProjectHistoryProps> = ({ open, onClose, currentP
                             {projects.map(p => (
                                 <li
                                     key={p.id}
-                                    className={`rounded-xl border px-4 py-3 flex flex-col sm:flex-row sm:items-center gap-3 ${
+                                    className={`rounded-xl border px-4 py-3 flex flex-col gap-3 ${
                                         p.id === currentProjectId
                                             ? 'border-google-blue bg-blue-900/10'
                                             : 'border-gray-700 bg-[#232323]'
                                     }`}
                                 >
+                                  <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+                                    {p.avatarImageGcsUri ? (
+                                        <GcsImage
+                                            gcsUri={p.avatarImageGcsUri}
+                                            alt={`Avatar for ${p.name}`}
+                                            className="w-14 h-14 rounded-lg object-cover shrink-0 border border-gray-700"
+                                            fallbackClassName="w-14 h-14 rounded-lg shrink-0 border border-gray-700"
+                                        />
+                                    ) : (
+                                        <div
+                                            className="w-14 h-14 rounded-lg shrink-0 border border-gray-700 bg-[#2D2D2D] flex items-center justify-center text-lg"
+                                            role="img"
+                                            aria-label="No avatar saved"
+                                        >
+                                            👤
+                                        </div>
+                                    )}
                                     <div className="flex-1 min-w-0">
                                         <div className="flex items-center gap-2">
                                             <span className="text-sm font-bold text-white truncate">{p.name}</span>
@@ -147,11 +224,22 @@ const ProjectHistory: React.FC<ProjectHistoryProps> = ({ open, onClose, currentP
                                             <span>{formatWhen(p.updatedAt)}</span>
                                             {p.targetAspectRatio && <span>{p.targetAspectRatio}</span>}
                                             {p.hasScript && <span>script ✓</span>}
+                                            <span>{p.hasAvatar ? 'avatar ✓' : 'no avatar'}</span>
                                             <span>{p.segmentCount} clip{p.segmentCount === 1 ? '' : 's'}</span>
                                             <span>{p.exportCount} export{p.exportCount === 1 ? '' : 's'}</span>
                                         </p>
                                     </div>
                                     <div className="flex items-center gap-2 shrink-0">
+                                        {p.exportCount > 0 && (
+                                            <button
+                                                onClick={() => setExpandedId(expandedId === p.id ? null : p.id)}
+                                                className="text-xs text-gray-400 hover:text-white px-2 py-1.5 rounded-lg border border-gray-700"
+                                                aria-expanded={expandedId === p.id}
+                                                aria-label={`${expandedId === p.id ? 'Hide' : 'Show'} renders for ${p.name}`}
+                                            >
+                                                {expandedId === p.id ? 'Hide renders' : 'Renders'}
+                                            </button>
+                                        )}
                                         <button
                                             onClick={() => handleLoad(p.id)}
                                             disabled={busyId === p.id}
@@ -168,6 +256,8 @@ const ProjectHistory: React.FC<ProjectHistoryProps> = ({ open, onClose, currentP
                                             Delete
                                         </button>
                                     </div>
+                                  </div>
+                                  {expandedId === p.id && <ProjectExports projectId={p.id} />}
                                 </li>
                             ))}
                         </ul>

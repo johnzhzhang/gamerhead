@@ -117,7 +117,13 @@ export const generateStreamerScript = async (
 // ---------------------------------------------------------------------------
 // AVATAR IMAGE GENERATION (Nano2 / gemini image model)
 // ---------------------------------------------------------------------------
-export const generateStreamerAvatar = async (config: AvatarConfig): Promise<string> => {
+/** A generated avatar: the data URL for immediate use plus its durable gs:// URI. */
+export interface AvatarResult {
+  imageData: string;
+  gcsUri?: string;
+}
+
+export const generateStreamerAvatar = async (config: AvatarConfig): Promise<AvatarResult> => {
   const prompt = constructAvatarPrompt(config);
 
   // Extract reference image data if present
@@ -141,8 +147,13 @@ export const generateStreamerAvatar = async (config: AvatarConfig): Promise<stri
       })
     });
 
-    logEvent('image', config.model, 'success');
-    return result.imageData;
+    // gcsUri in the log meta is what makes the avatar downloadable from the
+    // Admin activity log — previously image rows had no file at all.
+    logEvent('image', config.model, 'success', {
+      aspectRatio: config.aspectRatio,
+      gcsUri: result.gcsUri,
+    });
+    return { imageData: result.imageData, gcsUri: result.gcsUri };
   } catch (error: any) {
     logEvent('image', config.model, 'failed', { error: error.message });
     throw error;

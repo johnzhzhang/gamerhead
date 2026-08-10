@@ -33,13 +33,13 @@ Every AI call runs server-side through Vertex AI with Application Default Creden
 | Capability | Detail |
 |---|---|
 | **Script generation** | `gemini-3.5-flash` reads your gameplay video plus the project details and returns a timed shot list (start/end, duration, streamer action, dialogue) as structured JSON. Optional Google Search grounding pulls in real facts about the game. |
-| **Avatar generation** | `gemini-3.1-flash-image` renders the streamer at the exact aspect ratio the layout needs. You can supply a reference image to lock the character's look and only describe the pose. |
+| **Avatar generation** | `gemini-3.1-flash-image` renders the streamer at the exact aspect ratio the layout needs. You can supply a reference image to lock the character's look and only describe the pose. Every generated avatar is persisted to `gs://<bucket>/avatars/` and listed in the Avatar Lab so it can be reused without paying for a new generation. |
 | **Clip generation** | `veo-3.1-generate-001` (or `veo-3.1-fast-generate-001`) animates the avatar per shot, 4/6/8 seconds, with speech. Generate one take or two in parallel and pick the better one. Clips can chain from the previous clip's last frame for continuity. |
 | **Composition** | FFmpeg concatenates the clips server-side; the browser then composites the streamer over your gameplay as picture-in-picture, stacked, or streamer-only, with an audio mix slider. |
 | **Burned-in subtitles** | Optional. Built from the script dialogue, rendered as ASS with size pinned to the real video dimensions, burned by FFmpeg onto the full frame (not the tiny PiP window). |
 | **Preview before download** | Every export can be played inline in the browser before you keep it. |
 | **Durable output** | Clips land in `gs://<bucket>/videos/`, finished renders in `gs://<bucket>/exports/YYYY/MM/`. |
-| **Project history** | The whole working set is autosaved server-side per user, so a reload or a lost session does not mean re-typing and re-generating. |
+| **Project history** | The whole working set — including the avatar image and every generated clip — is autosaved server-side per user, so a reload or a lost session does not mean re-typing and re-generating. |
 | **Admin dashboard** | Usage scorecards, per-model trend chart, activity log with CSV export and authenticated file download. Restricted to `ADMIN_USERS`. |
 | **Three auth modes** | Cloud Run native IAP, Google Sign-In via GIS, or fixed username/password. |
 
@@ -223,6 +223,8 @@ Changing any of these invalidates the script and shot list, because they all fee
 
 **Avatar** — Describe the streamer's appearance and background, or upload a reference image and describe only the pose. The required aspect ratio is derived from the layout: stacked needs the avatar in the opposite orientation to the final video, so the app forces it and tells you when a layout change invalidates an existing avatar.
 
+Every generated avatar is uploaded to the bucket and appears in an **Avatars in this project** strip under the Generate button. Clicking one puts it back into use without a new generation charge, which matters because avatar generation is not deterministic — regenerating never gives you the same streamer back.
+
 **Studio** — Unlocks once the form is valid and an avatar exists. Generate clips per shot, one take or two in parallel, standard or fast Veo. Chain from the previous clip's last frame for continuity, or restart from the avatar. Then open the final page to preview or export.
 
 Text inputs use IME-safe wrappers (`components/TextInput.tsx`): while a composition is in progress the DOM node owns its text and the parent is not notified until `compositionend`, so re-renders cannot interrupt Chinese/Japanese/Korean input.
@@ -233,9 +235,17 @@ Text inputs use IME-safe wrappers (`components/TextInput.tsx`): while a composit
 
 Everything except the uploaded gameplay file is mirrored server-side under a `Project` entity, autosaved 1.5 s after any change. The header shows `Saving… / Saved HH:MM:SS / Save failed` (hover for the reason).
 
-Saved: game title, store URL, CTA, gaming device, dialogue pacing, extra instructions, aspect ratio, layout and placement, avatar settings, full script text, the shot list including each clip's `gs://` URI, and the list of exports.
+Saved: game title, store URL, CTA, gaming device, dialogue pacing, extra instructions, aspect ratio, layout and placement, avatar settings, **the generated avatar image**, every avatar generated for the project, full script text, the shot list including each clip's `gs://` URI, and the list of exports.
 
-Not saved: the gameplay video (a `File` cannot be serialised) and the avatar reference image (inline base64 — megabytes, and over Datastore's 1500-byte indexed-property limit). Both must be re-picked after restoring.
+Not saved: the gameplay video. A `File` cannot be serialised, so it always has to be re-attached.
+
+### Re-attaching the gameplay video
+
+Picking a gameplay video normally invalidates the script and every generated clip, because the script was written from that footage. That rule would make restoring pointless — the one thing you *must* do after opening a project is re-attach the video.
+
+So the project remembers the file's name, size and modification time. Re-attaching the same file is treated as a re-attach and keeps the script and clips; picking a different video invalidates them exactly as before. The restore banner names the file it is expecting.
+
+Images and videos both come back through the authenticated same-origin proxy and are re-wrapped as local URLs, so a restored clip behaves exactly like a freshly generated one: playable, stitchable, and safe to draw on a canvas for last-frame extraction.
 
 Open **History** in the header to list your projects newest-first with title, store URL, aspect ratio, clip count, export count and last-modified time. Opening one refills the form, restores the script and shot list, and turns each stored `gs://` URI back into a playable signed URL.
 
@@ -284,6 +294,16 @@ Clicking a file calls `/api/admin/signed-url`, which returns a 15-minute signed 
 
 Signing is restricted to `GCS_BUCKET_NAME`. A `gs://` URI pointing anywhere else is rejected, so the endpoint cannot be used to mint shareable links for arbitrary objects the service account happens to be able to read.
 
+### Signed URL or streaming proxy?
+
+Both exist, for different jobs, and the split is not arbitrary:
+
+| Need | Mechanism | Why |
+|---|---|---|
+| Play a stored render in a `<video>` | Signed URL (`/api/media/export-url`) | Supports range requests, so the browser can seek and stream without downloading the whole file |
+| Restore a clip so it can be re-exported | Streaming proxy (`/api/media/object`) → `blob:` URL | The bucket has no CORS configuration, so a cross-origin `fetch()` of a signed URL is blocked and `<video crossOrigin="anonymous">` refuses to load at all. A restored project would be watchable but impossible to stitch or to chain from a last frame |
+| Show an avatar thumbnail | Streaming proxy → `blob:` URL | Same-origin, and `<img>` needs no range requests |
+
 ### Model name display
 
 Only the first hyphen is replaced, so the vendor prefix survives: `veo-3.1-fast-generate-001` → `veo 3.1-fast-generate-001`.
@@ -312,8 +332,10 @@ meta        { duration?, gcsUri?, aspectRatio?, layout?, subtitles?, error? }
 indexed:    ownerEmail, name, gameTitle, gameUrl, targetAspectRatio,
             layoutType, segmentCount, exportCount, hasScript,
             createdAt, updatedAt
-unindexed:  payload  → JSON { gameInfo, avatarConfig, scriptText,
-                              segments, exports, avatarImageGcsUri }
+indexed:    hasAvatar, avatarImageGcsUri
+unindexed:  payload  → JSON { gameInfo, avatarConfig, scriptText, segments,
+                              exports, avatarImageGcsUri, avatarHistory,
+                              gameplayFileMeta }
 ```
 
 The blob shape exists because Datastore caps indexed properties at 1500 bytes and `excludeFromIndexes` only accepts explicit leaf paths — naming a parent object does **not** cover its children. A base64 `avatarConfig.referenceImage` therefore failed every save with `INVALID_ARGUMENT: The value of property "referenceImage" is longer than 1500 bytes`. Keeping the working set in a single unindexed string sidesteps the whole class of problem; base64 blobs and `blob:` URLs are stripped before saving, and payloads over 900 KB are rejected with 413 (the hard entity limit is ~1 MiB).
@@ -323,7 +345,9 @@ Queries filter on `ownerEmail` only and sort in memory, so no composite index is
 ### Cloud Storage
 
 ```
-gs://<bucket>/videos/<epoch>-<rand6>.mp4                       generated clips
+gs://<bucket>/videos/<epoch>-<rand6>.mp4                         generated clips
+gs://<bucket>/avatars/<YYYY>/<MM>/avatar-<epoch>-<uuid8>.png     generated avatars
+gs://<bucket>/avatars/<YYYY>/<MM>/avatar-ref-<epoch>-<uuid8>.*   uploaded reference images
 gs://<bucket>/exports/<YYYY>/<MM>/<label>-<epoch>-<uuid8>.<ext>  finished renders
 ```
 
@@ -361,7 +385,7 @@ Everything under `/api` except the three public endpoints requires authenticatio
 |---|---|---|
 | `POST` | `/api/gemini/generate-script` | `{prompt, inlineData?, searchGrounding?}` → `{fullText, segments, groundingUrls}`. Durations are snapped to 4/6/8 s |
 | `POST` | `/api/gemini/analyze-script` | `{prompt}` → re-derived shot list from an edited script |
-| `POST` | `/api/gemini/generate-avatar` | `{prompt, aspectRatio, referenceImageData?, referenceImageMime?, model?}` |
+| `POST` | `/api/gemini/generate-avatar` | `{prompt, aspectRatio, referenceImageData?, referenceImageMime?, model?}` → `{imageData, gcsUri}`. The image is uploaded to the bucket in the same request |
 | `POST` | `/api/gemini/generate-video` | `{prompt, imageBase64, aspectRatio, durationSeconds, model}` → `{operationName}` |
 | `GET` | `/api/gemini/video-operation?name=` | Polls Veo via `fetchPredictOperation`. Copies the result into your bucket and returns `{done, videoUri}`, or `{done, videoBase64}` when no bucket is configured, or a clear message when the RAI filter blocked it |
 | `GET` | `/api/gemini/download-video?uri=` | Streams a `gs://` or legacy HTTPS Veo URI through the server |
@@ -374,6 +398,8 @@ Everything under `/api` except the three public endpoints requires authenticatio
 | `POST` | `/api/gemini/burn-subtitles` | multipart `video`, `srt`, `saveToGcs?` → MP4 stream, `X-Gcs-Uri` header |
 | `POST` | `/api/gemini/save-export` | multipart `video`, `label?` → `{gcsUri}`. For renders the server never saw |
 | `GET` | `/api/media/export-url?uri=` | 1-hour signed URL, own bucket only. Used by `<video>`, which cannot send an `Authorization` header |
+| `POST` | `/api/media/save-image` | `{dataUrl, label?}` → `{gcsUri}`. For images the server did not produce — the avatar reference image |
+| `GET` | `/api/media/object?uri=` | Streams an object from the own bucket, same-origin and authenticated. See the note below on why this is not a signed URL |
 
 ### Admin — requires `ADMIN_USERS` membership
 

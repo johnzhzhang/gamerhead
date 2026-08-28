@@ -691,27 +691,6 @@ const Studio: React.FC<StudioProps> = ({
                                 Omni (backup)
                                 <span className="text-[8px] font-bold opacity-70">PREVIEW</span>
                             </button>
-                            <button
-                                onClick={() => setVeoModel('veo-3.1-generate-001')}
-                                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
-                                    veoModel === 'veo-3.1-generate-001'
-                                    ? 'bg-google-blue text-gray-900 shadow-sm'
-                                    : 'text-gray-400 hover:text-white hover:bg-white/5'
-                                }`}
-                            >
-                                Veo 3.1 Standard
-                            </button>
-                            <button
-                                 onClick={() => setVeoModel('veo-3.1-fast-generate-001')}
-                                 className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1 ${
-                                    veoModel === 'veo-3.1-fast-generate-001'
-                                    ? 'bg-google-green text-gray-900 shadow-sm'
-                                    : 'text-gray-400 hover:text-white hover:bg-white/5'
-                                }`}
-                            >
-                                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clipRule="evenodd" /></svg>
-                                Veo 3.1 Fast
-                            </button>
                          </div>
                          <div className="mt-1.5 text-[9px] text-gray-400 max-w-[260px] leading-tight px-1">
                             Applies to subsequent generations.

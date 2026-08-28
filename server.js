@@ -1304,7 +1304,8 @@ apiRouter.post('/gemini/generate-video', async (req, res) => {
                 return res.status(429).json({
                     error: `No Gemini Omni model has quota in this project (tried ${chain.join(', ')}). `
                          + `These are Preview models with fixed quota only, so quota must be granted per base model. `
-                         + `Pick a Veo model in the Studio to keep generating meanwhile. `
+                         + `As a stopgap you can deploy with VIDEO_MODEL set to a Veo id (e.g. veo-3.1-fast-generate-001), `
+                         + `which still routes through the Veo API. `
                          + `Original error: ${lastQuotaErr ? lastQuotaErr.message : 'unknown'}`
                 });
             }

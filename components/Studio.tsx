@@ -97,7 +97,7 @@ const Studio: React.FC<StudioProps> = ({
   const [audioVolumes, setAudioVolumes] = useState({ streamer: 1.2, gameplay: 0.3 });
 
   // Veo Model Selection
-  const [veoModel, setVeoModel] = useState<VideoModel>('gemini-omni-flash-preview');
+  const [veoModel, setVeoModel] = useState<VideoModel>('gemini-omni-1.1-flash-preview');
 
   // Generation Mode Selection (Single vs 2 Options)
   const [genMode, setGenMode] = useState<'single' | 'options'>('single');
@@ -668,27 +668,27 @@ const Studio: React.FC<StudioProps> = ({
                     <div className="bg-[#2D2D2D] p-1.5 rounded-xl border border-gray-700 shadow-float backdrop-blur-md">
                          <div className="flex gap-1 flex-wrap">
                             <button
-                                onClick={() => setVeoModel('gemini-omni-flash-preview')}
-                                title="Gemini Omni Flash (Preview) — Interactions API, 720p, has quota by default"
-                                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1 ${
-                                    veoModel === 'gemini-omni-flash-preview'
-                                    ? 'bg-google-yellow text-gray-900 shadow-sm'
-                                    : 'text-gray-400 hover:text-white hover:bg-white/5'
-                                }`}
-                            >
-                                Gemini Omni
-                                <span className="text-[8px] font-bold opacity-70">PREVIEW</span>
-                            </button>
-                            <button
                                 onClick={() => setVeoModel('gemini-omni-1.1-flash-preview')}
-                                title="Gemini Omni 1.1 Flash (Preview) — up to 4k, needs fixed quota granted per project"
+                                title="Gemini Omni 1.1 Flash (Preview) — primary, up to 4k. Falls back to Gemini Omni Flash if this project has no quota."
                                 className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1 ${
                                     veoModel === 'gemini-omni-1.1-flash-preview'
                                     ? 'bg-google-yellow text-gray-900 shadow-sm'
                                     : 'text-gray-400 hover:text-white hover:bg-white/5'
                                 }`}
                             >
-                                Omni 1.1
+                                Gemini Omni 1.1
+                                <span className="text-[8px] font-bold opacity-70">PREVIEW</span>
+                            </button>
+                            <button
+                                onClick={() => setVeoModel('gemini-omni-flash-preview')}
+                                title="Gemini Omni Flash (Preview) — backup, 720p, has quota by default"
+                                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1 ${
+                                    veoModel === 'gemini-omni-flash-preview'
+                                    ? 'bg-google-yellow text-gray-900 shadow-sm'
+                                    : 'text-gray-400 hover:text-white hover:bg-white/5'
+                                }`}
+                            >
+                                Omni (backup)
                                 <span className="text-[8px] font-bold opacity-70">PREVIEW</span>
                             </button>
                             <button
@@ -715,7 +715,7 @@ const Studio: React.FC<StudioProps> = ({
                          </div>
                          <div className="mt-1.5 text-[9px] text-gray-400 max-w-[260px] leading-tight px-1">
                             Applies to subsequent generations.
-                            {veoModel === 'gemini-omni-1.1-flash-preview' && ' Omni 1.1 needs fixed quota granted in your project.'}
+                            {veoModel === 'gemini-omni-1.1-flash-preview' && ' Primary; auto-falls back to Gemini Omni Flash if this project lacks Omni 1.1 quota.'}
                          </div>
                     </div>
 

@@ -740,13 +740,14 @@ const getVertexAIGlobalClient = () => {
 //   * Preview + fixed-quota only: no PayGo, no Provisioned Throughput. A project
 //     without quota gets an error, which is why the Veo path is kept selectable.
 // Two Gemini Omni video models exist, both on the Interactions API:
-//   * gemini-omni-1.1-flash-preview — 360p/720p/1080p/4k
-//   * gemini-omni-flash-preview     — 720p only
-// The 1.1 model is the newer one but needs fixed quota granted per project;
-// gemini-omni-flash-preview is the default here because it has quota in the
-// target project out of the box. Override with VIDEO_MODEL.
-const GEMINI_VIDEO_MODEL = 'gemini-omni-flash-preview';
+//   * gemini-omni-1.1-flash-preview — 360p/720p/1080p/4k, needs fixed quota
+//   * gemini-omni-flash-preview     — 720p only, has quota by default
+// The 1.1 model is the primary; if the project has not been granted quota for
+// it, the server transparently falls back to gemini-omni-flash-preview.
+const GEMINI_VIDEO_MODEL = 'gemini-omni-1.1-flash-preview';
+const GEMINI_VIDEO_FALLBACK = 'gemini-omni-flash-preview';
 const VIDEO_MODEL_DEFAULT = process.env.VIDEO_MODEL || GEMINI_VIDEO_MODEL;
+const VIDEO_MODEL_FALLBACK = process.env.VIDEO_MODEL_FALLBACK || GEMINI_VIDEO_FALLBACK;
 const VIDEO_RESOLUTION_DEFAULT = process.env.VIDEO_RESOLUTION || '720p';
 
 const OMNI_ALLOWED_RESOLUTIONS = ['360p', '720p', '1080p', '4k'];
@@ -1185,6 +1186,49 @@ apiRouter.post('/gemini/generate-avatar', async (req, res) => {
     }
 });
 
+/**
+ * Start an image-to-video interaction on a Gemini Omni model. Returns the
+ * interaction id, or throws. Quota errors are recognisable via err.isQuota.
+ */
+const startOmniInteraction = async ({ modelId, prompt, frameUri, ratio, secs, resolution }) => {
+    let outResolution = OMNI_ALLOWED_RESOLUTIONS.includes(resolution) ? resolution : '720p';
+    if (OMNI_720P_ONLY_MODELS.includes(modelId)) outResolution = '720p';
+
+    const body = {
+        model: modelId,
+        // Asynchronous: the interaction is retained for 14 days and read back by
+        // id. NOTE: the docs show `background` inside input[0], but the API
+        // rejects that (400 invalid_request Unknown parameter 'background' at
+        // 'input[0]'). It has to be top-level. Verified against the live API.
+        background: true,
+        input: [
+            { type: 'text', text: prompt },
+            { type: 'image', uri: frameUri, mime_type: 'image/png' },
+        ],
+        response_format: [{
+            type: 'video',
+            delivery: 'uri',
+            gcs_uri: `gs://${GCS_BUCKET_NAME}/videos/`,
+            aspect_ratio: ratio,
+            resolution: outResolution,
+            duration: `${secs}s`,
+        }],
+        generation_config: { video_config: { task: 'image_to_video' } },
+    };
+
+    console.log(`[Omni] interactions request — model=${modelId} ratio=${ratio} res=${outResolution} duration=${secs}s frame=${frameUri}`);
+    try {
+        const interaction = await callInteractions('', body);
+        if (!interaction?.id) {
+            throw new Error('Interactions API did not return an interaction id: ' + JSON.stringify(interaction).slice(0, 300));
+        }
+        return interaction.id;
+    } catch (err) {
+        if (/too_many_requests|Quota exceeded/i.test(err.message)) err.isQuota = true;
+        throw err;
+    }
+};
+
 // POST /api/gemini/generate-video
 // Body: { prompt, imageBase64, aspectRatio, durationSeconds, model, resolution }
 // Returns: { operationName: string, api: 'interactions' | 'veo' }
@@ -1225,55 +1269,51 @@ apiRouter.post('/gemini/generate-video', async (req, res) => {
             // duration: integer 3..10 followed by "s"
             const secs = Math.min(10, Math.max(3, Math.round(Number(durationSeconds) || 8)));
             const wantedResolution = String(resolution || VIDEO_RESOLUTION_DEFAULT);
-            let outResolution = OMNI_ALLOWED_RESOLUTIONS.includes(wantedResolution) ? wantedResolution : '720p';
-            // gemini-omni-flash-preview only supports 720p.
-            if (OMNI_720P_ONLY_MODELS.includes(modelId)) outResolution = '720p';
 
-            const body = {
-                model: modelId,
-                // Asynchronous: the interaction is retained for 14 days and read
-                // back by id. NOTE: the docs show `background` inside input[0],
-                // but the API rejects that with
-                //   400 invalid_request: Unknown parameter 'background' at 'input[0]'
-                // It has to be a top-level field. Verified against the live API.
-                background: true,
-                input: [
-                    { type: 'text', text: prompt },
-                    { type: 'image', uri: frameUri, mime_type: 'image/png' },
-                ],
-                response_format: [{
-                    type: 'video',
-                    delivery: 'uri',
-                    gcs_uri: `gs://${GCS_BUCKET_NAME}/videos/`,
-                    aspect_ratio: ratio,
-                    resolution: outResolution,
-                    duration: `${secs}s`,
-                }],
-                generation_config: { video_config: { task: 'image_to_video' } },
-            };
+            // Try the requested (primary) model. If it has no quota, and a
+            // different Omni fallback is configured, transparently retry with it
+            // so the user keeps generating instead of hitting a dead end.
+            const chain = [modelId];
+            if (VIDEO_MODEL_FALLBACK
+                && VIDEO_MODEL_FALLBACK !== modelId
+                && isInteractionsModel(VIDEO_MODEL_FALLBACK)) {
+                chain.push(VIDEO_MODEL_FALLBACK);
+            }
 
-            console.log(`[Omni] interactions request — model=${modelId} ratio=${ratio} res=${outResolution} duration=${secs}s frame=${frameUri}`);
-            let interaction;
-            try {
-                interaction = await callInteractions('', body);
-            } catch (err) {
-                // The model is Preview with fixed quota only (no PayGo), so a
-                // project that has not been granted quota gets a persistent 429
-                // rather than a transient one. Say so, and point at the fallback.
-                if (/too_many_requests|Quota exceeded/i.test(err.message)) {
-                    return res.status(429).json({
-                        error: `${modelId} has no quota in this project. It is a Preview model with fixed quota only `
-                             + `(pay-as-you-go is not supported), so quota must be requested for the base model. `
-                             + `Pick a Veo model in the Studio to keep generating meanwhile. Original error: ${err.message}`
+            let interactionId = null;
+            let usedModel = null;
+            let lastQuotaErr = null;
+            for (const candidate of chain) {
+                try {
+                    interactionId = await startOmniInteraction({
+                        modelId: candidate, prompt, frameUri, ratio, secs, resolution: wantedResolution,
                     });
+                    usedModel = candidate;
+                    break;
+                } catch (err) {
+                    if (err.isQuota) {
+                        console.warn(`[Omni] ${candidate} has no quota; ${candidate === chain[chain.length - 1] ? 'no more fallbacks' : 'falling back'}`);
+                        lastQuotaErr = err;
+                        continue;
+                    }
+                    throw err;
                 }
-                throw err;
             }
-            if (!interaction?.id) {
-                throw new Error('Interactions API did not return an interaction id: ' + JSON.stringify(interaction).slice(0, 300));
+
+            if (!interactionId) {
+                return res.status(429).json({
+                    error: `No Gemini Omni model has quota in this project (tried ${chain.join(', ')}). `
+                         + `These are Preview models with fixed quota only, so quota must be granted per base model. `
+                         + `Pick a Veo model in the Studio to keep generating meanwhile. `
+                         + `Original error: ${lastQuotaErr ? lastQuotaErr.message : 'unknown'}`
+                });
             }
-            console.log(`[Omni] interaction ${interaction.id} status=${interaction.status}`);
-            return res.json({ operationName: interaction.id, api: 'interactions' });
+
+            if (usedModel !== modelId) {
+                console.log(`[Omni] fell back from ${modelId} to ${usedModel}`);
+            }
+            console.log(`[Omni] interaction ${interactionId} (model=${usedModel})`);
+            return res.json({ operationName: interactionId, api: 'interactions', model: usedModel });
         }
 
         // ── Veo via predictLongRunning (kept selectable) ────────────────────

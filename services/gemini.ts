@@ -7,6 +7,9 @@ import {
     constructVeoGenerationPrompt
 } from "./prompts";
 import { compressVideo } from "../utils/videoUtils";
+
+/** Kept in sync with SCRIPT_MODEL / GEMINI_SCRIPT_MODEL on the server. */
+const SCRIPT_MODEL_LABEL = 'gemini-3.7-flash';
 import { logEvent } from "./logging";
 import { apiFetch as authFetch } from "./auth";
 
@@ -100,7 +103,7 @@ export const generateStreamerScript = async (
     });
 
     if (onStatusUpdate) onStatusUpdate("Finalizing...", 100);
-    logEvent('script', 'gemini-3.5-flash', 'success');
+    logEvent('script', SCRIPT_MODEL_LABEL, 'success');
     return {
       fullText: result.fullText,
       segments: result.segments,
@@ -109,7 +112,7 @@ export const generateStreamerScript = async (
       inlineData: result.inlineData || inlineData
     };
   } catch (error: any) {
-    logEvent('script', 'gemini-3.5-flash', 'failed', { error: error.message });
+    logEvent('script', SCRIPT_MODEL_LABEL, 'failed', { error: error.message });
     throw error;
   }
 };
@@ -173,10 +176,10 @@ export const analyzeScriptForVeo = async (script: string): Promise<VeoSegment[]>
       body: JSON.stringify({ prompt })
     });
 
-    logEvent('script', 'gemini-3.5-flash', 'success', { segments: segments.length });
+    logEvent('script', SCRIPT_MODEL_LABEL, 'success', { segments: segments.length });
     return segments;
   } catch (error: any) {
-    logEvent('script', 'gemini-3.5-flash', 'failed', { error: error.message });
+    logEvent('script', SCRIPT_MODEL_LABEL, 'failed', { error: error.message });
     throw new Error(`Failed to analyze script for video generation: ${error.message}`);
   }
 };

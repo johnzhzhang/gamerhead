@@ -744,6 +744,14 @@ const getVertexAIGlobalClient = () => {
 //   * gemini-omni-flash-preview     — 720p only, has quota by default
 // The 1.1 model is the primary; if the project has not been granted quota for
 // it, the server transparently falls back to gemini-omni-flash-preview.
+// Script / shot-list model. Gemini 3.7 Flash (GA, released 2026-08-13) supports
+// everything this app needs: system instructions, structured output
+// (responseMimeType + responseSchema), Google Search grounding, and video input,
+// on the `global` endpoint. Note it is a thinking model with MEDIUM by default;
+// thinking_level="MINIMAL" is rejected, so we simply never set it.
+// https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-7-flash
+const GEMINI_SCRIPT_MODEL = process.env.SCRIPT_MODEL || 'gemini-3.7-flash';
+
 const GEMINI_VIDEO_MODEL = 'gemini-omni-1.1-flash-preview';
 const GEMINI_VIDEO_FALLBACK = 'gemini-omni-flash-preview';
 const VIDEO_MODEL_DEFAULT = process.env.VIDEO_MODEL || GEMINI_VIDEO_MODEL;
@@ -1040,7 +1048,7 @@ apiRouter.post('/gemini/generate-script', async (req, res) => {
         if (inlineData) parts.push({ inlineData });
 
         const response = await ai.models.generateContent({
-            model: 'gemini-3.5-flash',
+            model: GEMINI_SCRIPT_MODEL,
             contents: [{ role: 'user', parts }],
             config: {
                 systemInstruction: 'You are an expert content creator scriptwriter. You must strictly adhere to the provided pacing and word count rules (ranges per segment duration) to generate the script.',
@@ -1100,7 +1108,7 @@ apiRouter.post('/gemini/analyze-script', async (req, res) => {
     try {
         const ai = getVertexAIGlobalClient();
         const response = await ai.models.generateContent({
-            model: 'gemini-3.5-flash',
+            model: GEMINI_SCRIPT_MODEL,
             contents: prompt,
             config: {
                 responseMimeType: 'application/json',

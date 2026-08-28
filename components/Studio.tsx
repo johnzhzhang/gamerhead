@@ -97,7 +97,9 @@ const Studio: React.FC<StudioProps> = ({
   const [audioVolumes, setAudioVolumes] = useState({ streamer: 1.2, gameplay: 0.3 });
 
   // Veo Model Selection
-  const [veoModel, setVeoModel] = useState<VideoModel>('gemini-omni-1.1-flash-preview');
+  // Not user-selectable: the server walks the model chain (Omni 1.1 → Omni Flash
+  // → Veo) and falls back on quota failure, so there is nothing to pick here.
+  const veoModel: VideoModel = 'gemini-omni-1.1-flash-preview';
 
   // Generation Mode Selection (Single vs 2 Options)
   const [genMode, setGenMode] = useState<'single' | 'options'>('single');
@@ -666,35 +668,17 @@ const Studio: React.FC<StudioProps> = ({
                 {/* Left: Model & Mode Selectors */}
                 <div className="pointer-events-auto flex flex-col md:flex-row gap-3">
                     <div className="bg-[#2D2D2D] p-1.5 rounded-xl border border-gray-700 shadow-float backdrop-blur-md">
-                         <div className="flex gap-1 flex-wrap">
-                            <button
-                                onClick={() => setVeoModel('gemini-omni-1.1-flash-preview')}
-                                title="Gemini Omni 1.1 Flash (Preview) — primary, up to 4k. Falls back to Gemini Omni Flash if this project has no quota."
-                                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1 ${
-                                    veoModel === 'gemini-omni-1.1-flash-preview'
-                                    ? 'bg-google-yellow text-gray-900 shadow-sm'
-                                    : 'text-gray-400 hover:text-white hover:bg-white/5'
-                                }`}
-                            >
+                         {/* The model is no longer a user choice. Every fallback
+                             (Gemini Omni Flash, then Veo) is applied server-side
+                             on quota failure, so this is purely informational. */}
+                         <div className="flex items-center gap-1.5 px-2 py-1">
+                            <span className="px-2 py-1 rounded-lg text-xs font-bold bg-google-yellow text-gray-900 flex items-center gap-1">
                                 Gemini Omni 1.1
                                 <span className="text-[8px] font-bold opacity-70">PREVIEW</span>
-                            </button>
-                            <button
-                                onClick={() => setVeoModel('gemini-omni-flash-preview')}
-                                title="Gemini Omni Flash (Preview) — backup, 720p, has quota by default"
-                                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1 ${
-                                    veoModel === 'gemini-omni-flash-preview'
-                                    ? 'bg-google-yellow text-gray-900 shadow-sm'
-                                    : 'text-gray-400 hover:text-white hover:bg-white/5'
-                                }`}
-                            >
-                                Omni (backup)
-                                <span className="text-[8px] font-bold opacity-70">PREVIEW</span>
-                            </button>
+                            </span>
                          </div>
-                         <div className="mt-1.5 text-[9px] text-gray-400 max-w-[260px] leading-tight px-1">
-                            Applies to subsequent generations.
-                            {veoModel === 'gemini-omni-1.1-flash-preview' && ' Primary; auto-falls back to Gemini Omni Flash if this project lacks Omni 1.1 quota.'}
+                         <div className="mt-1 text-[9px] text-gray-400 max-w-[240px] leading-tight px-1">
+                            Video model. Falls back automatically if capacity is unavailable.
                          </div>
                     </div>
 

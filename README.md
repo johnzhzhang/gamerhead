@@ -242,12 +242,13 @@ for Veo:
 
 ### Model chain
 
-The Studio picker only offers the two Gemini Omni models. Veo is a **background
-safety net**, not a user-facing choice — the server walks this chain per request:
+The model is **not a user-facing choice** — the Studio shows which one is in use
+and nothing more. Every fallback happens server-side, so the whole chain is
+invisible to the user. The server walks it per request:
 
 1. `VIDEO_MODEL` (default `gemini-omni-1.1-flash-preview`) — primary
 2. `VIDEO_MODEL_FALLBACK` (default `gemini-omni-flash-preview`) — used when the
-   primary returns a persistent quota 429
+   primary returns a persistent quota 429. 720p only
 3. `VIDEO_MODEL_LAST_RESORT` (default `veo-3.1-fast-generate-001`) — used when
    every Omni candidate is out of quota. Veo is pay-as-you-go so it is always
    available. Set the variable to an empty string to disable the net.

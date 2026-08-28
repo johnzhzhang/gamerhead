@@ -748,6 +748,10 @@ const GEMINI_VIDEO_MODEL = 'gemini-omni-1.1-flash-preview';
 const GEMINI_VIDEO_FALLBACK = 'gemini-omni-flash-preview';
 const VIDEO_MODEL_DEFAULT = process.env.VIDEO_MODEL || GEMINI_VIDEO_MODEL;
 const VIDEO_MODEL_FALLBACK = process.env.VIDEO_MODEL_FALLBACK || GEMINI_VIDEO_FALLBACK;
+// Last-resort safety net when every Gemini Omni model is out of quota. Veo is
+// pay-as-you-go, so it is always available. Deliberately not exposed in the UI —
+// set to an empty string to disable the net entirely.
+const VIDEO_MODEL_LAST_RESORT = process.env.VIDEO_MODEL_LAST_RESORT ?? 'veo-3.1-fast-generate-001';
 const VIDEO_RESOLUTION_DEFAULT = process.env.VIDEO_RESOLUTION || '720p';
 
 const OMNI_ALLOWED_RESOLUTIONS = ['360p', '720p', '1080p', '4k'];
@@ -1229,6 +1233,25 @@ const startOmniInteraction = async ({ modelId, prompt, frameUri, ratio, secs, re
     }
 };
 
+/** Start a Veo long-running video generation. Returns the operation name. */
+const startVeoOperation = async ({ modelId, prompt, imageBase64, ratio, durationSeconds }) => {
+    const ai = getVeoClient();  // Veo is only available in us-central1
+    const operation = await ai.models.generateVideos({
+        model: modelId,
+        prompt,
+        image: { imageBytes: imageBase64, mimeType: 'image/png' },
+        config: {
+            numberOfVideos: 1,
+            resolution: '720p',
+            aspectRatio: ratio,
+            durationSeconds: durationSeconds || 6,
+            personGeneration: 'allow_adult',
+        },
+    });
+    if (!operation?.name) throw new Error('Veo did not return an operation name');
+    return operation.name;
+};
+
 // POST /api/gemini/generate-video
 // Body: { prompt, imageBase64, aspectRatio, durationSeconds, model, resolution }
 // Returns: { operationName: string, api: 'interactions' | 'veo' }
@@ -1242,6 +1265,10 @@ apiRouter.post('/gemini/generate-video', async (req, res) => {
 
     const modelId = model || VIDEO_MODEL_DEFAULT;
     const ratio = aspectRatio === '9:16' ? '9:16' : '16:9';
+    // Callers may send either raw base64 or a full data: URL. Strip the prefix
+    // once here: Veo rejects a data URL with "Invalid base64 encoded bytes", and
+    // both paths (plus the Veo safety net) need the same normalised value.
+    const rawImageBase64 = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
 
     try {
         // ── Gemini Omni via the Interactions API ────────────────────────────
@@ -1255,9 +1282,8 @@ apiRouter.post('/gemini/generate-video', async (req, res) => {
 
             // The documented image input is a gs:// URI, so persist the start
             // frame first. It doubles as a record of what each clip was seeded from.
-            const rawBase64 = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
             const frameUri = await uploadImageToBucket({
-                base64: rawBase64,
+                base64: rawImageBase64,
                 mimeType: 'image/png',
                 label: 'startframe',
                 prefix: 'frames',
@@ -1301,11 +1327,32 @@ apiRouter.post('/gemini/generate-video', async (req, res) => {
             }
 
             if (!interactionId) {
+                // Every Omni candidate is out of quota. Rather than failing the
+                // user's generation, silently retry on Veo. The client only ever
+                // sees an opaque handle, and /api/gemini/video-operation routes
+                // by whether it looks like an LRO name, so this is transparent.
+                // Veo is deliberately NOT offered in the Studio picker — it is a
+                // background safety net, not a user-facing choice.
+                if (VIDEO_MODEL_LAST_RESORT) {
+                    console.warn(`[Omni] all Omni models out of quota (${chain.join(', ')}); retrying on ${VIDEO_MODEL_LAST_RESORT}`);
+                    try {
+                        const veoOp = await startVeoOperation({
+                            modelId: VIDEO_MODEL_LAST_RESORT, prompt, imageBase64: rawImageBase64, ratio, durationSeconds,
+                        });
+                        console.log(`[Veo] fallback operation ${veoOp}`);
+                        return res.json({ operationName: veoOp, api: 'veo', model: VIDEO_MODEL_LAST_RESORT, fallback: true });
+                    } catch (veoErr) {
+                        console.error('[Veo] fallback also failed:', veoErr.message);
+                        return res.status(503).json({
+                            error: `No Gemini Omni model has quota (tried ${chain.join(', ')}) and the `
+                                 + `${VIDEO_MODEL_LAST_RESORT} fallback also failed: ${veoErr.message}`
+                        });
+                    }
+                }
+
                 return res.status(429).json({
                     error: `No Gemini Omni model has quota in this project (tried ${chain.join(', ')}). `
                          + `These are Preview models with fixed quota only, so quota must be granted per base model. `
-                         + `As a stopgap you can deploy with VIDEO_MODEL set to a Veo id (e.g. veo-3.1-fast-generate-001), `
-                         + `which still routes through the Veo API. `
                          + `Original error: ${lastQuotaErr ? lastQuotaErr.message : 'unknown'}`
                 });
             }
@@ -1317,24 +1364,9 @@ apiRouter.post('/gemini/generate-video', async (req, res) => {
             return res.json({ operationName: interactionId, api: 'interactions', model: usedModel });
         }
 
-        // ── Veo via predictLongRunning (kept selectable) ────────────────────
-        const ai = getVeoClient();  // Veo only available in us-central1
-        const config = {
-            numberOfVideos: 1,
-            resolution: '720p',
-            aspectRatio: ratio,
-            durationSeconds: durationSeconds || 6,
-            personGeneration: 'allow_adult',
-        };
-
-        const operation = await ai.models.generateVideos({
-            model: modelId,
-            prompt,
-            image: { imageBytes: imageBase64, mimeType: 'image/png' },
-            config
-        });
-
-        res.json({ operationName: operation.name, api: 'veo' });
+        // ── Veo via predictLongRunning (reachable via VIDEO_MODEL) ──────────
+        const veoOperation = await startVeoOperation({ modelId, prompt, imageBase64: rawImageBase64, ratio, durationSeconds });
+        res.json({ operationName: veoOperation, api: 'veo', model: modelId });
     } catch (err) {
         console.error('[Gemini] generate-video error:', err);
         res.status(500).json({ error: err.message });

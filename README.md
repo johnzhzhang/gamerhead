@@ -238,8 +238,23 @@ for Veo:
 | Consumption | Preview, fixed quota. Omni Flash has quota by default; **Omni 1.1 must be granted quota per project** | pay-as-you-go |
 
 `/api/gemini/video-operation` tells the two apart by whether the handle contains
-`/operations/`, so both paths coexist and the Studio model picker chooses between
-them per generation. `VIDEO_MODEL` and `VIDEO_RESOLUTION` override the defaults.
+`/operations/`, so both paths coexist behind one opaque handle.
+
+### Model chain
+
+The Studio picker only offers the two Gemini Omni models. Veo is a **background
+safety net**, not a user-facing choice — the server walks this chain per request:
+
+1. `VIDEO_MODEL` (default `gemini-omni-1.1-flash-preview`) — primary
+2. `VIDEO_MODEL_FALLBACK` (default `gemini-omni-flash-preview`) — used when the
+   primary returns a persistent quota 429
+3. `VIDEO_MODEL_LAST_RESORT` (default `veo-3.1-fast-generate-001`) — used when
+   every Omni candidate is out of quota. Veo is pay-as-you-go so it is always
+   available. Set the variable to an empty string to disable the net.
+
+The response reports which model actually ran (`model`) and whether the Veo net
+fired (`fallback: true`); the client does not need to care, because the polling
+endpoint routes on the handle shape.
 
 ### Two gotchas found against the live API
 

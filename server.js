@@ -739,11 +739,19 @@ const getVertexAIGlobalClient = () => {
 //     content item — not in `response.videos[]`.
 //   * Preview + fixed-quota only: no PayGo, no Provisioned Throughput. A project
 //     without quota gets an error, which is why the Veo path is kept selectable.
-const GEMINI_VIDEO_MODEL = 'gemini-omni-1.1-flash-preview';
+// Two Gemini Omni video models exist, both on the Interactions API:
+//   * gemini-omni-1.1-flash-preview — 360p/720p/1080p/4k
+//   * gemini-omni-flash-preview     — 720p only
+// The 1.1 model is the newer one but needs fixed quota granted per project;
+// gemini-omni-flash-preview is the default here because it has quota in the
+// target project out of the box. Override with VIDEO_MODEL.
+const GEMINI_VIDEO_MODEL = 'gemini-omni-flash-preview';
 const VIDEO_MODEL_DEFAULT = process.env.VIDEO_MODEL || GEMINI_VIDEO_MODEL;
 const VIDEO_RESOLUTION_DEFAULT = process.env.VIDEO_RESOLUTION || '720p';
 
 const OMNI_ALLOWED_RESOLUTIONS = ['360p', '720p', '1080p', '4k'];
+// gemini-omni-flash-preview only supports 720p; 1.1 supports the full set.
+const OMNI_720P_ONLY_MODELS = ['gemini-omni-flash-preview'];
 
 /** True when the model id is served by the Interactions API rather than Veo. */
 const isInteractionsModel = (modelId) => !String(modelId || '').startsWith('veo-');
@@ -755,15 +763,19 @@ const interactionsUrl = (suffix = '') => {
     return `https://aiplatform.googleapis.com/v1beta1/projects/${GCP_PROJECT_ID}/locations/global/interactions${suffix}`;
 };
 
-/** POST to the Interactions API with ADC credentials. */
-const callInteractions = async (suffix, body) => {
+/** Call the Interactions API with ADC credentials. POST to create, GET to read. */
+const callInteractions = async (suffix, body, method = 'POST') => {
     const token = await getAccessToken();
     const url = interactionsUrl(suffix);
-    const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json; charset=utf-8' },
-        body: JSON.stringify(body ?? {}),
-    });
+    const options = {
+        method,
+        headers: { 'Authorization': `Bearer ${token}` },
+    };
+    if (method === 'POST') {
+        options.headers['Content-Type'] = 'application/json; charset=utf-8';
+        options.body = JSON.stringify(body ?? {});
+    }
+    const resp = await fetch(url, options);
     const text = await resp.text();
     if (!resp.ok) {
         throw new Error(`Interactions API ${resp.status} on ${suffix || '/'}: ${text.slice(0, 600)}`);
@@ -1213,7 +1225,9 @@ apiRouter.post('/gemini/generate-video', async (req, res) => {
             // duration: integer 3..10 followed by "s"
             const secs = Math.min(10, Math.max(3, Math.round(Number(durationSeconds) || 8)));
             const wantedResolution = String(resolution || VIDEO_RESOLUTION_DEFAULT);
-            const outResolution = OMNI_ALLOWED_RESOLUTIONS.includes(wantedResolution) ? wantedResolution : '720p';
+            let outResolution = OMNI_ALLOWED_RESOLUTIONS.includes(wantedResolution) ? wantedResolution : '720p';
+            // gemini-omni-flash-preview only supports 720p.
+            if (OMNI_720P_ONLY_MODELS.includes(modelId)) outResolution = '720p';
 
             const body = {
                 model: modelId,
@@ -1300,7 +1314,9 @@ apiRouter.get('/gemini/video-operation', async (req, res) => {
     try {
         // ── Gemini Omni: read the interaction by id ─────────────────────────
         if (!isVeoOperation) {
-            const interaction = await callInteractions(`/${encodeURIComponent(name)}`);
+            // Read with GET. The docs show POST for the retrieval call, but that
+            // returns 404 against the live API; GET returns the interaction.
+            const interaction = await callInteractions(`/${encodeURIComponent(name)}`, null, 'GET');
             const status = interaction?.status;
             console.log(`[Omni] interaction ${name} status=${status}`);
 

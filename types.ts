@@ -15,6 +15,7 @@ export type DialoguePacking = 'Slow' | 'Normal' | 'Fast';
  * options remain selectable as a fallback.
  */
 export type VideoModel =
+  | 'gemini-omni-flash-preview'
   | 'gemini-omni-1.1-flash-preview'
   | 'veo-3.1-generate-001'
   | 'veo-3.1-fast-generate-001';

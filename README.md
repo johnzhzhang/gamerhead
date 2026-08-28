@@ -35,7 +35,7 @@ Every AI call runs server-side through Vertex AI with Application Default Creden
 |---|---|
 | **Script generation** | `gemini-3.5-flash` reads your gameplay video plus the project details and returns a timed shot list (start/end, duration, streamer action, dialogue) as structured JSON. Optional Google Search grounding pulls in real facts about the game. |
 | **Avatar generation** | `gemini-3.1-flash-image` renders the streamer at the exact aspect ratio the layout needs. You can supply a reference image to lock the character's look and only describe the pose. Every generated avatar is persisted to `gs://<bucket>/avatars/` and listed in the Avatar Lab so it can be reused without paying for a new generation. |
-| **Clip generation** | `gemini-omni-1.1-flash-preview` animates the avatar per shot, with speech. Veo 3.1 (standard or fast) stays selectable as a fallback. Generate one take or two in parallel and pick the better one. Clips can chain from the previous clip's last frame for continuity. |
+| **Clip generation** | `gemini-omni-flash-preview` animates the avatar per shot, with speech (Gemini Omni 1.1 and Veo 3.1 are also selectable). Veo 3.1 (standard or fast) stays selectable as a fallback. Generate one take or two in parallel and pick the better one. Clips can chain from the previous clip's last frame for continuity. |
 | **Composition** | FFmpeg concatenates the clips server-side; the browser then composites the streamer over your gameplay as picture-in-picture, stacked, or streamer-only, with an audio mix slider. |
 | **Burned-in subtitles** | Optional. Built from the script dialogue, rendered as ASS with size pinned to the real video dimensions, burned by FFmpeg onto the full frame (not the tiny PiP window). |
 | **Preview before download** | Every export can be played inline in the browser before you keep it. |
@@ -140,7 +140,7 @@ gcloud beta iap web add-iam-policy-binding \
 | `AUTHORIZED_USERS` | no | GIS mode email allowlist. Empty means anyone who clears the consent screen gets in. |
 | `AUTHORIZED_DOMAIN` | no | GIS mode single-domain restriction, e.g. `example.com`. |
 | `BASIC_AUTH_USERS` | conditional | `user:pass,user2:pass2`. Setting it switches the app into Basic-Auth mode. |
-| `VIDEO_MODEL` | no | Overrides the clip-generation model. Defaults to `gemini-omni-1.1-flash-preview`. Any id starting with `veo-` routes to the Veo API instead. |
+| `VIDEO_MODEL` | no | Overrides the clip-generation model. Defaults to `gemini-omni-flash-preview`; `gemini-omni-1.1-flash-preview` and `veo-*` ids are also accepted. Any id starting with `veo-` routes to the Veo API. |
 | `VIDEO_RESOLUTION` | no | Gemini Omni output resolution: `360p` / `720p` / `1080p` / `4k`. Defaults to `720p`. |
 | `PORT` | no | Defaults to `8080`. |
 | `NODE_ENV` | no | Anything other than `development` means production (static `dist/`). `development` mounts Vite middleware. |
@@ -218,21 +218,24 @@ printf '1\n2\ny\ngamerheads\nus-central1\ny\n' | ./deploy.sh   # mode 2, non-int
 
 ## Video generation models
 
-Clip generation defaults to **`gemini-omni-1.1-flash-preview`**
-([model docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-1-1-flash)).
-It is not a drop-in swap for Veo — it is served by a different API:
+Clip generation defaults to **`gemini-omni-flash-preview`**
+([model docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-flash-preview)).
+`gemini-omni-1.1-flash-preview`
+([docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-1-1-flash))
+is also selectable. Both are served by the Interactions API — not a drop-in swap
+for Veo:
 
-| | **Gemini Omni 1.1 Flash** (default) | **Veo 3.1** (fallback) |
+| | **Gemini Omni Flash** (default) / **Omni 1.1** | **Veo 3.1** (fallback) |
 |---|---|---|
 | API | Interactions API: `POST .../locations/global/interactions` | `predictLongRunning` + `fetchPredictOperation` |
 | Region | `global` only — there is no regional host | `us-central1` only |
 | Start frame | Cloud Storage `uri` (the app stages it under `frames/`) | inline base64 |
 | Duration | string `"3s"`–`"10s"` | integer 4 / 6 / 8 |
-| Resolution | `360p` / `720p` / `1080p` / `4k`, default `720p` | `720p` / `1080p` |
+| Resolution | `720p` (Omni Flash) · `360p`–`4k` (Omni 1.1) | `720p` / `1080p` |
 | System instructions | **not supported** | supported |
 | Output location | `steps[]` → `model_output` step → `video` content item | `response.videos[]` |
 | Handle returned to the client | interaction id | long-running-operation name |
-| Consumption | Preview, **fixed quota only** — no pay-as-you-go | pay-as-you-go |
+| Consumption | Preview, fixed quota. Omni Flash has quota by default; **Omni 1.1 must be granted quota per project** | pay-as-you-go |
 
 `/api/gemini/video-operation` tells the two apart by whether the handle contains
 `/operations/`, so both paths coexist and the Studio model picker chooses between
@@ -247,9 +250,12 @@ them per generation. `VIDEO_MODEL` and `VIDEO_RESOLUTION` override the defaults.
 400 invalid_request: Unknown parameter 'background' at 'input[0]'
 ```
 
-**Quota is not granted by default.** Because the model is Preview with fixed
-quota and no pay-as-you-go, a project that has not been granted quota gets a
-persistent (not transient) 429:
+**Retrieval is a GET, not a POST.** The docs show `POST .../interactions/{id}`
+to fetch a finished interaction; that returns 404. `GET` returns it.
+
+**Omni 1.1 needs quota.** `gemini-omni-flash-preview` has fixed quota by default,
+but `gemini-omni-1.1-flash-preview` returns a persistent (not transient) 429
+until quota is granted for the base model:
 
 ```
 429 too_many_requests: Quota exceeded for
@@ -258,8 +264,7 @@ with base model: gemini-omni-1.1-flash-preview
 ```
 
 The server turns that into an actionable message and points at the Veo fallback
-rather than surfacing a raw quota error. Request quota for the base model before
-expecting the default path to work.
+rather than surfacing a raw quota error.
 
 ---
 

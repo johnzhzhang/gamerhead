@@ -552,7 +552,7 @@ const GameHeads: React.FC<{
             
             <div className="flex items-center gap-4">
                 <span className="text-[10px] font-bold text-google-green bg-green-900/20 px-3 py-1.5 rounded-full border border-green-800 flex items-center gap-1">
-                    ⚡ Powered by Nano Banana & Veo 3.1
+                    ⚡ Powered by Nano Banana & Gemini Omni
                 </span>
                 {currentUser && onSignOut && (
                     <div className="flex items-center gap-2">

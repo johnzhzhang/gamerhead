@@ -255,7 +255,14 @@ export const generateVeoClip = async (
       throw err;
     }
 
-    if (!pollResult.done) continue;
+    if (!pollResult.done) {
+      // The server may transparently resubmit (content_blocked retry, or a
+      // fallback to another model) and hand back a new handle to poll. Follow it.
+      if (pollResult.operationName && pollResult.operationName !== operationName) {
+        operationName = pollResult.operationName;
+      }
+      continue;
+    }
 
     if (pollResult.error) {
       logEvent('video', model, 'failed', { error: pollResult.error });

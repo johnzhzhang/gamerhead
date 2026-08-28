@@ -1277,8 +1277,113 @@ const startVeoOperation = async ({ modelId, prompt, imageBase64, ratio, duration
     return operation.name;
 };
 
-// POST /api/gemini/generate-video
-// Body: { prompt, imageBase64, aspectRatio, durationSeconds, model, resolution }
+// ── Content-blocked retry / Veo fallback plumbing ──────────────────────────
+//
+// The Interactions API only reveals a content_blocked failure at POLL time, by
+// which point the poll request no longer has the prompt or the start frame. So
+// the generation context is persisted (Datastore, keyed by the handle) when the
+// job starts, and the poll endpoint looks it up to resubmit. Cloud Run runs
+// multiple instances, so an in-memory map would not survive a poll landing on a
+// different instance — Datastore is the safe store.
+const VIDEO_JOB_KIND = 'VideoJob';
+// The RAI filter is non-deterministic, so a plain retry on the same Omni model
+// often passes. After this many blocked retries, fall through to Veo.
+const VIDEO_BLOCK_RETRIES = Number(process.env.VIDEO_BLOCK_RETRIES ?? 1);
+
+const saveVideoJob = async (handle, ctx) => {
+    const db = getDb();
+    if (!db) return; // best-effort; without it, retry just won't fire
+    try {
+        await db.save({
+            key: db.key([VIDEO_JOB_KIND, handle]),
+            data: {
+                prompt: ctx.prompt,
+                frameUri: ctx.frameUri || null,
+                ratio: ctx.ratio,
+                secs: ctx.secs,
+                wantedResolution: ctx.wantedResolution,
+                durationSeconds: ctx.durationSeconds ?? null,
+                blockRetries: ctx.blockRetries || 0,
+                createdAt: new Date(),
+            },
+            excludeFromIndexes: ['prompt'],
+        });
+    } catch (err) {
+        console.warn('[VideoJob] save failed (retry disabled for this job):', err.message);
+    }
+};
+
+const loadVideoJob = async (handle) => {
+    const db = getDb();
+    if (!db) return null;
+    try {
+        const [entity] = await db.get(db.key([VIDEO_JOB_KIND, handle]));
+        return entity || null;
+    } catch (err) {
+        console.warn('[VideoJob] load failed:', err.message);
+        return null;
+    }
+};
+
+/** Download a gs:// object and return its base64 (for Veo's inline image input). */
+const gcsObjectToBase64 = async (gcsUri) => {
+    const withoutScheme = gcsUri.slice(5);
+    const slashIdx = withoutScheme.indexOf('/');
+    const bucketName = withoutScheme.slice(0, slashIdx);
+    const objectName = withoutScheme.slice(slashIdx + 1);
+    const [buf] = await getStorage().bucket(bucketName).file(objectName).download();
+    return buf.toString('base64');
+};
+
+/**
+ * Start a video generation and persist its context for retry. Walks the Omni
+ * chain (primary → fallback), then Veo on quota exhaustion. Returns
+ * { operationName, api, model, fallback }.
+ */
+const beginVideoJob = async (ctx) => {
+    const { prompt, frameUri, ratio, secs, wantedResolution } = ctx;
+
+    const chain = [ctx.primaryModel || VIDEO_MODEL_DEFAULT];
+    if (VIDEO_MODEL_FALLBACK && VIDEO_MODEL_FALLBACK !== chain[0] && isInteractionsModel(VIDEO_MODEL_FALLBACK)) {
+        chain.push(VIDEO_MODEL_FALLBACK);
+    }
+
+    let interactionId = null;
+    let usedModel = null;
+    let lastQuotaErr = null;
+    for (const candidate of chain) {
+        try {
+            interactionId = await startOmniInteraction({ modelId: candidate, prompt, frameUri, ratio, secs, resolution: wantedResolution });
+            usedModel = candidate;
+            break;
+        } catch (err) {
+            if (err.isQuota) { lastQuotaErr = err; continue; }
+            throw err;
+        }
+    }
+
+    if (interactionId) {
+        await saveVideoJob(interactionId, ctx);
+        return { operationName: interactionId, api: 'interactions', model: usedModel, fallback: usedModel !== chain[0] };
+    }
+
+    // Every Omni candidate is out of quota → Veo safety net.
+    if (VIDEO_MODEL_LAST_RESORT) {
+        const imageBase64 = ctx.rawImageBase64 || (frameUri ? await gcsObjectToBase64(frameUri) : null);
+        if (!imageBase64) throw new Error('No image available for Veo fallback');
+        const veoOp = await startVeoOperation({
+            modelId: VIDEO_MODEL_LAST_RESORT, prompt, imageBase64, ratio, durationSeconds: ctx.durationSeconds,
+        });
+        console.log(`[Veo] quota fallback operation ${veoOp}`);
+        return { operationName: veoOp, api: 'veo', model: VIDEO_MODEL_LAST_RESORT, fallback: true };
+    }
+
+    const quotaErr = new Error(lastQuotaErr ? lastQuotaErr.message : 'no Omni quota');
+    quotaErr.allQuota = true;
+    throw quotaErr;
+};
+
+// POST /api/gemini/generate-video// Body: { prompt, imageBase64, aspectRatio, durationSeconds, model, resolution }
 // Returns: { operationName: string, api: 'interactions' | 'veo' }
 //
 // `operationName` is an opaque handle the client hands back to
@@ -1321,72 +1426,25 @@ apiRouter.post('/gemini/generate-video', async (req, res) => {
             const secs = Math.min(10, Math.max(3, Math.round(Number(durationSeconds) || 8)));
             const wantedResolution = String(resolution || VIDEO_RESOLUTION_DEFAULT);
 
-            // Try the requested (primary) model. If it has no quota, and a
-            // different Omni fallback is configured, transparently retry with it
-            // so the user keeps generating instead of hitting a dead end.
-            const chain = [modelId];
-            if (VIDEO_MODEL_FALLBACK
-                && VIDEO_MODEL_FALLBACK !== modelId
-                && isInteractionsModel(VIDEO_MODEL_FALLBACK)) {
-                chain.push(VIDEO_MODEL_FALLBACK);
-            }
-
-            let interactionId = null;
-            let usedModel = null;
-            let lastQuotaErr = null;
-            for (const candidate of chain) {
-                try {
-                    interactionId = await startOmniInteraction({
-                        modelId: candidate, prompt, frameUri, ratio, secs, resolution: wantedResolution,
-                    });
-                    usedModel = candidate;
-                    break;
-                } catch (err) {
-                    if (err.isQuota) {
-                        console.warn(`[Omni] ${candidate} has no quota; ${candidate === chain[chain.length - 1] ? 'no more fallbacks' : 'falling back'}`);
-                        lastQuotaErr = err;
-                        continue;
-                    }
-                    throw err;
-                }
-            }
-
-            if (!interactionId) {
-                // Every Omni candidate is out of quota. Rather than failing the
-                // user's generation, silently retry on Veo. The client only ever
-                // sees an opaque handle, and /api/gemini/video-operation routes
-                // by whether it looks like an LRO name, so this is transparent.
-                // Veo is deliberately NOT offered in the Studio picker — it is a
-                // background safety net, not a user-facing choice.
-                if (VIDEO_MODEL_LAST_RESORT) {
-                    console.warn(`[Omni] all Omni models out of quota (${chain.join(', ')}); retrying on ${VIDEO_MODEL_LAST_RESORT}`);
-                    try {
-                        const veoOp = await startVeoOperation({
-                            modelId: VIDEO_MODEL_LAST_RESORT, prompt, imageBase64: rawImageBase64, ratio, durationSeconds,
-                        });
-                        console.log(`[Veo] fallback operation ${veoOp}`);
-                        return res.json({ operationName: veoOp, api: 'veo', model: VIDEO_MODEL_LAST_RESORT, fallback: true });
-                    } catch (veoErr) {
-                        console.error('[Veo] fallback also failed:', veoErr.message);
-                        return res.status(503).json({
-                            error: `No Gemini Omni model has quota (tried ${chain.join(', ')}) and the `
-                                 + `${VIDEO_MODEL_LAST_RESORT} fallback also failed: ${veoErr.message}`
-                        });
-                    }
-                }
-
-                return res.status(429).json({
-                    error: `No Gemini Omni model has quota in this project (tried ${chain.join(', ')}). `
-                         + `These are Preview models with fixed quota only, so quota must be granted per base model. `
-                         + `Original error: ${lastQuotaErr ? lastQuotaErr.message : 'unknown'}`
+            try {
+                const result = await beginVideoJob({
+                    primaryModel: modelId,
+                    prompt, frameUri, ratio, secs, wantedResolution,
+                    durationSeconds, rawImageBase64,
+                    blockRetries: 0,
                 });
+                if (result.fallback) console.log(`[Omni] started via fallback → ${result.model}`);
+                console.log(`[Omni] ${result.api} handle ${result.operationName} (model=${result.model})`);
+                return res.json(result);
+            } catch (err) {
+                if (err.allQuota) {
+                    return res.status(429).json({
+                        error: `No Gemini Omni model has quota in this project. These are Preview models with `
+                             + `fixed quota only, so quota must be granted per base model. Original error: ${err.message}`
+                    });
+                }
+                throw err;
             }
-
-            if (usedModel !== modelId) {
-                console.log(`[Omni] fell back from ${modelId} to ${usedModel}`);
-            }
-            console.log(`[Omni] interaction ${interactionId} (model=${usedModel})`);
-            return res.json({ operationName: interactionId, api: 'interactions', model: usedModel });
         }
 
         // ── Veo via predictLongRunning (reachable via VIDEO_MODEL) ──────────
@@ -1430,15 +1488,48 @@ apiRouter.get('/gemini/video-operation', async (req, res) => {
                 console.warn(`[Omni] interaction ${name} ${status}: ${failure.code || 'unknown'} — ${failure.message}`);
 
                 // The RAI filter rejects photorealistic people fairly often, and
-                // this app's whole premise is a photorealistic streamer, so make
-                // that case actionable rather than opaque.
-                if (failure.code === 'content_blocked' || /Responsible AI|content_blocked/i.test(failure.message)) {
+                // this app's whole premise is a photorealistic streamer. The
+                // filter is non-deterministic, so on a block we resubmit: retry
+                // Omni a few times, then fall through to Veo (more permissive via
+                // personGeneration: allow_adult). The client keeps polling the
+                // handle we hand back, so the whole retry is transparent.
+                const isBlocked = failure.code === 'content_blocked' || /Responsible AI|content_blocked/i.test(failure.message);
+                if (isBlocked) {
+                    const job = await loadVideoJob(name);
+                    if (job) {
+                        try {
+                            const retries = job.blockRetries || 0;
+                            if (retries < VIDEO_BLOCK_RETRIES) {
+                                console.warn(`[Omni] ${name} content_blocked; retry ${retries + 1}/${VIDEO_BLOCK_RETRIES} on Omni`);
+                                const r = await beginVideoJob({
+                                    primaryModel: VIDEO_MODEL_DEFAULT,
+                                    prompt: job.prompt, frameUri: job.frameUri,
+                                    ratio: job.ratio, secs: job.secs, wantedResolution: job.wantedResolution,
+                                    durationSeconds: job.durationSeconds,
+                                    blockRetries: retries + 1,
+                                });
+                                return res.json({ done: false, operationName: r.operationName });
+                            }
+                            if (VIDEO_MODEL_LAST_RESORT && job.frameUri) {
+                                console.warn(`[Omni] ${name} content_blocked after ${retries} retries; falling back to ${VIDEO_MODEL_LAST_RESORT}`);
+                                const imageBase64 = await gcsObjectToBase64(job.frameUri);
+                                const veoOp = await startVeoOperation({
+                                    modelId: VIDEO_MODEL_LAST_RESORT, prompt: job.prompt, imageBase64,
+                                    ratio: job.ratio, durationSeconds: job.durationSeconds,
+                                });
+                                return res.json({ done: false, operationName: veoOp });
+                            }
+                        } catch (retryErr) {
+                            console.error('[Omni] content_blocked retry failed:', retryErr.message);
+                            // fall through to the blocked message below
+                        }
+                    }
                     return res.json({
                         done: true,
                         error: 'Blocked by the Vertex AI safety filter: the generated video was judged to contain '
-                             + 'reputational harm to a photorealistic person. Try regenerating — this filter is '
-                             + 'not deterministic and often passes on a retry — or soften the shot description '
-                             + `(less close-up, less identifiable). Original message: ${failure.message}`,
+                             + 'reputational harm to a photorealistic person, and automatic retries did not clear it. '
+                             + 'Try regenerating, or soften the shot description (less close-up, less identifiable). '
+                             + `Original message: ${failure.message}`,
                     });
                 }
                 return res.json({ done: true, error: `Video generation ${status}: ${failure.message}` });

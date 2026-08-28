@@ -818,8 +818,25 @@ const extractInteractionVideo = (interaction) => {
     return null;
 };
 
-/** Model thoughts, useful when a generation comes back empty. */
-const extractInteractionThoughts = (interaction) => {
+/**
+ * Pull the failure reason out of a failed interaction.
+ *
+ * The payload carries it in a top-level `errors` ARRAY, e.g.
+ *   { "errors": [ { "message": "...", "code": "content_blocked" } ] }
+ * and mirrors it on the `model_output` step as `{ error: { code, message } }`.
+ * There is no singular top-level `error` field.
+ */
+const extractInteractionError = (interaction) => {
+    const first = Array.isArray(interaction?.errors) ? interaction.errors[0] : null;
+    if (first?.message) return { code: first.code || null, message: String(first.message) };
+
+    for (const step of (Array.isArray(interaction?.steps) ? interaction.steps : [])) {
+        if (step?.error?.message) return { code: step.error.code || null, message: String(step.error.message) };
+    }
+    return { code: null, message: interaction?.status ? `status=${interaction.status}` : 'unknown failure' };
+};
+
+/** Model thoughts, useful when a generation comes back empty. */const extractInteractionThoughts = (interaction) => {
     const steps = Array.isArray(interaction?.steps) ? interaction.steps : [];
     for (const step of steps) {
         if (step?.type !== 'thought') continue;
@@ -1405,8 +1422,26 @@ apiRouter.get('/gemini/video-operation', async (req, res) => {
                 return res.json({ done: false });
             }
             if (status && status !== 'completed') {
-                const detail = interaction?.error?.message || interaction?.error || status;
-                return res.json({ done: true, error: `Video generation ${status}: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}` });
+                // The failure detail lives in a top-level `errors` ARRAY (and is
+                // mirrored on the model_output step) — not a singular `error`.
+                // Reading the wrong shape is why this used to surface as a bare
+                // "Video generation failed: failed" with no reason.
+                const failure = extractInteractionError(interaction);
+                console.warn(`[Omni] interaction ${name} ${status}: ${failure.code || 'unknown'} — ${failure.message}`);
+
+                // The RAI filter rejects photorealistic people fairly often, and
+                // this app's whole premise is a photorealistic streamer, so make
+                // that case actionable rather than opaque.
+                if (failure.code === 'content_blocked' || /Responsible AI|content_blocked/i.test(failure.message)) {
+                    return res.json({
+                        done: true,
+                        error: 'Blocked by the Vertex AI safety filter: the generated video was judged to contain '
+                             + 'reputational harm to a photorealistic person. Try regenerating — this filter is '
+                             + 'not deterministic and often passes on a retry — or soften the shot description '
+                             + `(less close-up, less identifiable). Original message: ${failure.message}`,
+                    });
+                }
+                return res.json({ done: true, error: `Video generation ${status}: ${failure.message}` });
             }
 
             const video = extractInteractionVideo(interaction);

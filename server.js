@@ -720,6 +720,92 @@ const getVertexAIGlobalClient = () => {
     });
 };
 
+// ── VIDEO GENERATION MODELS ────────────────────────────────────────────────
+//
+// Default is Gemini Omni 1.1 Flash (Preview), which does NOT use the Veo
+// long-running-prediction API. It is served by the Interactions API:
+//
+//   POST https://aiplatform.googleapis.com/v1beta1/projects/<p>/locations/global/interactions
+//
+// Differences that drive the code below
+// (https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-1-1-flash):
+//   * Region: `global` only — there is no regional host, unlike Veo's us-central1.
+//   * Image input is documented as a Cloud Storage `uri`, so the start frame is
+//     uploaded to the bucket first rather than sent as inline base64.
+//   * `duration` is a string in seconds, "3s".."10s" (Veo took an integer 4/6/8).
+//   * `resolution` accepts 360p/720p/1080p/4k and defaults to 720p.
+//   * System instructions are NOT supported, so any caller-supplied one is dropped.
+//   * Output arrives in `steps[]` as a `model_output` step containing a `video`
+//     content item — not in `response.videos[]`.
+//   * Preview + fixed-quota only: no PayGo, no Provisioned Throughput. A project
+//     without quota gets an error, which is why the Veo path is kept selectable.
+const GEMINI_VIDEO_MODEL = 'gemini-omni-1.1-flash-preview';
+const VIDEO_MODEL_DEFAULT = process.env.VIDEO_MODEL || GEMINI_VIDEO_MODEL;
+const VIDEO_RESOLUTION_DEFAULT = process.env.VIDEO_RESOLUTION || '720p';
+
+const OMNI_ALLOWED_RESOLUTIONS = ['360p', '720p', '1080p', '4k'];
+
+/** True when the model id is served by the Interactions API rather than Veo. */
+const isInteractionsModel = (modelId) => !String(modelId || '').startsWith('veo-');
+
+const interactionsUrl = (suffix = '') => {
+    if (!GCP_PROJECT_ID) {
+        throw new Error('GCP_PROJECT_ID / GOOGLE_CLOUD_PROJECT environment variable is not set.');
+    }
+    return `https://aiplatform.googleapis.com/v1beta1/projects/${GCP_PROJECT_ID}/locations/global/interactions${suffix}`;
+};
+
+/** POST to the Interactions API with ADC credentials. */
+const callInteractions = async (suffix, body) => {
+    const token = await getAccessToken();
+    const url = interactionsUrl(suffix);
+    const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify(body ?? {}),
+    });
+    const text = await resp.text();
+    if (!resp.ok) {
+        throw new Error(`Interactions API ${resp.status} on ${suffix || '/'}: ${text.slice(0, 600)}`);
+    }
+    try {
+        return JSON.parse(text);
+    } catch {
+        throw new Error(`Interactions API returned non-JSON: ${text.slice(0, 300)}`);
+    }
+};
+
+/**
+ * Pull the generated video out of an interaction. The payload is a list of
+ * `steps`; the one we want is `type: "model_output"` with a `video` content item
+ * carrying either a `uri` (when response_format.gcs_uri was set) or inline `data`.
+ */
+const extractInteractionVideo = (interaction) => {
+    const steps = Array.isArray(interaction?.steps) ? interaction.steps : [];
+    for (const step of steps) {
+        if (step?.type !== 'model_output') continue;
+        for (const item of (Array.isArray(step.content) ? step.content : [])) {
+            if (item?.type !== 'video') continue;
+            if (typeof item.uri === 'string' && item.uri) return { uri: item.uri };
+            if (typeof item.data === 'string' && item.data) return { data: item.data, mimeType: item.mime_type || 'video/mp4' };
+        }
+    }
+    return null;
+};
+
+/** Model thoughts, useful when a generation comes back empty. */
+const extractInteractionThoughts = (interaction) => {
+    const steps = Array.isArray(interaction?.steps) ? interaction.steps : [];
+    for (const step of steps) {
+        if (step?.type !== 'thought') continue;
+        const texts = (Array.isArray(step.summary) ? step.summary : [])
+            .filter(s => s?.type === 'text' && typeof s.text === 'string')
+            .map(s => s.text);
+        if (texts.length) return texts.join(' ').slice(0, 400);
+    }
+    return null;
+};
+
 // Get ADC access token for authenticated video download
 // Works on Cloud Run (metadata server) and local dev (ADC / GOOGLE_APPLICATION_CREDENTIALS)
 const getAccessToken = async () => {
@@ -1088,35 +1174,112 @@ apiRouter.post('/gemini/generate-avatar', async (req, res) => {
 });
 
 // POST /api/gemini/generate-video
-// Body: { prompt, imageBase64, aspectRatio, durationSeconds, model, systemInstruction }
-// Returns: { operationName: string }
+// Body: { prompt, imageBase64, aspectRatio, durationSeconds, model, resolution }
+// Returns: { operationName: string, api: 'interactions' | 'veo' }
+//
+// `operationName` is an opaque handle the client hands back to
+// /api/gemini/video-operation. For Gemini Omni it is an interaction id; for Veo
+// it is a long-running-operation name.
 apiRouter.post('/gemini/generate-video', async (req, res) => {
-    const { prompt, imageBase64, aspectRatio, durationSeconds, model, systemInstruction } = req.body;
+    const { prompt, imageBase64, aspectRatio, durationSeconds, model, resolution } = req.body;
     if (!prompt || !imageBase64) return res.status(400).json({ error: 'prompt and imageBase64 are required' });
 
-    try {
-        const ai = getVeoClient();  // Veo only available in us-central1
-        const veoModel = model || 'veo-3.1-generate-001';
-        const veoRatio = aspectRatio === '9:16' ? '9:16' : '16:9';
+    const modelId = model || VIDEO_MODEL_DEFAULT;
+    const ratio = aspectRatio === '9:16' ? '9:16' : '16:9';
 
+    try {
+        // ── Gemini Omni via the Interactions API ────────────────────────────
+        if (isInteractionsModel(modelId)) {
+            if (!GCS_BUCKET_NAME) {
+                return res.status(503).json({
+                    error: 'GCS_BUCKET_NAME is required for Gemini Omni video generation: '
+                         + 'the start frame is passed to the model as a Cloud Storage URI.'
+                });
+            }
+
+            // The documented image input is a gs:// URI, so persist the start
+            // frame first. It doubles as a record of what each clip was seeded from.
+            const rawBase64 = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
+            const frameUri = await uploadImageToBucket({
+                base64: rawBase64,
+                mimeType: 'image/png',
+                label: 'startframe',
+                prefix: 'frames',
+            });
+            if (!frameUri) {
+                return res.status(500).json({ error: 'Failed to stage the start frame in Cloud Storage.' });
+            }
+
+            // duration: integer 3..10 followed by "s"
+            const secs = Math.min(10, Math.max(3, Math.round(Number(durationSeconds) || 8)));
+            const wantedResolution = String(resolution || VIDEO_RESOLUTION_DEFAULT);
+            const outResolution = OMNI_ALLOWED_RESOLUTIONS.includes(wantedResolution) ? wantedResolution : '720p';
+
+            const body = {
+                model: modelId,
+                // Asynchronous: the interaction is retained for 14 days and read
+                // back by id. NOTE: the docs show `background` inside input[0],
+                // but the API rejects that with
+                //   400 invalid_request: Unknown parameter 'background' at 'input[0]'
+                // It has to be a top-level field. Verified against the live API.
+                background: true,
+                input: [
+                    { type: 'text', text: prompt },
+                    { type: 'image', uri: frameUri, mime_type: 'image/png' },
+                ],
+                response_format: [{
+                    type: 'video',
+                    delivery: 'uri',
+                    gcs_uri: `gs://${GCS_BUCKET_NAME}/videos/`,
+                    aspect_ratio: ratio,
+                    resolution: outResolution,
+                    duration: `${secs}s`,
+                }],
+                generation_config: { video_config: { task: 'image_to_video' } },
+            };
+
+            console.log(`[Omni] interactions request — model=${modelId} ratio=${ratio} res=${outResolution} duration=${secs}s frame=${frameUri}`);
+            let interaction;
+            try {
+                interaction = await callInteractions('', body);
+            } catch (err) {
+                // The model is Preview with fixed quota only (no PayGo), so a
+                // project that has not been granted quota gets a persistent 429
+                // rather than a transient one. Say so, and point at the fallback.
+                if (/too_many_requests|Quota exceeded/i.test(err.message)) {
+                    return res.status(429).json({
+                        error: `${modelId} has no quota in this project. It is a Preview model with fixed quota only `
+                             + `(pay-as-you-go is not supported), so quota must be requested for the base model. `
+                             + `Pick a Veo model in the Studio to keep generating meanwhile. Original error: ${err.message}`
+                    });
+                }
+                throw err;
+            }
+            if (!interaction?.id) {
+                throw new Error('Interactions API did not return an interaction id: ' + JSON.stringify(interaction).slice(0, 300));
+            }
+            console.log(`[Omni] interaction ${interaction.id} status=${interaction.status}`);
+            return res.json({ operationName: interaction.id, api: 'interactions' });
+        }
+
+        // ── Veo via predictLongRunning (kept selectable) ────────────────────
+        const ai = getVeoClient();  // Veo only available in us-central1
         const config = {
             numberOfVideos: 1,
             resolution: '720p',
-            aspectRatio: veoRatio,
+            aspectRatio: ratio,
             durationSeconds: durationSeconds || 6,
             personGeneration: 'allow_adult',
         };
-        if (systemInstruction) config.systemInstruction = systemInstruction;
 
         const operation = await ai.models.generateVideos({
-            model: veoModel,
+            model: modelId,
             prompt,
             image: { imageBytes: imageBase64, mimeType: 'image/png' },
             config
         });
 
-        // Return the operation name for client-side polling
-        res.json({ operationName: operation.name });
+        res.json({ operationName: operation.name, api: 'veo' });
     } catch (err) {
         console.error('[Gemini] generate-video error:', err);
         res.status(500).json({ error: err.message });
@@ -1124,14 +1287,72 @@ apiRouter.post('/gemini/generate-video', async (req, res) => {
 });
 
 // GET /api/gemini/video-operation?name=xxx
-// Returns: { done: bool, videoUri?: string, error?: string }
-// NOTE: We use direct REST API here because the SDK's getVideosOperation()
-// requires a SDK-internal Operation object, not a plain { name } object.
+// Returns: { done: bool, videoUri?: string, videoBase64?: string, error?: string }
+//
+// `name` is either a Gemini Omni interaction id or a Veo long-running-operation
+// name; they are told apart by whether the value looks like an LRO path.
 apiRouter.get('/gemini/video-operation', async (req, res) => {
     const { name } = req.query;
     if (!name) return res.status(400).json({ error: 'name is required' });
 
+    const isVeoOperation = typeof name === 'string' && name.includes('/operations/');
+
     try {
+        // ── Gemini Omni: read the interaction by id ─────────────────────────
+        if (!isVeoOperation) {
+            const interaction = await callInteractions(`/${encodeURIComponent(name)}`);
+            const status = interaction?.status;
+            console.log(`[Omni] interaction ${name} status=${status}`);
+
+            if (status === 'in_progress' || status === 'queued' || status === 'pending') {
+                return res.json({ done: false });
+            }
+            if (status && status !== 'completed') {
+                const detail = interaction?.error?.message || interaction?.error || status;
+                return res.json({ done: true, error: `Video generation ${status}: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}` });
+            }
+
+            const video = extractInteractionVideo(interaction);
+            if (!video) {
+                const thoughts = extractInteractionThoughts(interaction);
+                return res.json({
+                    done: true,
+                    error: 'The model returned no video. This is usually a safety filter or an unsupported prompt.'
+                         + (thoughts ? ` Model notes: ${thoughts}` : ''),
+                });
+            }
+
+            // response_format.gcs_uri points at our own bucket, so a returned URI
+            // normally needs no copy. Copy only if it landed somewhere else.
+            if (video.uri) {
+                let finalUri = video.uri;
+                if (GCS_BUCKET_NAME && !finalUri.startsWith(`gs://${GCS_BUCKET_NAME}/`)) {
+                    try {
+                        finalUri = await copyVideoToBucket(finalUri);
+                    } catch (copyErr) {
+                        console.error('[GCS] Copy to customer bucket failed, using original URI:', copyErr.message);
+                    }
+                }
+                return res.json({ done: true, videoUri: finalUri });
+            }
+
+            // Inline bytes (no gcs_uri honoured): persist, else hand back base64.
+            if (GCS_BUCKET_NAME) {
+                try {
+                    const objectName = `videos/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp4`;
+                    await getStorage().bucket(GCS_BUCKET_NAME).file(objectName)
+                        .save(Buffer.from(video.data, 'base64'), { contentType: 'video/mp4', resumable: false });
+                    const uri = `gs://${GCS_BUCKET_NAME}/${objectName}`;
+                    console.log(`[Omni] inline video uploaded to ${uri}`);
+                    return res.json({ done: true, videoUri: uri });
+                } catch (uploadErr) {
+                    console.error('[GCS] Failed to upload inline video bytes:', uploadErr.message);
+                }
+            }
+            return res.json({ done: true, videoBase64: `data:${video.mimeType};base64,${video.data}` });
+        }
+
+        // ── Veo: poll via fetchPredictOperation ─────────────────────────────
         const token = await getAccessToken();
 
         // Veo operations must be polled via fetchPredictOperation (not standard GET /operations/{id})

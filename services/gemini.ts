@@ -1,5 +1,5 @@
 
-import { GameInfo, ScriptResult, AvatarConfig, VeoSegment } from "../types";
+import { GameInfo, ScriptResult, AvatarConfig, VeoSegment, VideoModel } from "../types";
 import { 
     constructGeneratorPrompt, 
     constructAvatarPrompt,
@@ -196,7 +196,7 @@ export const generateVeoClip = async (
   imageBase64: string,
   aspectRatio: '16:9' | '9:16',
   durationSeconds: 4 | 6 | 8,
-  model: 'veo-3.1-generate-001' | 'veo-3.1-fast-generate-001',
+  model: VideoModel,
   signal?: AbortSignal,
   gamingDevice?: string
 ): Promise<VeoClipResult> => {

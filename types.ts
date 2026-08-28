@@ -6,6 +6,19 @@ export type StackedPlacement = 'top' | 'bottom' | 'left' | 'right';
 export type GamingDevice = 'Mobile (Vertical)' | 'Mobile (Horizontal)' | 'PC' | 'Console' | 'Hands-free (No device)';
 export type DialoguePacking = 'Slow' | 'Normal' | 'Fast';
 
+/**
+ * Models that can animate the avatar into a clip.
+ *
+ * `gemini-omni-1.1-flash-preview` is the default. It is served by the
+ * Interactions API rather than Veo's long-running prediction API, is available
+ * in the `global` region only, and is Preview with fixed quota — hence the Veo
+ * options remain selectable as a fallback.
+ */
+export type VideoModel =
+  | 'gemini-omni-1.1-flash-preview'
+  | 'veo-3.1-generate-001'
+  | 'veo-3.1-fast-generate-001';
+
 export interface GameInfo {
   title: string;
   url: string;

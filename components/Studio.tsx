@@ -1,7 +1,7 @@
 
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import NeonButton from './NeonButton';
-import { ScriptResult, AvatarConfig, VeoSegment, LayoutType, TargetAspectRatio, PipPlacement, StackedPlacement, ExportRecord } from '../types';
+import { ScriptResult, AvatarConfig, VeoSegment, LayoutType, TargetAspectRatio, PipPlacement, StackedPlacement, ExportRecord, VideoModel } from '../types';
 import { generateVeoClip, stitchClipsServer, burnSubtitlesServer, saveExportToGcs } from '../services/gemini';
 import { compositePipVideo } from '../utils/videoUtils';
 import { logEvent } from '../services/logging';
@@ -97,7 +97,7 @@ const Studio: React.FC<StudioProps> = ({
   const [audioVolumes, setAudioVolumes] = useState({ streamer: 1.2, gameplay: 0.3 });
 
   // Veo Model Selection
-  const [veoModel, setVeoModel] = useState<'veo-3.1-generate-001' | 'veo-3.1-fast-generate-001'>('veo-3.1-generate-001');
+  const [veoModel, setVeoModel] = useState<VideoModel>('gemini-omni-1.1-flash-preview');
 
   // Generation Mode Selection (Single vs 2 Options)
   const [genMode, setGenMode] = useState<'single' | 'options'>('single');
@@ -668,6 +668,18 @@ const Studio: React.FC<StudioProps> = ({
                     <div className="bg-[#2D2D2D] p-1.5 rounded-xl border border-gray-700 shadow-float backdrop-blur-md">
                          <div className="flex gap-1">
                             <button
+                                onClick={() => setVeoModel('gemini-omni-1.1-flash-preview')}
+                                title="Gemini Omni 1.1 Flash (Preview) — global region, fixed quota, 3–10s clips"
+                                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1 ${
+                                    veoModel === 'gemini-omni-1.1-flash-preview'
+                                    ? 'bg-google-yellow text-gray-900 shadow-sm'
+                                    : 'text-gray-400 hover:text-white hover:bg-white/5'
+                                }`}
+                            >
+                                Gemini Omni 1.1
+                                <span className="text-[8px] font-bold opacity-70">PREVIEW</span>
+                            </button>
+                            <button
                                 onClick={() => setVeoModel('veo-3.1-generate-001')}
                                 className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
                                     veoModel === 'veo-3.1-generate-001'
@@ -689,8 +701,9 @@ const Studio: React.FC<StudioProps> = ({
                                 Veo 3.1 Fast
                             </button>
                          </div>
-                         <div className="mt-1.5 text-[9px] text-gray-400 max-w-[200px] leading-tight px-1">
+                         <div className="mt-1.5 text-[9px] text-gray-400 max-w-[240px] leading-tight px-1">
                             Applies to subsequent generations.
+                            {veoModel === 'gemini-omni-1.1-flash-preview' && ' Gemini Omni is Preview and needs fixed quota in your project.'}
                          </div>
                     </div>
 

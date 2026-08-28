@@ -14,6 +14,7 @@ Every AI call runs server-side through Vertex AI with Application Default Creden
 - [Authentication modes](#authentication-modes)
 - [Environment variables](#environment-variables)
 - [The deploy script](#the-deploy-script)
+- [Video generation models](#video-generation-models)
 - [User workflow](#user-workflow)
 - [Project history](#project-history)
 - [Exports and previews](#exports-and-previews)
@@ -34,7 +35,7 @@ Every AI call runs server-side through Vertex AI with Application Default Creden
 |---|---|
 | **Script generation** | `gemini-3.5-flash` reads your gameplay video plus the project details and returns a timed shot list (start/end, duration, streamer action, dialogue) as structured JSON. Optional Google Search grounding pulls in real facts about the game. |
 | **Avatar generation** | `gemini-3.1-flash-image` renders the streamer at the exact aspect ratio the layout needs. You can supply a reference image to lock the character's look and only describe the pose. Every generated avatar is persisted to `gs://<bucket>/avatars/` and listed in the Avatar Lab so it can be reused without paying for a new generation. |
-| **Clip generation** | `veo-3.1-generate-001` (or `veo-3.1-fast-generate-001`) animates the avatar per shot, 4/6/8 seconds, with speech. Generate one take or two in parallel and pick the better one. Clips can chain from the previous clip's last frame for continuity. |
+| **Clip generation** | `gemini-omni-1.1-flash-preview` animates the avatar per shot, with speech. Veo 3.1 (standard or fast) stays selectable as a fallback. Generate one take or two in parallel and pick the better one. Clips can chain from the previous clip's last frame for continuity. |
 | **Composition** | FFmpeg concatenates the clips server-side; the browser then composites the streamer over your gameplay as picture-in-picture, stacked, or streamer-only, with an audio mix slider. |
 | **Burned-in subtitles** | Optional. Built from the script dialogue, rendered as ASS with size pinned to the real video dimensions, burned by FFmpeg onto the full frame (not the tiny PiP window). |
 | **Preview before download** | Every export can be played inline in the browser before you keep it. |
@@ -139,6 +140,8 @@ gcloud beta iap web add-iam-policy-binding \
 | `AUTHORIZED_USERS` | no | GIS mode email allowlist. Empty means anyone who clears the consent screen gets in. |
 | `AUTHORIZED_DOMAIN` | no | GIS mode single-domain restriction, e.g. `example.com`. |
 | `BASIC_AUTH_USERS` | conditional | `user:pass,user2:pass2`. Setting it switches the app into Basic-Auth mode. |
+| `VIDEO_MODEL` | no | Overrides the clip-generation model. Defaults to `gemini-omni-1.1-flash-preview`. Any id starting with `veo-` routes to the Veo API instead. |
+| `VIDEO_RESOLUTION` | no | Gemini Omni output resolution: `360p` / `720p` / `1080p` / `4k`. Defaults to `720p`. |
 | `PORT` | no | Defaults to `8080`. |
 | `NODE_ENV` | no | Anything other than `development` means production (static `dist/`). `development` mounts Vite middleware. |
 
@@ -210,6 +213,53 @@ Every non-interactive `gcloud`/`gsutil` call is invoked with `</dev/null`, becau
 ```bash
 printf '1\n2\ny\ngamerheads\nus-central1\ny\n' | ./deploy.sh   # mode 2, non-interactive
 ```
+
+---
+
+## Video generation models
+
+Clip generation defaults to **`gemini-omni-1.1-flash-preview`**
+([model docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-1-1-flash)).
+It is not a drop-in swap for Veo — it is served by a different API:
+
+| | **Gemini Omni 1.1 Flash** (default) | **Veo 3.1** (fallback) |
+|---|---|---|
+| API | Interactions API: `POST .../locations/global/interactions` | `predictLongRunning` + `fetchPredictOperation` |
+| Region | `global` only — there is no regional host | `us-central1` only |
+| Start frame | Cloud Storage `uri` (the app stages it under `frames/`) | inline base64 |
+| Duration | string `"3s"`–`"10s"` | integer 4 / 6 / 8 |
+| Resolution | `360p` / `720p` / `1080p` / `4k`, default `720p` | `720p` / `1080p` |
+| System instructions | **not supported** | supported |
+| Output location | `steps[]` → `model_output` step → `video` content item | `response.videos[]` |
+| Handle returned to the client | interaction id | long-running-operation name |
+| Consumption | Preview, **fixed quota only** — no pay-as-you-go | pay-as-you-go |
+
+`/api/gemini/video-operation` tells the two apart by whether the handle contains
+`/operations/`, so both paths coexist and the Studio model picker chooses between
+them per generation. `VIDEO_MODEL` and `VIDEO_RESOLUTION` override the defaults.
+
+### Two gotchas found against the live API
+
+**`background` goes at the top level.** The documentation shows it inside
+`input[0]`; the API rejects that:
+
+```
+400 invalid_request: Unknown parameter 'background' at 'input[0]'
+```
+
+**Quota is not granted by default.** Because the model is Preview with fixed
+quota and no pay-as-you-go, a project that has not been granted quota gets a
+persistent (not transient) 429:
+
+```
+429 too_many_requests: Quota exceeded for
+aiplatform.googleapis.com/global_generate_content_requests_per_minute_per_project_per_base_model
+with base model: gemini-omni-1.1-flash-preview
+```
+
+The server turns that into an actionable message and points at the Veo fallback
+rather than surfacing a raw quota error. Request quota for the base model before
+expecting the default path to work.
 
 ---
 
@@ -346,6 +396,7 @@ Queries filter on `ownerEmail` only and sort in memory, so no composite index is
 
 ```
 gs://<bucket>/videos/<epoch>-<rand6>.mp4                         generated clips
+gs://<bucket>/frames/<YYYY>/<MM>/startframe-<epoch>-<uuid8>.png  clip start frames
 gs://<bucket>/avatars/<YYYY>/<MM>/avatar-<epoch>-<uuid8>.png     generated avatars
 gs://<bucket>/avatars/<YYYY>/<MM>/avatar-ref-<epoch>-<uuid8>.*   uploaded reference images
 gs://<bucket>/exports/<YYYY>/<MM>/<label>-<epoch>-<uuid8>.<ext>  finished renders
@@ -386,8 +437,8 @@ Everything under `/api` except the three public endpoints requires authenticatio
 | `POST` | `/api/gemini/generate-script` | `{prompt, inlineData?, searchGrounding?}` → `{fullText, segments, groundingUrls}`. Durations are snapped to 4/6/8 s |
 | `POST` | `/api/gemini/analyze-script` | `{prompt}` → re-derived shot list from an edited script |
 | `POST` | `/api/gemini/generate-avatar` | `{prompt, aspectRatio, referenceImageData?, referenceImageMime?, model?}` → `{imageData, gcsUri}`. The image is uploaded to the bucket in the same request |
-| `POST` | `/api/gemini/generate-video` | `{prompt, imageBase64, aspectRatio, durationSeconds, model}` → `{operationName}` |
-| `GET` | `/api/gemini/video-operation?name=` | Polls Veo via `fetchPredictOperation`. Copies the result into your bucket and returns `{done, videoUri}`, or `{done, videoBase64}` when no bucket is configured, or a clear message when the RAI filter blocked it |
+| `POST` | `/api/gemini/generate-video` | `{prompt, imageBase64, aspectRatio, durationSeconds, model?, resolution?}` → `{operationName, api}` |
+| `GET` | `/api/gemini/video-operation?name=` | Reads a Gemini Omni interaction by id, or polls Veo via `fetchPredictOperation`. Returns `{done, videoUri}`, `{done, videoBase64}` when no bucket is configured, or a clear message when a safety filter blocked it |
 | `GET` | `/api/gemini/download-video?uri=` | Streams a `gs://` or legacy HTTPS Veo URI through the server |
 
 ### Composition and delivery

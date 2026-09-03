@@ -20,6 +20,29 @@ import {
     validateUploadRequest,
     parseOwnBucketUri,
 } from './lib/autopilot.js';
+import {
+    JOB_STATUS,
+    VARIANT_STAGE,
+    ACTION,
+    validateJobSpec,
+    createJob,
+    nextAction,
+    isTerminal,
+    setAvatarCandidates,
+    regenerateAvatar,
+    useUploadedAvatar,
+    approveAvatar,
+    avatarUriForVariant,
+    applyScript,
+    applyClip,
+    applyCompose,
+    failVariant,
+    finalise,
+    cancelJob,
+    canUseVeo,
+    summarise,
+} from './lib/autopilot-job.js';
+import { composeVideo, probeMedia } from './lib/compose.js';
 
 const require = createRequire(import.meta.url);
 const multer = require('multer');
@@ -2213,6 +2236,604 @@ const autopilotOnly = (req, res, next) => {
     next();
 };
 
+// ── shared media plumbing ────────────────────────────────────────────────────
+// Autopilot needs the same primitives the interactive endpoints use inline;
+// factoring them out keeps one implementation rather than a divergent copy.
+
+const VIDEO_BLOCK_RETRIES_DEFAULT = VIDEO_BLOCK_RETRIES;
+
+/** Poll a Veo long-running operation. Veo requires fetchPredictOperation. */
+const fetchVeoOperation = async (name) => {
+    const token = await getAccessToken();
+    const modelPathMatch = String(name).match(/^(.*\/models\/[^/]+)\/operations\//);
+    if (!modelPathMatch) throw new Error(`Cannot parse operation name: ${name}`);
+    const url = `https://us-central1-aiplatform.googleapis.com/v1/${modelPathMatch[1]}:fetchPredictOperation`;
+
+    const resp = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ operationName: name }),
+    });
+    if (!resp.ok) {
+        const text = await resp.text().catch(() => resp.statusText);
+        throw new Error(`fetchPredictOperation failed (${resp.status}): ${text}`);
+    }
+    return resp.json();
+};
+
+/** Human-readable reason a Veo operation produced nothing. */
+const extractVeoError = (operation) => {
+    if (operation?.error?.message) return operation.error.message;
+    const filtered = operation?.response?.raiMediaFilteredReasons;
+    if (Array.isArray(filtered) && filtered.length) return filtered.join('; ');
+    return null;
+};
+
+/** Stream a gs:// object to a local path. */
+const downloadGcsToFile = async (gcsUri, destPath) => {
+    const withoutScheme = String(gcsUri).slice(5);
+    const slashIdx = withoutScheme.indexOf('/');
+    if (!String(gcsUri).startsWith('gs://') || slashIdx === -1) {
+        throw new Error(`Not a gs:// URI: ${gcsUri}`);
+    }
+    await getStorage()
+        .bucket(withoutScheme.slice(0, slashIdx))
+        .file(withoutScheme.slice(slashIdx + 1))
+        .download({ destination: destPath });
+    return destPath;
+};
+
+/**
+ * Concatenate clips without re-encoding.
+ *
+ * Stream copy works because every clip comes from the same model at the same
+ * resolution; it also keeps the streamer track pristine for the composite.
+ */
+const concatClipFiles = async (clipPaths, outPath, tmpDir) => {
+    if (!clipPaths.length) throw new Error('No clips to concatenate');
+    if (clipPaths.length === 1) {
+        await execFileAsync('ffmpeg', ['-hide_banner', '-y', '-i', clipPaths[0], '-c', 'copy', outPath]);
+        return outPath;
+    }
+    const listPath = path.join(tmpDir, 'filelist.txt');
+    await writeFile(listPath, clipPaths.map((p) => `file '${p}'`).join('\n'));
+    await execFileAsync('ffmpeg', [
+        '-hide_banner', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', '-y', outPath,
+    ]);
+    return outPath;
+};
+
+const srtPad = (n, w = 2) => String(n).padStart(w, '0');
+
+const secondsToSrtTime = (total) => {
+    const t = Number.isFinite(total) && total > 0 ? total : 0;
+    const ms = Math.floor((t - Math.floor(t)) * 1000);
+    return `${srtPad(Math.floor(t / 3600))}:${srtPad(Math.floor(t / 60) % 60)}`
+         + `:${srtPad(Math.floor(t) % 60)},${srtPad(ms, 3)}`;
+};
+
+/**
+ * Build an SRT from a shot list. Server-side port of utils/subtitles.ts, needed
+ * because Autopilot has no browser to build it.
+ *
+ * Bracketed vocal cues such as "[shouting]" are prompt directives for the video
+ * model, not spoken words, so they must never be burned in.
+ */
+const segmentsToSrt = (segments) => {
+    const lines = [];
+    let cursor = 0;
+    let idx = 1;
+    for (const seg of segments || []) {
+        const text = String(seg.dialogue || '')
+            .replace(/\[[^\]]*\]/g, '')
+            .replace(/\([^)]*\)/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        const dur = Number(seg.duration) || 0;
+        const start = cursor;
+        cursor += dur;
+        if (!text || dur <= 0) continue;
+        lines.push(String(idx++));
+        lines.push(`${secondsToSrtTime(start)} --> ${secondsToSrtTime(cursor)}`);
+        lines.push(text);
+        lines.push('');
+    }
+    return lines.join('\n');
+};
+
+// ── generation helpers ───────────────────────────────────────────────────────
+// Autopilot drives the same models the wizard does, so these wrap the exact
+// calls the interactive endpoints make rather than introducing a second recipe.
+
+const AVATAR_IMAGE_MODEL = process.env.AVATAR_MODEL || 'gemini-3.1-flash-image';
+
+/** Render one streamer image. Returns raw base64 (no data: prefix). */
+const generateAvatarImage = async ({ prompt, aspectRatio, referenceGcsUri }) => {
+    const parts = [{ text: prompt }];
+    if (referenceGcsUri) {
+        // A reference image is how the user pins the character's look; without it
+        // every regeneration returns a different person.
+        const base64 = await gcsObjectToBase64(referenceGcsUri);
+        parts.push({ inlineData: { mimeType: 'image/png', data: base64 } });
+    }
+
+    const ai = getVertexAIGlobalClient();
+    const response = await ai.models.generateContent({
+        model: AVATAR_IMAGE_MODEL,
+        contents: [{ role: 'user', parts }],
+        config: {
+            temperature: 0.5,
+            responseModalities: ['IMAGE', 'TEXT'],
+            imageConfig: { aspectRatio: aspectRatio || '16:9', imageSize: '1K' },
+            safetySettings: SAFETY_SETTINGS_BLOCK_NONE,
+        },
+    });
+
+    for (const part of response.candidates?.[0]?.content?.parts || []) {
+        if (part.inlineData) {
+            return { imageData: part.inlineData.data, mimeType: part.inlineData.mimeType };
+        }
+    }
+    throw new Error('The image model returned no image');
+};
+
+/**
+ * Write one variant's shot list.
+ *
+ * Variants differ by script, so the temperature climbs with the index and the
+ * prompt asks for a distinct angle. That is what makes ten renders worth having
+ * instead of ten copies.
+ */
+const generateAutopilotScript = async (job, variantIdx) => {
+    const s = job.spec;
+    const angles = [
+        'lead with the core gameplay hook',
+        'lead with a bold claim about how it feels to play',
+        'lead with a question aimed straight at the viewer',
+        'lead with the single most impressive visual moment',
+        'lead with what makes this different from similar games',
+        'lead with a short personal reaction',
+        'lead with the reward or progression the player chases',
+        'lead with urgency about trying it today',
+        'lead with the atmosphere and mood',
+        'lead with a surprising detail a new player would miss',
+    ];
+    const angle = angles[variantIdx % angles.length];
+
+    const promptText = [
+        `You are scripting a short promotional video for the game "${s.gameTitle}".`,
+        s.gameUrl ? `Store link: ${s.gameUrl}` : '',
+        s.gamingDevice ? `Platform / device: ${s.gamingDevice}` : '',
+        s.callToAction ? `The video must end on this call to action: ${s.callToAction}` : '',
+        s.dialoguePacing ? `Dialogue pacing: ${s.dialoguePacing}` : '',
+        s.extraInstructions ? `Additional direction: ${s.extraInstructions}` : '',
+        '',
+        `Creative direction for this version: ${angle}.`,
+        'Produce a timed shot list for an on-camera streamer.',
+        'Each shot needs: id, startTime, endTime, duration (4, 6 or 8 seconds),',
+        'prompt (what the streamer physically does on camera), and dialogue (what they say).',
+        'Keep the whole video between 16 and 40 seconds. Return JSON only.',
+    ].filter(Boolean).join('\n');
+
+    const ai = getVertexAIGlobalClient();
+    const response = await ai.models.generateContent({
+        model: GEMINI_SCRIPT_MODEL,
+        contents: [{ role: 'user', parts: [{ text: promptText }] }],
+        config: {
+            // Nudge each variant apart; index 0 stays the most predictable.
+            temperature: Math.min(1.3, 0.7 + variantIdx * 0.12),
+            systemInstruction: 'You are an expert content creator scriptwriter. '
+                + 'Adhere strictly to the duration rules.',
+            responseMimeType: 'application/json',
+            responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                    type: Type.OBJECT,
+                    properties: {
+                        id: { type: Type.INTEGER },
+                        startTime: { type: Type.STRING },
+                        endTime: { type: Type.STRING },
+                        duration: { type: Type.INTEGER },
+                        prompt: { type: Type.STRING },
+                        dialogue: { type: Type.STRING },
+                    },
+                    required: ['id', 'startTime', 'endTime', 'duration', 'prompt', 'dialogue'],
+                },
+            },
+        },
+    });
+
+    const raw = JSON.parse(response.text || '[]');
+    if (!Array.isArray(raw) || !raw.length) throw new Error('Script model returned no shots');
+
+    // Validation gate: snap durations to what the video models accept and drop
+    // anything without dialogue, which would render a silent talking head.
+    const segments = raw
+        .filter((seg) => seg && String(seg.dialogue || '').trim())
+        .map((seg, i) => {
+            let d = Number(seg.duration) || 8;
+            d = d <= 4 ? 4 : (d <= 6 ? 6 : 8);
+            return {
+                id: i + 1,
+                startTime: String(seg.startTime || '0:00'),
+                endTime: String(seg.endTime || '0:08'),
+                duration: d,
+                prompt: String(seg.prompt || '').slice(0, 1000),
+                dialogue: String(seg.dialogue || '').slice(0, 1000),
+            };
+        });
+    if (!segments.length) throw new Error('Every shot came back without dialogue');
+    return segments;
+};
+
+/** Poll a video handle until it resolves, reusing the interactive read paths. */
+const awaitVideoHandle = async ({ operationName, api }, { timeoutMs = 10 * 60 * 1000 } = {}) => {
+    const started = Date.now();
+    let delay = 8000;
+    for (;;) {
+        if (Date.now() - started > timeoutMs) throw new Error('Video generation timed out');
+        await new Promise((r) => setTimeout(r, delay));
+        delay = Math.min(15000, delay + 1000);
+
+        if (api === 'veo') {
+            const op = await fetchVeoOperation(operationName);
+            if (!op.done) continue;
+            const uri = op.response?.videos?.[0]?.gcsUri;
+            if (uri) return { gcsUri: uri };
+            throw new Error(extractVeoError(op) || 'Veo returned no video');
+        }
+
+        const interaction = await callInteractions(`/${operationName}`, undefined, 'GET');
+        const status = interaction?.status;
+        if (status === 'completed') {
+            const video = extractInteractionVideo(interaction);
+            if (video?.uri) return { gcsUri: video.uri };
+            throw new Error('Interaction completed without a video');
+        }
+        if (status === 'failed' || status === 'cancelled') {
+            const err = extractInteractionError(interaction);
+            const e = new Error(err?.message || `Interaction ${status}`);
+            e.code = err?.code;
+            throw e;
+        }
+    }
+};
+
+/**
+ * Produce one clip for a variant.
+ *
+ * Chains from the previous clip's last frame when there is one, so the streamer
+ * stays continuous — the same trick the Studio offers manually. On a safety block
+ * it retries, then falls through to Veo only while the batch's Veo budget lasts.
+ */
+const produceAutopilotClip = async (job, variantIdx, clipIdx) => {
+    const variant = job.variants.find((v) => v.idx === variantIdx);
+    const segment = variant.scriptSegments[clipIdx];
+    const avatarUri = avatarUriForVariant(job, variantIdx);
+    if (!avatarUri) throw new Error('No approved avatar for this variant');
+
+    const ratio = job.spec.layoutType === 'stacked'
+        ? (job.spec.targetRatio === '9:16' ? '16:9' : '9:16')
+        : job.spec.targetRatio;
+
+    const prompt = `${segment.prompt}. The streamer says: "${segment.dialogue}"`;
+    const frameUri = avatarUri;   // always seed from the approved streamer image
+    const secs = Math.min(10, Math.max(3, segment.duration));
+
+    let attempt = 0;
+    let lastErr = null;
+    // Omni's RAI filter rejects photorealistic people non-deterministically, so a
+    // plain retry usually clears it.
+    const maxOmniAttempts = 1 + VIDEO_BLOCK_RETRIES_DEFAULT;
+    while (attempt < maxOmniAttempts) {
+        attempt += 1;
+        try {
+            const started = await beginVideoJob({
+                primaryModel: VIDEO_MODEL_DEFAULT,
+                prompt,
+                frameUri,
+                ratio,
+                secs,
+                wantedResolution: VIDEO_RESOLUTION_DEFAULT,
+                durationSeconds: segment.duration,
+                blockRetries: 0,
+            });
+            const { gcsUri } = await awaitVideoHandle(started);
+            return { gcsUri, usedVeo: started.api === 'veo' };
+        } catch (err) {
+            lastErr = err;
+            const blocked = err.code === 'content_blocked'
+                || /content_blocked|safety/i.test(err.message || '');
+            if (!blocked) break;
+            console.warn(`[Autopilot] ${job.id} v${variantIdx} clip ${clipIdx} blocked, attempt ${attempt}`);
+        }
+    }
+
+    // Veo honours personGeneration: allow_adult, which is why it is kept as the
+    // rescue — but it is pay-as-you-go, so the batch budget gates it.
+    if (VIDEO_MODEL_LAST_RESORT && canUseVeo(job)) {
+        console.log(`[Autopilot] ${job.id} v${variantIdx} clip ${clipIdx} → Veo rescue `
+            + `(${job.counters.veoUsed + 1}/${job.veoBudget})`);
+        const imageBase64 = await gcsObjectToBase64(frameUri);
+        const op = await startVeoOperation({
+            modelId: VIDEO_MODEL_LAST_RESORT,
+            prompt,
+            imageBase64,
+            ratio,
+            durationSeconds: segment.duration,
+        });
+        const { gcsUri } = await awaitVideoHandle({ operationName: op, api: 'veo' });
+        return { gcsUri, usedVeo: true };
+    }
+
+    if (VIDEO_MODEL_LAST_RESORT && !canUseVeo(job)) {
+        throw new Error(`${lastErr?.message || 'clip failed'} — the Veo budget for this batch `
+            + `(${job.veoBudget} clips) is spent, so no further pay-as-you-go retries were made`);
+    }
+    throw lastErr || new Error('Clip generation failed');
+};
+
+/**
+ * Turn a variant's clips into the deliverable: concatenate, burn subtitles if
+ * asked, composite over the gameplay unless the layout is streamer-only, and
+ * persist the result.
+ */
+const deliverAutopilotVariant = async (job, variantIdx) => {
+    const variant = job.variants.find((v) => v.idx === variantIdx);
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), `gh-ap-${job.id}-${variantIdx}-`));
+    try {
+        // 1. clips → local files
+        const localClips = [];
+        for (let i = 0; i < variant.clipUris.length; i += 1) {
+            const p = path.join(tmpDir, `clip-${String(i).padStart(3, '0')}.mp4`);
+            await downloadGcsToFile(variant.clipUris[i], p);
+            localClips.push(p);
+        }
+
+        // 2. concatenate
+        let streamerTrack = path.join(tmpDir, 'streamer.mp4');
+        await concatClipFiles(localClips, streamerTrack, tmpDir);
+
+        // 3. optional burned-in subtitles, built server-side from the shot list
+        if (job.spec.subtitles) {
+            const srt = segmentsToSrt(variant.scriptSegments);
+            streamerTrack = await burnSrtIntoVideo(streamerTrack, srt, tmpDir, 'streamer-sub.mp4');
+        }
+
+        // 4. composite (or not, for streamer-only)
+        let deliverable = streamerTrack;
+        if (job.spec.layoutType !== 'streamer-only') {
+            const gameplayLocal = path.join(tmpDir, 'gameplay.src');
+            await downloadGcsToFile(job.spec.gameplayGcsUri, gameplayLocal);
+            deliverable = path.join(tmpDir, 'final.mp4');
+            await composeVideo({
+                gameplayPath: gameplayLocal,
+                streamerPath: streamerTrack,
+                outputPath: deliverable,
+                layout: job.spec.layoutType,
+                targetRatio: job.spec.targetRatio,
+                pipPlacement: job.spec.pipPlacement,
+                stackedPlacement: job.spec.stackedPlacement,
+                volumes: job.spec.volumes,
+            });
+        } else {
+            // Validation gate still applies: the concatenation must be playable.
+            const meta = await probeMedia(deliverable);
+            if (!(meta.duration > 0)) throw new Error('Concatenated video has no duration');
+        }
+
+        // 5. persist
+        const gcsUri = await uploadExportToBucket({
+            localPath: deliverable,
+            ext: 'mp4',
+            contentType: 'video/mp4',
+            label: `autopilot-${job.id}-v${variantIdx}`,
+        });
+        if (!gcsUri) throw new Error('Failed to store the finished video');
+        console.log(`[Autopilot] ${job.id} v${variantIdx} delivered → ${gcsUri}`);
+        return gcsUri;
+    } finally {
+        await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+};
+
+// ── job store ────────────────────────────────────────────────────────────────
+// Datastore is the source of truth rather than process memory: Cloud Run is
+// multi-instance and an instance can disappear mid-batch. Everything needed to
+// resume sits in the entity, and the heavy fields are unindexed to stay clear of
+// the 1500-byte limit on indexed properties.
+const AUTOPILOT_JOB_KIND = 'AutopilotJob';
+
+const jobToEntity = (job) => ({
+    key: getDb().key([AUTOPILOT_JOB_KIND, job.id]),
+    data: {
+        ownerEmail: job.ownerEmail,
+        status: job.status,
+        variantCount: job.spec.variantCount,
+        doneCount: job.variants.filter((v) => v.stage === VARIANT_STAGE.DONE).length,
+        failedCount: job.variants.filter((v) => v.stage === VARIANT_STAGE.FAILED).length,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+        // One JSON blob per section. Naming a parent in excludeFromIndexes does
+        // not cover its children, so keeping them as strings sidesteps the whole
+        // class of "property is longer than 1500 bytes" failures.
+        spec: JSON.stringify(job.spec),
+        avatar: JSON.stringify(job.avatar),
+        variants: JSON.stringify(job.variants),
+        counters: JSON.stringify(job.counters || {}),
+        veoBudget: job.veoBudget || 0,
+        error: job.error ? String(job.error).slice(0, 500) : null,
+    },
+    excludeFromIndexes: ['spec', 'avatar', 'variants', 'counters', 'error'],
+});
+
+const entityToJob = (entity) => {
+    if (!entity) return null;
+    const key = entity[Datastore.KEY];
+    const parse = (v, dflt) => {
+        try { return v ? JSON.parse(v) : dflt; } catch { return dflt; }
+    };
+    return {
+        id: String(key?.name || ''),
+        ownerEmail: entity.ownerEmail,
+        status: entity.status,
+        createdAt: entity.createdAt,
+        updatedAt: entity.updatedAt,
+        spec: parse(entity.spec, {}),
+        avatar: parse(entity.avatar, { candidates: [], approvedIdx: [], regenCount: 0 }),
+        variants: parse(entity.variants, []),
+        counters: parse(entity.counters, { veoUsed: 0 }),
+        veoBudget: Number(entity.veoBudget) || 0,
+        error: entity.error || null,
+    };
+};
+
+const saveJob = async (job) => {
+    const db = getDb();
+    if (!db) throw new Error('Datastore is not configured; Autopilot needs it to resume jobs');
+    await db.save(jobToEntity(job));
+    return job;
+};
+
+const loadJob = async (id) => {
+    const db = getDb();
+    if (!db) return null;
+    const [entity] = await db.get(db.key([AUTOPILOT_JOB_KIND, id]));
+    return entityToJob(entity);
+};
+
+/** Jobs belong to their creator; a foreign id is reported as missing, not denied. */
+const loadOwnedJob = async (id, ownerEmail) => {
+    const job = await loadJob(id);
+    if (!job || job.ownerEmail !== ownerEmail) return null;
+    return job;
+};
+
+const listJobs = async (ownerEmail, limit = 50) => {
+    const db = getDb();
+    if (!db) return [];
+    const query = db.createQuery(AUTOPILOT_JOB_KIND).filter('ownerEmail', '=', ownerEmail);
+    const [entities] = await db.runQuery(query);
+    return entities
+        .map(entityToJob)
+        .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+        .slice(0, limit);
+};
+
+// ── executor ─────────────────────────────────────────────────────────────────
+// One tick performs at most one unit of work and then checkpoints. Keeping the
+// unit small is what makes a lost instance cheap: at worst one clip is redone.
+
+/** Guards against two ticks working the same job at once within an instance. */
+const inFlightTicks = new Set();
+
+const renderAvatarCandidates = async (job, count = 1) => {
+    const ratio = avatarRatioFor(job.spec);
+    const out = [];
+    for (let i = 0; i < count; i += 1) {
+        const { imageData } = await generateAvatarImage({
+            prompt: job.spec.avatarPrompt,
+            aspectRatio: ratio,
+            referenceGcsUri: job.spec.avatarRefGcsUri,
+        });
+        const gcsUri = await uploadImageToBucket({
+            base64: imageData,
+            mimeType: 'image/png',
+            label: 'autopilot-avatar',
+            prefix: `autopilot/${job.id}`,
+        });
+        if (!gcsUri) throw new Error('Failed to store the avatar candidate');
+        out.push({ gcsUri });
+    }
+    return out;
+};
+
+/**
+ * The avatar aspect ratio is dictated by the layout: a stacked layout needs the
+ * streamer in the opposite orientation to the finished video.
+ */
+const avatarRatioFor = (spec) => {
+    if (spec.layoutType === 'stacked') return spec.targetRatio === '9:16' ? '16:9' : '9:16';
+    return spec.targetRatio;
+};
+
+/**
+ * Advance a job by one step.
+ *
+ * Returns the (possibly unchanged) job. `awaiting_avatar` returns immediately —
+ * nextAction never yields work at the gate, so this function is safe to call
+ * from the poll endpoint and the resume sweep alike.
+ */
+const tickJob = async (jobId) => {
+    if (inFlightTicks.has(jobId)) return { skipped: 'in-flight' };
+    inFlightTicks.add(jobId);
+    try {
+        let job = await loadJob(jobId);
+        if (!job) return { skipped: 'missing' };
+
+        const action = nextAction(job);
+        if (action.type === ACTION.WAIT_APPROVAL || action.type === ACTION.NOTHING) {
+            return { action: action.type, job };
+        }
+
+        if (action.type === ACTION.GENERATE_AVATAR) {
+            const candidates = await renderAvatarCandidates(job, 1);
+            job = setAvatarCandidates(job, candidates);
+            await saveJob(job);
+            return { action: action.type, job };
+        }
+
+        if (action.type === ACTION.FINALISE) {
+            job = finalise(job);
+            await saveJob(job);
+            console.log(`[Autopilot] ${job.id} → ${job.status}`);
+            return { action: action.type, job };
+        }
+
+        const idx = action.variantIdx;
+        try {
+            if (action.type === ACTION.GENERATE_SCRIPT) {
+                const segments = await generateAutopilotScript(job, idx);
+                const r = applyScript(job, idx, segments, {
+                    maxClipsPerJob: AUTOPILOT_MAX_CLIPS_PER_JOB,
+                });
+                if (!r.ok) {
+                    // A fatal result already carries the failed job (clip ceiling).
+                    job = r.fatal ? r.job : failVariant(job, idx, r.error);
+                    await saveJob(job);
+                    return { action: action.type, job, error: r.error };
+                }
+                job = r.job;
+                await saveJob(job);
+                return { action: action.type, job };
+            }
+
+            if (action.type === ACTION.GENERATE_CLIP) {
+                const { gcsUri, usedVeo } = await produceAutopilotClip(job, idx, action.clipIdx);
+                job = applyClip(job, idx, action.clipIdx, gcsUri, { usedVeo });
+                await saveJob(job);
+                return { action: action.type, job };
+            }
+
+            if (action.type === ACTION.COMPOSE) {
+                const finalUri = await deliverAutopilotVariant(job, idx);
+                job = applyCompose(job, idx, finalUri);
+                await saveJob(job);
+                return { action: action.type, job };
+            }
+        } catch (err) {
+            console.error(`[Autopilot] ${jobId} variant ${idx} failed:`, err.message);
+            job = failVariant(job, idx, err.message);
+            await saveJob(job);
+            return { action: action.type, job, error: err.message };
+        }
+
+        return { action: action.type, job };
+    } finally {
+        inFlightTicks.delete(jobId);
+    }
+};
+
 // POST /api/autopilot/upload-url
 // Body: { contentType: string, sizeBytes: number }
 // Returns: { uploadUrl, gcsUri, uploadId, expiresAt, requiredHeaders }
@@ -2255,6 +2876,276 @@ apiRouter.post('/autopilot/upload-url', autopilotOnly, async (req, res) => {
     } catch (err) {
         console.error('[Autopilot] upload-url error:', err);
         res.status(500).json({ error: 'Failed to create upload URL: ' + err.message });
+    }
+});
+
+// POST /api/autopilot/jobs
+// Body: the job spec (see validateJobSpec). Returns { jobId, status }.
+// Renders the avatar candidate synchronously so the client lands straight on the
+// confirmation gate.
+apiRouter.post('/autopilot/jobs', autopilotOnly, async (req, res) => {
+    const owner = ownerKeyOf(req);
+    const check = validateJobSpec(req.body || {}, {
+        maxBatch: AUTOPILOT_MAX_BATCH,
+        maxClipsPerJob: AUTOPILOT_MAX_CLIPS_PER_JOB,
+        ownBucket: GCS_BUCKET_NAME,
+    });
+    if (!check.ok) return res.status(check.status).json({ error: check.error });
+
+    // The gameplay object is validated for real before anything is spent: a URI
+    // that does not resolve, or is not decodable video, fails the job now.
+    if (check.spec.gameplayGcsUri) {
+        const parsed = parseOwnBucketUri(check.spec.gameplayGcsUri, GCS_BUCKET_NAME);
+        if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+        try {
+            const [exists] = await getStorage().bucket(parsed.bucket).file(parsed.object).exists();
+            if (!exists) {
+                return res.status(400).json({ error: 'gameplayGcsUri does not exist — finish the upload first' });
+            }
+        } catch (err) {
+            return res.status(400).json({ error: 'Could not read gameplayGcsUri: ' + err.message });
+        }
+    }
+
+    try {
+        let job = createJob({ id: `ap-${randomUUID()}`, ownerEmail: owner, spec: check.spec });
+        await saveJob(job);
+
+        // Render the first candidate now; on failure the job survives so the user
+        // can regenerate rather than losing the whole submission.
+        try {
+            const candidates = await renderAvatarCandidates(job, 1);
+            job = setAvatarCandidates(job, candidates);
+        } catch (err) {
+            console.error('[Autopilot] initial avatar failed:', err.message);
+            job = { ...job, status: JOB_STATUS.AWAITING_AVATAR, error: `Avatar generation failed: ${err.message}` };
+        }
+        await saveJob(job);
+
+        const plannedClips = check.spec.variantCount * 4;
+        console.log(`[Autopilot] created ${job.id} (${check.spec.variantCount} variants) for ${owner}`);
+        res.status(201).json({
+            jobId: job.id,
+            ...summarise(job),
+            // Surfaced so the confirmation gate can state the cost before the
+            // user unlocks the expensive half of the pipeline.
+            costPreview: {
+                estimatedClips: plannedClips,
+                veoBudget: job.veoBudget,
+                veoSafetyNet: Boolean(VIDEO_MODEL_LAST_RESORT),
+            },
+        });
+    } catch (err) {
+        console.error('[Autopilot] create job error:', err);
+        res.status(500).json({ error: 'Failed to create job: ' + err.message });
+    }
+});
+
+/** Signed read URLs for whatever the job has produced so far. */
+const signJobMedia = async (job) => {
+    const sign = async (gcsUri) => {
+        if (!gcsUri) return null;
+        const parsed = parseOwnBucketUri(gcsUri, GCS_BUCKET_NAME);
+        if (!parsed.ok) return null;
+        try {
+            const [url] = await getStorage().bucket(parsed.bucket).file(parsed.object).getSignedUrl({
+                action: 'read',
+                expires: Date.now() + 60 * 60 * 1000,
+            });
+            return url;
+        } catch { return null; }
+    };
+    const avatarUrls = await Promise.all(job.avatar.candidates.map((c) => sign(c.gcsUri)));
+    const outputUrls = await Promise.all(job.variants.map((v) => sign(v.finalUri)));
+    return {
+        avatarCandidateUrls: avatarUrls,
+        outputs: job.variants.map((v, i) => ({
+            idx: v.idx,
+            url: outputUrls[i],
+            downloadName: outputUrls[i] ? `${job.spec.gameTitle || 'video'}-v${v.idx + 1}.mp4` : null,
+        })).filter((o) => o.url),
+    };
+};
+
+// GET /api/autopilot/jobs
+apiRouter.get('/autopilot/jobs', autopilotOnly, async (req, res) => {
+    try {
+        const jobs = await listJobs(ownerKeyOf(req));
+        res.json({ jobs: jobs.map(summarise) });
+    } catch (err) {
+        console.error('[Autopilot] list error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/autopilot/jobs/:id
+// Also advances the job by one step, so a polling client keeps the pipeline
+// moving even on an instance with no background CPU. The gate is unaffected:
+// nextAction returns WAIT_APPROVAL there and no work is done.
+apiRouter.get('/autopilot/jobs/:id', autopilotOnly, async (req, res) => {
+    try {
+        const owner = ownerKeyOf(req);
+        let job = await loadOwnedJob(req.params.id, owner);
+        if (!job) return res.status(404).json({ error: 'Job not found' });
+
+        if (!isTerminal(job) && job.status === JOB_STATUS.RUNNING) {
+            // Fire and forget: the response reflects the state we already have,
+            // the next poll picks up whatever this tick completes.
+            tickJob(job.id).catch((err) => console.error('[Autopilot] tick error:', err.message));
+        }
+
+        const media = await signJobMedia(job);
+        res.json({ ...summarise(job), ...media });
+    } catch (err) {
+        console.error('[Autopilot] get job error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/autopilot/jobs/:id/avatar/regenerate
+// Body: { avatarPrompt?, avatarRefGcsUri? }
+apiRouter.post('/autopilot/jobs/:id/avatar/regenerate', autopilotOnly, async (req, res) => {
+    try {
+        const job = await loadOwnedJob(req.params.id, ownerKeyOf(req));
+        if (!job) return res.status(404).json({ error: 'Job not found' });
+        if (job.status !== JOB_STATUS.AWAITING_AVATAR && job.status !== JOB_STATUS.CREATED) {
+            return res.status(409).json({ error: `Cannot regenerate the avatar while the job is ${job.status}` });
+        }
+
+        const { avatarPrompt, avatarRefGcsUri } = req.body || {};
+        if (avatarRefGcsUri) {
+            const parsed = parseOwnBucketUri(avatarRefGcsUri, GCS_BUCKET_NAME);
+            if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+        }
+        const staged = {
+            ...job,
+            spec: {
+                ...job.spec,
+                avatarPrompt: avatarPrompt ? String(avatarPrompt).trim() : job.spec.avatarPrompt,
+                avatarRefGcsUri: avatarRefGcsUri !== undefined ? avatarRefGcsUri : job.spec.avatarRefGcsUri,
+            },
+        };
+        const candidates = await renderAvatarCandidates(staged, 1);
+        const updated = regenerateAvatar(job, candidates, {
+            prompt: avatarPrompt,
+            refGcsUri: avatarRefGcsUri,
+        });
+        await saveJob({ ...updated, error: null });
+
+        const media = await signJobMedia(updated);
+        res.json({ ...summarise(updated), ...media });
+    } catch (err) {
+        console.error('[Autopilot] regenerate error:', err);
+        res.status(500).json({ error: 'Avatar regeneration failed: ' + err.message });
+    }
+});
+
+// POST /api/autopilot/jobs/:id/avatar/upload-url
+// Returns a signed PUT URL for a streamer image the user supplies themselves.
+apiRouter.post('/autopilot/jobs/:id/avatar/upload-url', autopilotOnly, async (req, res) => {
+    try {
+        const job = await loadOwnedJob(req.params.id, ownerKeyOf(req));
+        if (!job) return res.status(404).json({ error: 'Job not found' });
+        if (isTerminal(job)) return res.status(409).json({ error: `Job is already ${job.status}` });
+
+        const contentType = String(req.body?.contentType || 'image/png');
+        if (!['image/png', 'image/jpeg', 'image/webp'].includes(contentType)) {
+            return res.status(400).json({ error: 'Streamer image must be PNG, JPEG or WebP' });
+        }
+        const ext = contentType === 'image/png' ? 'png' : (contentType === 'image/jpeg' ? 'jpg' : 'webp');
+        const objectName = `autopilot/${job.id}/avatar-supplied-${Date.now()}.${ext}`;
+        const [uploadUrl] = await getStorage().bucket(GCS_BUCKET_NAME).file(objectName).getSignedUrl({
+            version: 'v4', action: 'write', expires: Date.now() + 15 * 60 * 1000, contentType,
+        });
+        res.json({
+            uploadUrl,
+            gcsUri: `gs://${GCS_BUCKET_NAME}/${objectName}`,
+            requiredHeaders: { 'Content-Type': contentType },
+        });
+    } catch (err) {
+        console.error('[Autopilot] avatar upload-url error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/autopilot/jobs/:id/avatar/use-uploaded
+// Body: { gcsUri }
+apiRouter.post('/autopilot/jobs/:id/avatar/use-uploaded', autopilotOnly, async (req, res) => {
+    try {
+        const job = await loadOwnedJob(req.params.id, ownerKeyOf(req));
+        if (!job) return res.status(404).json({ error: 'Job not found' });
+        if (isTerminal(job)) return res.status(409).json({ error: `Job is already ${job.status}` });
+
+        const parsed = parseOwnBucketUri(req.body?.gcsUri, GCS_BUCKET_NAME);
+        if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+        const [exists] = await getStorage().bucket(parsed.bucket).file(parsed.object).exists();
+        if (!exists) return res.status(400).json({ error: 'That image has not been uploaded yet' });
+
+        const updated = useUploadedAvatar(job, req.body.gcsUri);
+        await saveJob({ ...updated, error: null });
+        const media = await signJobMedia(updated);
+        res.json({ ...summarise(updated), ...media });
+    } catch (err) {
+        console.error('[Autopilot] use-uploaded error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/autopilot/jobs/:id/avatar/approve
+// Body: { selected?: number[] }
+//
+// The only transition out of the gate. Everything expensive happens after this
+// call, which is why it is an explicit user action and never inferred.
+apiRouter.post('/autopilot/jobs/:id/avatar/approve', autopilotOnly, async (req, res) => {
+    try {
+        const job = await loadOwnedJob(req.params.id, ownerKeyOf(req));
+        if (!job) return res.status(404).json({ error: 'Job not found' });
+
+        const result = approveAvatar(job, req.body?.selected, {});
+        if (!result.ok) return res.status(409).json({ error: result.error });
+        await saveJob(result.job);
+        console.log(`[Autopilot] ${job.id} avatar approved → running`);
+
+        // Kick the pipeline immediately; polling will carry it from here.
+        tickJob(job.id).catch((err) => console.error('[Autopilot] tick error:', err.message));
+        res.json(summarise(result.job));
+    } catch (err) {
+        console.error('[Autopilot] approve error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/autopilot/jobs/:id/tick
+// Idempotent single-step advance. Exposed so the UI can drive the pipeline.
+apiRouter.post('/autopilot/jobs/:id/tick', autopilotOnly, async (req, res) => {
+    try {
+        const job = await loadOwnedJob(req.params.id, ownerKeyOf(req));
+        if (!job) return res.status(404).json({ error: 'Job not found' });
+
+        const result = await tickJob(job.id);
+        const fresh = result.job || await loadJob(job.id);
+        res.json({
+            action: result.action || result.skipped || 'nothing',
+            ...(fresh ? summarise(fresh) : {}),
+        });
+    } catch (err) {
+        console.error('[Autopilot] tick endpoint error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/autopilot/jobs/:id/cancel
+apiRouter.post('/autopilot/jobs/:id/cancel', autopilotOnly, async (req, res) => {
+    try {
+        const job = await loadOwnedJob(req.params.id, ownerKeyOf(req));
+        if (!job) return res.status(404).json({ error: 'Job not found' });
+        const cancelled = cancelJob(job);
+        await saveJob(cancelled);
+        console.log(`[Autopilot] ${job.id} cancelled by ${job.ownerEmail}`);
+        res.json(summarise(cancelled));
+    } catch (err) {
+        console.error('[Autopilot] cancel error:', err);
+        res.status(500).json({ error: err.message });
     }
 });
 

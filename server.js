@@ -41,6 +41,7 @@ import {
     cancelJob,
     canUseVeo,
     summarise,
+    actionKey,
 } from './lib/autopilot-job.js';
 import { composeVideo, probeMedia } from './lib/compose.js';
 
@@ -2695,6 +2696,47 @@ const saveJob = async (job) => {
     return job;
 };
 
+/**
+ * Apply a change to a job inside a transaction, retrying on contention.
+ *
+ * Necessary because several workers progress one batch at once and the entity is
+ * written whole. A plain load → mutate → save loses updates: an observed run had
+ * the clip count going backwards (11/12 → 10/12) and a failed variant reverting
+ * to running, because the last writer clobbered its peers.
+ *
+ * The expensive generation happens *outside* this call; only the short checkpoint
+ * is transactional. `mutate` receives freshly-read state and must be a pure
+ * function of it, so a retry re-derives the same delta safely.
+ */
+const commitJobUpdate = async (jobId, mutate, { attempts = 6 } = {}) => {
+    const db = getDb();
+    if (!db) throw new Error('Datastore is not configured');
+    let lastErr = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const tx = db.transaction();
+        try {
+            await tx.run();
+            const [entity] = await tx.get(db.key([AUTOPILOT_JOB_KIND, jobId]));
+            const current = entityToJob(entity);
+            if (!current) { await tx.rollback(); return null; }
+
+            const next = mutate(current);
+            if (!next) { await tx.rollback(); return current; }
+
+            tx.save(jobToEntity(next));
+            await tx.commit();
+            return next;
+        } catch (err) {
+            lastErr = err;
+            await tx.rollback().catch(() => {});
+            // Contention is expected with a full worker pool; back off and re-read.
+            const wait = 60 * (2 ** attempt) + Math.floor(Math.random() * 80);
+            await new Promise((r) => setTimeout(r, wait));
+        }
+    }
+    throw lastErr || new Error('Could not commit the job update');
+};
+
 const loadJob = async (id) => {
     const db = getDb();
     if (!db) return null;
@@ -2724,8 +2766,15 @@ const listJobs = async (ownerEmail, limit = 50) => {
 // One tick performs at most one unit of work and then checkpoints. Keeping the
 // unit small is what makes a lost instance cheap: at worst one clip is redone.
 
-/** Guards against two ticks working the same job at once within an instance. */
-const inFlightTicks = new Set();
+/**
+ * Actions currently being executed in this instance, keyed jobId + action.
+ *
+ * Claiming at action granularity (not per job) is what allows several workers on
+ * one batch: an earlier attempt locked per job and silently serialised the whole
+ * pipeline — 12 clips took 608 s because only one ever ran at a time.
+ */
+const claimedActions = new Set();
+const claimKey = (jobId, action) => `${jobId}#${actionKey(action)}`;
 
 const renderAvatarCandidates = async (job, count = 1) => {
     const ratio = avatarRatioFor(job.spec);
@@ -2764,73 +2813,76 @@ const avatarRatioFor = (spec) => {
  * nextAction never yields work at the gate, so this function is safe to call
  * from the poll endpoint and the resume sweep alike.
  */
-const tickJob = async (jobId) => {
-    if (inFlightTicks.has(jobId)) return { skipped: 'in-flight' };
-    inFlightTicks.add(jobId);
+const tickJob = async (jobId, presetAction = null) => {
+    let job = await loadJob(jobId);
+    if (!job) return { skipped: 'missing' };
+
+    const claimedForJob = new Set(
+        [...claimedActions]
+            .filter((k) => k.startsWith(`${jobId}#`))
+            .map((k) => k.slice(jobId.length + 1))
+    );
+    const action = presetAction || nextAction(job, { exclude: claimedForJob });
+    if (action.type === ACTION.WAIT_APPROVAL || action.type === ACTION.NOTHING) {
+        return { action: action.type, job };
+    }
+
+    const key = claimKey(jobId, action);
+    if (claimedActions.has(key)) return { skipped: 'in-flight' };
+    claimedActions.add(key);
     try {
-        let job = await loadJob(jobId);
-        if (!job) return { skipped: 'missing' };
-
-        const action = nextAction(job);
-        if (action.type === ACTION.WAIT_APPROVAL || action.type === ACTION.NOTHING) {
-            return { action: action.type, job };
-        }
-
         if (action.type === ACTION.GENERATE_AVATAR) {
             const candidates = await renderAvatarCandidates(job, 1);
-            job = setAvatarCandidates(job, candidates);
-            await saveJob(job);
-            return { action: action.type, job };
+            const updated = await commitJobUpdate(jobId, (cur) => setAvatarCandidates(cur, candidates));
+            return { action: action.type, job: updated };
         }
 
         if (action.type === ACTION.FINALISE) {
-            job = finalise(job);
-            await saveJob(job);
-            console.log(`[Autopilot] ${job.id} → ${job.status}`);
-            return { action: action.type, job };
+            const updated = await commitJobUpdate(jobId, (cur) => finalise(cur));
+            if (updated) console.log(`[Autopilot] ${updated.id} → ${updated.status}`);
+            return { action: action.type, job: updated };
         }
 
         const idx = action.variantIdx;
         try {
             if (action.type === ACTION.GENERATE_SCRIPT) {
                 const segments = await generateAutopilotScript(job, idx);
-                const r = applyScript(job, idx, segments, {
-                    maxClipsPerJob: AUTOPILOT_MAX_CLIPS_PER_JOB,
-                });
-                if (!r.ok) {
+                let scriptError = null;
+                const updated = await commitJobUpdate(jobId, (cur) => {
+                    const r = applyScript(cur, idx, segments, {
+                        maxClipsPerJob: AUTOPILOT_MAX_CLIPS_PER_JOB,
+                    });
+                    if (r.ok) return r.job;
+                    scriptError = r.error;
                     // A fatal result already carries the failed job (clip ceiling).
-                    job = r.fatal ? r.job : failVariant(job, idx, r.error);
-                    await saveJob(job);
-                    return { action: action.type, job, error: r.error };
-                }
-                job = r.job;
-                await saveJob(job);
-                return { action: action.type, job };
+                    return r.fatal ? r.job : failVariant(cur, idx, r.error);
+                });
+                return { action: action.type, job: updated, error: scriptError };
             }
 
             if (action.type === ACTION.GENERATE_CLIP) {
                 const { gcsUri, usedVeo } = await produceAutopilotClip(job, idx, action.clipIdx);
-                job = applyClip(job, idx, action.clipIdx, gcsUri, { usedVeo });
-                await saveJob(job);
-                return { action: action.type, job };
+                const updated = await commitJobUpdate(
+                    jobId,
+                    (cur) => applyClip(cur, idx, action.clipIdx, gcsUri, { usedVeo })
+                );
+                return { action: action.type, job: updated };
             }
 
             if (action.type === ACTION.COMPOSE) {
                 const finalUri = await deliverAutopilotVariant(job, idx);
-                job = applyCompose(job, idx, finalUri);
-                await saveJob(job);
-                return { action: action.type, job };
+                const updated = await commitJobUpdate(jobId, (cur) => applyCompose(cur, idx, finalUri));
+                return { action: action.type, job: updated };
             }
         } catch (err) {
             console.error(`[Autopilot] ${jobId} variant ${idx} failed:`, err.message);
-            job = failVariant(job, idx, err.message);
-            await saveJob(job);
-            return { action: action.type, job, error: err.message };
+            const updated = await commitJobUpdate(jobId, (cur) => failVariant(cur, idx, err.message));
+            return { action: action.type, job: updated, error: err.message };
         }
 
         return { action: action.type, job };
     } finally {
-        inFlightTicks.delete(jobId);
+        claimedActions.delete(key);
     }
 };
 
@@ -2876,6 +2928,111 @@ apiRouter.post('/autopilot/upload-url', autopilotOnly, async (req, res) => {
     } catch (err) {
         console.error('[Autopilot] upload-url error:', err);
         res.status(500).json({ error: 'Failed to create upload URL: ' + err.message });
+    }
+});
+
+// ── concurrency ──────────────────────────────────────────────────────────────
+// A batch is mostly waiting on the video models, so several clips are kept in
+// flight. The ceilings are separate because the constraints are:
+//   * clips  — Omni's 50 requests/minute quota
+//   * compose — CPU; ffmpeg saturates the container's 2 vCPU
+
+const activeClipWork = new Map();     // jobId → count of in-flight clip actions
+const activeComposeWork = new Map();  // jobId → count of in-flight composites
+
+const bump = (map, key, delta) => {
+    const next = (map.get(key) || 0) + delta;
+    if (next <= 0) map.delete(key);
+    else map.set(key, next);
+    return next;
+};
+
+const totalOf = (map) => [...map.values()].reduce((a, b) => a + b, 0);
+
+/**
+ * Drive one job with several workers until it can make no further progress.
+ *
+ * Safe to call repeatedly: workers claim distinct actions through nextAction on
+ * freshly loaded state, and every unit checkpoints before the next is chosen.
+ * `awaiting_avatar` returns at once because nextAction yields no work there.
+ */
+const driveJob = async (jobId) => {
+    for (;;) {
+        const job = await loadJob(jobId);
+        if (!job || isTerminal(job)) return;
+
+        // Skip whatever peers are already doing so each worker takes fresh work.
+        const claimedForJob = new Set(
+            [...claimedActions]
+                .filter((k) => k.startsWith(`${jobId}#`))
+                .map((k) => k.slice(jobId.length + 1))
+        );
+        const action = nextAction(job, { exclude: claimedForJob });
+        if (action.type === ACTION.WAIT_APPROVAL || action.type === ACTION.NOTHING) return;
+
+        const isCompose = action.type === ACTION.COMPOSE;
+        const limit = isCompose ? AUTOPILOT_COMPOSE_CONCURRENCY : AUTOPILOT_CONCURRENCY;
+        const map = isCompose ? activeComposeWork : activeClipWork;
+        if (totalOf(map) >= limit) {
+            // Saturated for this kind of work; whoever frees a slot carries on.
+            // Yield rather than spin.
+            await new Promise((r) => setTimeout(r, 1500));
+            continue;
+        }
+
+        bump(map, jobId, 1);
+        try {
+            const result = await tickJob(jobId, action);
+            if (result?.skipped === 'missing') return;
+        } finally {
+            bump(map, jobId, -1);
+        }
+    }
+};
+
+/** Start up to `n` cooperating workers on a job without blocking the caller. */
+const scheduleJob = (jobId, n = AUTOPILOT_CONCURRENCY) => {
+    for (let i = 0; i < n; i += 1) {
+        driveJob(jobId).catch((err) => console.error(`[Autopilot] worker error on ${jobId}:`, err.message));
+    }
+};
+
+/**
+ * Pick up jobs that stopped making progress.
+ *
+ * Needed because an instance can vanish mid-batch. Jobs at the approval gate are
+ * skipped: they are not stalled, they are waiting for a person, and sweeping them
+ * must never be what starts the expensive work.
+ */
+const resumeStalledJobs = async ({ olderThanMs = 90 * 1000, limit = 20 } = {}) => {
+    const db = getDb();
+    if (!db) return { resumed: 0 };
+    const [entities] = await db.runQuery(
+        db.createQuery(AUTOPILOT_JOB_KIND).filter('status', '=', JOB_STATUS.RUNNING).limit(limit)
+    );
+    const cutoff = Date.now() - olderThanMs;
+    let resumed = 0;
+    for (const entity of entities) {
+        const job = entityToJob(entity);
+        if (!job) continue;
+        if (new Date(job.updatedAt).getTime() > cutoff) continue; // still moving
+        console.log(`[Autopilot] resuming stalled job ${job.id}`);
+        scheduleJob(job.id);
+        resumed += 1;
+    }
+    return { resumed, scanned: entities.length };
+};
+
+// POST /api/autopilot/resume
+// Sweep for stalled jobs. Intended for a Cloud Scheduler cron so a batch keeps
+// moving after the user closes the tab; harmless to call by hand.
+apiRouter.post('/autopilot/resume', autopilotOnly, async (req, res) => {
+    try {
+        const result = await resumeStalledJobs();
+        res.json(result);
+    } catch (err) {
+        console.error('[Autopilot] resume error:', err);
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -2990,8 +3147,9 @@ apiRouter.get('/autopilot/jobs/:id', autopilotOnly, async (req, res) => {
 
         if (!isTerminal(job) && job.status === JOB_STATUS.RUNNING) {
             // Fire and forget: the response reflects the state we already have,
-            // the next poll picks up whatever this tick completes.
-            tickJob(job.id).catch((err) => console.error('[Autopilot] tick error:', err.message));
+            // the next poll picks up whatever these workers complete. This is what
+            // keeps a batch moving on an instance with no background CPU.
+            scheduleJob(job.id);
         }
 
         const media = await signJobMedia(job);
@@ -3026,11 +3184,13 @@ apiRouter.post('/autopilot/jobs/:id/avatar/regenerate', autopilotOnly, async (re
             },
         };
         const candidates = await renderAvatarCandidates(staged, 1);
-        const updated = regenerateAvatar(job, candidates, {
-            prompt: avatarPrompt,
-            refGcsUri: avatarRefGcsUri,
-        });
-        await saveJob({ ...updated, error: null });
+        const updated = await commitJobUpdate(job.id, (cur) => ({
+            ...regenerateAvatar(cur, candidates, {
+                prompt: avatarPrompt,
+                refGcsUri: avatarRefGcsUri,
+            }),
+            error: null,
+        }));
 
         const media = await signJobMedia(updated);
         res.json({ ...summarise(updated), ...media });
@@ -3081,8 +3241,10 @@ apiRouter.post('/autopilot/jobs/:id/avatar/use-uploaded', autopilotOnly, async (
         const [exists] = await getStorage().bucket(parsed.bucket).file(parsed.object).exists();
         if (!exists) return res.status(400).json({ error: 'That image has not been uploaded yet' });
 
-        const updated = useUploadedAvatar(job, req.body.gcsUri);
-        await saveJob({ ...updated, error: null });
+        const updated = await commitJobUpdate(job.id, (cur) => ({
+            ...useUploadedAvatar(cur, req.body.gcsUri),
+            error: null,
+        }));
         const media = await signJobMedia(updated);
         res.json({ ...summarise(updated), ...media });
     } catch (err) {
@@ -3101,13 +3263,21 @@ apiRouter.post('/autopilot/jobs/:id/avatar/approve', autopilotOnly, async (req, 
         const job = await loadOwnedJob(req.params.id, ownerKeyOf(req));
         if (!job) return res.status(404).json({ error: 'Job not found' });
 
-        const result = approveAvatar(job, req.body?.selected, {});
-        if (!result.ok) return res.status(409).json({ error: result.error });
-        await saveJob(result.job);
+        // Transactional: a worker or a concurrent request must not clobber the
+        // transition that unlocks the expensive half of the pipeline.
+        let approveError = null;
+        const updated = await commitJobUpdate(job.id, (cur) => {
+            const r = approveAvatar(cur, req.body?.selected, {});
+            if (!r.ok) { approveError = r.error; return null; }
+            return r.job;
+        });
+        if (approveError) return res.status(409).json({ error: approveError });
+        const result = { ok: true, job: updated };
         console.log(`[Autopilot] ${job.id} avatar approved → running`);
 
-        // Kick the pipeline immediately; polling will carry it from here.
-        tickJob(job.id).catch((err) => console.error('[Autopilot] tick error:', err.message));
+        // Kick the pipeline immediately with the full worker pool; polling and
+        // the resume sweep carry it from here.
+        scheduleJob(job.id);
         res.json(summarise(result.job));
     } catch (err) {
         console.error('[Autopilot] approve error:', err);
@@ -3139,8 +3309,7 @@ apiRouter.post('/autopilot/jobs/:id/cancel', autopilotOnly, async (req, res) => 
     try {
         const job = await loadOwnedJob(req.params.id, ownerKeyOf(req));
         if (!job) return res.status(404).json({ error: 'Job not found' });
-        const cancelled = cancelJob(job);
-        await saveJob(cancelled);
+        const cancelled = await commitJobUpdate(job.id, (cur) => cancelJob(cur));
         console.log(`[Autopilot] ${job.id} cancelled by ${job.ownerEmail}`);
         res.json(summarise(cancelled));
     } catch (err) {

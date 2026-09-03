@@ -33,6 +33,7 @@ import {
     cancelJob,
     canUseVeo,
     summarise,
+    actionKey,
 } from '../lib/autopilot-job.js';
 
 const BUCKET = 'test-bucket';
@@ -459,4 +460,75 @@ test('summarise flags the gate so the UI knows to stop and ask', () => {
     assert.strictEqual(view.awaitingApproval, true);
     assert.strictEqual(view.status, JOB_STATUS.AWAITING_AVATAR);
     assert.strictEqual(view.avatar.candidateCount, 1);
+});
+
+// ── concurrency: workers must not be handed the same action ──────────────────
+
+test('actionKey distinguishes every unit of work', () => {
+    const keys = new Set([
+        actionKey({ type: ACTION.GENERATE_CLIP, variantIdx: 0, clipIdx: 0 }),
+        actionKey({ type: ACTION.GENERATE_CLIP, variantIdx: 0, clipIdx: 1 }),
+        actionKey({ type: ACTION.GENERATE_CLIP, variantIdx: 1, clipIdx: 0 }),
+        actionKey({ type: ACTION.COMPOSE, variantIdx: 0 }),
+        actionKey({ type: ACTION.GENERATE_SCRIPT, variantIdx: 0 }),
+    ]);
+    assert.strictEqual(keys.size, 5, 'each action must have a distinct key');
+});
+
+test('excluding claimed actions hands out distinct clips', () => {
+    const job = runningJob(2, 3);   // 2 variants x 3 clips = 6 units of work
+    const claimed = new Set();
+    const handed = [];
+
+    for (let i = 0; i < 6; i += 1) {
+        const a = nextAction(job, { exclude: claimed });
+        assert.strictEqual(a.type, ACTION.GENERATE_CLIP, `unit ${i} should be a clip`);
+        const key = actionKey(a);
+        assert.ok(!claimed.has(key), 'the same clip must never be handed out twice');
+        claimed.add(key);
+        handed.push(`v${a.variantIdx}c${a.clipIdx}`);
+    }
+
+    assert.strictEqual(new Set(handed).size, 6, 'all six clips are distinct');
+    // Once everything is claimed there is nothing left to give out.
+    assert.strictEqual(nextAction(job, { exclude: claimed }).type, ACTION.NOTHING);
+});
+
+test('clips are drained variant-first so the earliest video lands soonest', () => {
+    const job = runningJob(3, 2);   // 3 variants x 2 clips
+    const claimed = new Set();
+    const order = [];
+    for (let i = 0; i < 6; i += 1) {
+        const a = nextAction(job, { exclude: claimed });
+        claimed.add(actionKey(a));
+        order.push(`v${a.variantIdx}c${a.clipIdx}`);
+    }
+    // Deliberate: variant 0 is completed before variant 1 is started, so the user
+    // gets a finished video while the rest are still rendering. Round-robin would
+    // make every variant land at the end instead.
+    assert.deepStrictEqual(order, ['v0c0', 'v0c1', 'v1c0', 'v1c1', 'v2c0', 'v2c1']);
+    assert.strictEqual(new Set(order).size, 6, 'still no duplicates');
+});
+
+test('the gate ignores exclusions — it can never be worked around', () => {
+    let job = makeJob();
+    job = setAvatarCandidates(job, [{ gcsUri: `gs://${BUCKET}/a.png` }]);
+    const claimed = new Set([actionKey({ type: ACTION.WAIT_APPROVAL })]);
+    // Even if a caller claims the wait action, no work may be substituted for it.
+    assert.strictEqual(nextAction(job, { exclude: claimed }).type, ACTION.WAIT_APPROVAL);
+});
+
+test('scripts are handed out before clips so every variant starts early', () => {
+    let job = makeJob({ variantCount: 3 });
+    job = setAvatarCandidates(job, [{ gcsUri: `gs://${BUCKET}/a.png` }]);
+    job = approveAvatar(job, [0]).job;
+    job = applyScript(job, 0, segments(2), { maxClipsPerJob: 60 }).job;
+
+    const claimed = new Set();
+    const first = nextAction(job, { exclude: claimed });
+    assert.strictEqual(first.type, ACTION.GENERATE_SCRIPT,
+        'variants without a script take priority over clips');
+    claimed.add(actionKey(first));
+    const second = nextAction(job, { exclude: claimed });
+    assert.strictEqual(second.type, ACTION.GENERATE_SCRIPT);
 });

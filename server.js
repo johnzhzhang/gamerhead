@@ -13,6 +13,13 @@ import { Datastore } from '@google-cloud/datastore';
 import { Storage } from '@google-cloud/storage';
 import compression from 'compression';
 import { GoogleGenAI, Type } from '@google/genai';
+import {
+    ALLOWED_GAMEPLAY_MIME,
+    extFromMime,
+    veoBudgetFor,
+    validateUploadRequest,
+    parseOwnBucketUri,
+} from './lib/autopilot.js';
 
 const require = createRequire(import.meta.url);
 const multer = require('multer');
@@ -761,6 +768,34 @@ const VIDEO_MODEL_FALLBACK = process.env.VIDEO_MODEL_FALLBACK || GEMINI_VIDEO_FA
 // set to an empty string to disable the net entirely.
 const VIDEO_MODEL_LAST_RESORT = process.env.VIDEO_MODEL_LAST_RESORT ?? 'veo-3.1-fast-generate-001';
 const VIDEO_RESOLUTION_DEFAULT = process.env.VIDEO_RESOLUTION || '720p';
+
+// ── Autopilot (batch one-shot production) ────────────────────────────────────
+// Autopilot turns one brief into N finished videos without per-step operation.
+// It is additive: when AUTOPILOT_ENABLED is unset every /api/autopilot/* route
+// 404s and the existing wizard is untouched.
+const AUTOPILOT_ENABLED = /^(1|true|yes|on)$/i.test(String(process.env.AUTOPILOT_ENABLED || ''));
+const AUTOPILOT_MAX_BATCH = Math.max(1, Number(process.env.AUTOPILOT_MAX_BATCH) || 10);
+const AUTOPILOT_CONCURRENCY = Math.max(1, Number(process.env.AUTOPILOT_CONCURRENCY) || 4);
+const AUTOPILOT_COMPOSE_CONCURRENCY = Math.max(1, Number(process.env.AUTOPILOT_COMPOSE_CONCURRENCY) || 2);
+const AUTOPILOT_MAX_CLIPS_PER_JOB = Math.max(1, Number(process.env.AUTOPILOT_MAX_CLIPS_PER_JOB) || 60);
+// Veo is kept as the safety net (it honours personGeneration: allow_adult, the
+// only rescue for Omni's non-deterministic block on photorealistic people), but
+// it is pay-as-you-go. Cap how much of a batch may fall through to it so that
+// "Omni is down" cannot silently turn into 40 billable Veo clips.
+const AUTOPILOT_VEO_CLIP_BUDGET = process.env.AUTOPILOT_VEO_CLIP_BUDGET
+    ? Math.max(0, Number(process.env.AUTOPILOT_VEO_CLIP_BUDGET))
+    : null; // null → derive per job: max(4, ceil(totalClips * 0.25))
+
+// Gameplay footage is uploaded straight to Cloud Storage with a signed URL.
+// Cloud Run caps an HTTP/1 request body at 32 MiB and that limit cannot be
+// raised, while the UI accepts gameplay up to 250 MB — so proxying the upload
+// through the app is not an option.
+const AUTOPILOT_UPLOAD_MAX_BYTES = Math.max(
+    1,
+    Number(process.env.AUTOPILOT_UPLOAD_MAX_BYTES) || 250 * 1024 * 1024
+);
+const AUTOPILOT_UPLOAD_TTL_MS = 60 * 60 * 1000; // 1 h: a 250 MB upload needs room
+const AUTOPILOT_UPLOAD_PREFIX = 'autopilot/uploads';
 
 const OMNI_ALLOWED_RESOLUTIONS = ['360p', '720p', '1080p', '4k'];
 // gemini-omni-flash-preview only supports 720p; 1.1 supports the full set.
@@ -2155,6 +2190,84 @@ apiRouter.get('/media/object', async (req, res) => {
         console.error('[Media] object error:', err);
         if (!res.headersSent) res.status(500).json({ error: 'Failed to read object: ' + err.message });
     }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTOPILOT
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Every Autopilot route is invisible unless the feature is switched on, so an
+ * existing deployment that has not opted in behaves exactly as before.
+ */
+const autopilotOnly = (req, res, next) => {
+    if (!AUTOPILOT_ENABLED) {
+        return res.status(404).json({ error: 'API endpoint not found', path: req.originalUrl });
+    }
+    if (!GCS_BUCKET_NAME) {
+        return res.status(503).json({
+            error: 'Autopilot requires GCS_BUCKET_NAME: gameplay footage and finished '
+                 + 'videos are held in Cloud Storage.',
+        });
+    }
+    next();
+};
+
+// POST /api/autopilot/upload-url
+// Body: { contentType: string, sizeBytes: number }
+// Returns: { uploadUrl, gcsUri, uploadId, expiresAt, requiredHeaders }
+//
+// The browser PUTs the gameplay file straight to Cloud Storage with this URL.
+// That is not an optimisation: Cloud Run's HTTP/1 request body limit is 32 MiB
+// and cannot be raised, so a 250 MB upload can never transit the app.
+apiRouter.post('/autopilot/upload-url', autopilotOnly, async (req, res) => {
+    // Signed-URL uploads bypass the app entirely, so validate before handing the
+    // URL out — afterwards the object lands in the bucket without touching our code.
+    const check = validateUploadRequest(req.body || {}, { maxBytes: AUTOPILOT_UPLOAD_MAX_BYTES });
+    if (!check.ok) return res.status(check.status).json({ error: check.error });
+    const { contentType, size } = check;
+
+    try {
+        const uploadId = randomUUID();
+        const objectName = `${AUTOPILOT_UPLOAD_PREFIX}/${uploadId}/gameplay.${check.ext}`;
+        const expiresAt = Date.now() + AUTOPILOT_UPLOAD_TTL_MS;
+
+        // v4 signing binds the method and content type: the URL cannot be reused
+        // to write anything else, and the client must echo the same header.
+        const [uploadUrl] = await getStorage()
+            .bucket(GCS_BUCKET_NAME)
+            .file(objectName)
+            .getSignedUrl({
+                version: 'v4',
+                action: 'write',
+                expires: expiresAt,
+                contentType,
+            });
+
+        console.log(`[Autopilot] upload URL for ${objectName} (${(size / 1048576).toFixed(1)} MB)`);
+        res.json({
+            uploadUrl,
+            gcsUri: `gs://${GCS_BUCKET_NAME}/${objectName}`,
+            uploadId,
+            expiresAt,
+            requiredHeaders: { 'Content-Type': contentType },
+        });
+    } catch (err) {
+        console.error('[Autopilot] upload-url error:', err);
+        res.status(500).json({ error: 'Failed to create upload URL: ' + err.message });
+    }
+});
+
+// GET /api/autopilot/config
+// Returns the caller-visible limits so the UI can validate before uploading.
+apiRouter.get('/autopilot/config', autopilotOnly, (req, res) => {
+    res.json({
+        maxBatch: AUTOPILOT_MAX_BATCH,
+        maxClipsPerJob: AUTOPILOT_MAX_CLIPS_PER_JOB,
+        uploadMaxBytes: AUTOPILOT_UPLOAD_MAX_BYTES,
+        allowedGameplayTypes: ALLOWED_GAMEPLAY_MIME,
+        veoSafetyNet: Boolean(VIDEO_MODEL_LAST_RESORT),
+    });
 });
 
 app.use('/api', apiRouter);

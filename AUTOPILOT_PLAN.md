@@ -36,7 +36,8 @@
 
 | 原文 | 理解 |
 |---|---|
-| 每一步需要人来跟踪,希望输入指令之后直接拿到成品,中间的脚本和对话不用每一步操作 | 现状每步都要人干预是痛点。要**一次提交、全自动跑完**,脚本/台词不再逐段确认 |
+| 每一步需要人来跟踪,希望输入指令之后直接拿到成品,中间的脚本和对话不用每一步操作 | 现状每步都要人干预是痛点。**脚本/台词/分镜/片段/合成全自动**,不再逐段确认 |
+| 生成主播场景图片还是需要页面确认 | **头像是唯一保留的人工确认点**。确认通过后剩余流程全自动 |
 | 如果可以支持批量产出 10 个成片会更好 | 一个 brief → **N 个(≤10)不同成片**,用于挑选/A-B 投放 |
 | 控制台上输入合并到一个页面,中间步骤直接生成但是要有校验,最终结果直接输出 url 供用户下载 | **单页表单**替代三步向导;每步**自动但有校验**;交付**可下载 URL** |
 | 和之前版本在 deploy.sh 中可以兼容,可以考虑增加一个选项 | 老部署路径行为不变,**新增一个选项**开启 Autopilot |
@@ -60,14 +61,32 @@
 
 ## 2. 目标形态
 
+**两阶段**,中间只有一个人工确认点(头像):
+
 ```
-一页表单填完 → 点 Generate → 等 → 拿到 N 个成片的下载 URL
+阶段 A ── 一页表单填完 → 点 Generate
+             ↓ 自动生成主播场景图候选
+          ⏸ 页面确认：满意 → 继续 ／ 不满意 → 重生成 ／ 上传自己的图
+             ↓ 确认通过
+阶段 B ── 全自动：脚本 → 分镜 → 片段 → 拼接 → 合成 → 字幕
+             ↓
+          拿到 N 个成片的下载 URL
 ```
 
-- 中间脚本、分镜、头像、片段、拼接、合成、字幕**全自动**
+- 阶段 B 内部**全自动**,脚本、台词、片段、合成都不需要人再操作
 - 每步**有校验**,不合格重试或标记失败,不让坏数据流向下一步
-- **关掉浏览器任务继续跑**,回来还能看到结果
+- **关掉浏览器任务继续跑**,回来还能看到结果(阶段 B;阶段 A 停在确认闸门等人)
 - **部分成功也交付**:10 个里成 8 个就给 8 个 URL,不整单回滚
+
+### 为什么头像值得单独设闸门
+
+不只是"用户想看一眼",这个闸门有实际收益:
+
+| 理由 | 说明 |
+|---|---|
+| **省钱** | 头像是 10 个成片里唯一贯穿全局的视觉元素。头像不对 → 40 个片段全部白烧。闸门正好卡在花钱之前:头像 1 次生成很便宜,片段 40 次很贵 |
+| **不可复现** | 头像生成非确定性,重生成拿不回同一个主播(README 已记录)。所以"先确认再批量"是唯一可靠做法 |
+| **一次确认,复用 N 次** | 确认一个头像 → 10 个变体共用,人工成本摊薄到 1/10 |
 
 ---
 
@@ -78,13 +97,20 @@
    │ ① POST /api/autopilot/upload-url        换取签名上传 URL
    │ ② PUT  → 直传 GCS                       绕过 Cloud Run 32MiB 限制
    │ ③ POST /api/autopilot/jobs              建作业 → { jobId }
-   │ ④ GET  /api/autopilot/jobs/:id          轮询进度 + 取最终 URL
+   │ ④ GET  /api/autopilot/jobs/:id          轮询进度
+   │
+   │ ⏸ 作业进入 awaiting_avatar 状态，暂停等人
+   │ ⑤ POST .../avatar/regenerate            不满意就重生成（可改提示词/传参考图）
+   │ ⑥ POST .../avatar/approve               确认 → 解锁阶段 B
+   │
+   │ ⑦ 继续轮询 ④ → 取最终 URL
    ▼
 Cloud Run 编排器  AutopilotJob 状态机（每步 checkpoint 到 Datastore）
-   ├─ 脚本    gemini-3.7-flash          （复用 generate-script 逻辑）
-   ├─ 头像    gemini-3.1-flash-image    （复用 generate-avatar 逻辑）
-   ├─ 片段    beginVideoJob()           （复用 Omni 1.1→Flash→Veo 链 + 拦截重投）
-   └─ 合成    ffmpeg 服务端新代码        （PiP / stacked / 音混 / 字幕）
+   ├─ 阶段 A  头像  gemini-3.1-flash-image   （复用 generate-avatar 逻辑）
+   │            ↓ ⏸ 人工确认闸门（作业在此暂停，不消耗配额）
+   ├─ 阶段 B  脚本  gemini-3.7-flash         （复用 generate-script 逻辑）
+   ├─ 阶段 B  片段  beginVideoJob()          （复用 Omni 1.1→Flash→Veo 链 + 拦截重投）
+   └─ 阶段 B  合成  ffmpeg 服务端新代码       （PiP / stacked / 音混 / 字幕）
    ▼
 gs://<bucket>/autopilot/<jobId>/final-<n>.mp4
    ▼
@@ -93,7 +119,7 @@ gs://<bucket>/autopilot/<jobId>/final-<n>.mp4
 
 设计要点:**不能用一个阻塞请求跑完**。
 
-实测单个 Omni 片段约 36 秒。10 个成片 × 约 4 段 = 40 个片段,叠加脚本/头像/合成,现实耗时约 **15 分钟**。虽然 Cloud Run `timeoutSeconds=3600` 撑得住,但:
+实测单个 Omni 片段约 36 秒。10 个成片 × 约 4 段 = 40 个片段,叠加脚本与合成,**阶段 B** 现实耗时约 **15 分钟**(阶段 A 的头像生成约 10 秒,人工确认时长不计)。虽然 Cloud Run `timeoutSeconds=3600` 撑得住,但:
 
 - 一个挂 15 分钟的 HTTP 请求太脆,断网/刷新即全废
 - 无法满足"关掉页面继续跑"
@@ -183,6 +209,16 @@ Cloud Run 默认**请求之外 CPU 被 throttle**(实测当前服务 `cpu-thrott
 
 `tick` 必须**幂等**:重复调用同一状态不产生额外副作用。
 
+### 6.4 闸门不参与自动推进
+
+`awaiting_avatar` 状态**不被任何自动机制推进**:
+
+- L1 进程内 worker 跳过该状态的作业
+- L2 `tick` 遇到该状态立即返回,不做任何事
+- L3 `resume` cron 过滤掉该状态的作业
+
+唯一出路是用户显式调 `avatar/approve`。这条规则同时是[成本护栏](#14-成本与配额)的第一道:自动化永远不会自己决定去花那 40 次视频生成的钱。
+
 ---
 
 ## 7. 流水线与校验门
@@ -192,13 +228,16 @@ Cloud Run 默认**请求之外 CPU 被 throttle**(实测当前服务 `cpu-thrott
 | # | 步骤 | 校验门 | 失败处理 |
 |---|---|---|---|
 | 0 | 入参 | 必填项完整;比例/布局合法;gameplay 能 ffprobe 出时长与分辨率 | 立即 `400`,不建作业 |
-| 1 | 脚本 | JSON schema 通过;段数 ≥ 1;每段 `duration ∈ {4,6,8}`;台词非空;总时长 ≤ gameplay 时长 | 升温重试 2 次 → 该变体失败 |
-| 2 | 头像 | 图片可解码;比例符合布局要求(`stacked` 需与成片反向比例) | 重试 2 次 → 该变体失败 |
-| 3 | 片段 | 每段 `videoUri` 存在;ffprobe 时长/分辨率符合预期 | **复用现有链**:Omni 1.1 → Omni Flash → `content_blocked` 重投 → (可选)Veo |
-| 4 | 合成 | 输出可 probe;时长 ≈ 各段之和(±0.5s);含音轨;文件大小 > 0 | 重跑 1 次 → 该变体失败 |
-| 5 | 交付 | GCS 对象存在且大小合理;签名 URL 可访问 | 标记该变体失败,**其余照常交付** |
+| 1 | **头像生成**(阶段 A) | 图片可解码;比例符合布局要求(`stacked` 需与成片反向比例) | 自动重试 2 次 → 仍失败则报错等人重生成 |
+| 2 | **⏸ 头像确认**(人工闸门) | 人工判断。作业停在 `awaiting_avatar`,**不消耗任何视频配额** | 可无限次重生成 / 改提示词 / 传参考图 / 直接上传成品图;也可取消整单 |
+| 3 | 脚本(阶段 B) | JSON schema 通过;段数 ≥ 1;每段 `duration ∈ {4,6,8}`;台词非空;总时长 ≤ gameplay 时长 | 升温重试 2 次 → 该变体失败 |
+| 4 | 片段(阶段 B) | 每段 `videoUri` 存在;ffprobe 时长/分辨率符合预期 | **复用现有链**:Omni 1.1 → Omni Flash → `content_blocked` 重投 → (可选)Veo |
+| 5 | 合成(阶段 B) | 输出可 probe;时长 ≈ 各段之和(±0.5s);含音轨;文件大小 > 0 | 重跑 1 次 → 该变体失败 |
+| 6 | 交付 | GCS 对象存在且大小合理;签名 URL 可访问 | 标记该变体失败,**其余照常交付** |
 
 **部分成功交付**是刻意设计:批量场景下个别变体失败很正常,不应拖垮整单。
+
+**闸门位置的关键性**:第 2 步之前只花了 1 次图片生成的钱;一旦越过闸门,第 4 步就是 40 次视频生成。所以闸门必须**硬阻塞** —— 没有显式 approve,编排器绝不推进到阶段 B。
 
 ---
 
@@ -206,13 +245,29 @@ Cloud Run 默认**请求之外 CPU 被 throttle**(实测当前服务 `cpu-thrott
 
 "10 个成片"理解为**同一 brief 产出 10 个不同成片**用于挑选/投放测试。变体维度可锁:
 
-| 模式 | 脚本 | 头像 | 用途 |
-|---|---|---|---|
-| `vary-script`(默认) | 10 份不同(升温 / 换切入角度) | 锁定 1 个 | 测文案,主播形象统一 |
-| `vary-avatar` | 锁定 1 份 | 10 个不同 | 测主播形象 |
-| `vary-both` | 各自独立 | 各自独立 | 最大多样性 |
+| 模式 | 脚本 | 头像 | 确认闸门形态 | 用途 |
+|---|---|---|---|---|
+| `vary-script`(**推荐默认**) | 10 份不同(升温 / 换切入角度) | 锁定 1 个 | **确认 1 张图** | 测文案,主播形象统一 |
+| `vary-avatar` | 锁定 1 份 | 10 个不同 | 候选图廊,**多选勾中要用的** | 测主播形象 |
+| `vary-both` | 各自独立 | 各自独立 | 候选图廊多选 | 最大多样性 |
 
 **gameplay 只上传一次,N 个变体共用** —— 省时间也省流量。
+
+### 确认闸门与变体模式的关系
+
+引入人工确认后,`vary-script` 成为**明显最优的默认值**:只需确认 1 张图,就能解锁 10 个成片,人工成本摊到 1/10。
+
+`vary-avatar` / `vary-both` 则需要确认多张图,做成**候选图廊**:
+
+```
+一次生成 N+2 张候选（多生成几张备选，图片便宜）
+   ↓
+图廊展示，用户勾选要用的 N 张（也可对单张重生成）
+   ↓
+每张选中的头像各出 1 个成片
+```
+
+图片生成远比视频便宜,所以"多生成几张让用户挑"是划算的。
 
 > ⚠️ **待确认**:若"10 个成片"实际是**10 个不同 gameplay 各出 1 片**,批量模型需改为多素材输入,方案会有差异。当前按"一素材多变体"设计。见[第 17 节](#17-待确认事项)。
 
@@ -220,17 +275,20 @@ Cloud Run 默认**请求之外 CPU 被 throttle**(实测当前服务 `cpu-thrott
 
 ## 9. 单页控制台
 
-新增 `components/Autopilot.tsx`,一页三块。**不复用**三步向导。
+新增 `components/Autopilot.tsx`,一页四块。**不复用**三步向导。
 
 | 区块 | 内容 |
 |---|---|
-| **输入区** | 游戏标题 / URL / CTA / 设备 / 台词节奏 / 附加说明;目标比例;布局与位置;字幕开关;变体数(1–10);变体模式;gameplay 上传(带直传进度条) |
-| **进度区** | 提交后出现。一行一个变体,展示 脚本 → 头像 → 片段(3/4) → 合成 的实时状态与错误原因 |
+| **输入区** | 游戏标题 / URL / CTA / 设备 / 台词节奏 / 附加说明;目标比例;布局与位置;字幕开关;变体数(1–10);变体模式;主播外观与背景描述;可选参考图;gameplay 上传(带直传进度条) |
+| **⏸ 头像确认区** | 提交后出现,**页面停在这里等人**。展示生成的主播场景图(单张或候选图廊)。操作:`确认并开始生成` / `重新生成`(可改描述或换参考图) / `上传我自己的图` / `取消`。同时显示"确认后将生成 N 个片段"的成本提示 |
+| **进度区** | 确认后出现。一行一个变体,展示 脚本 → 片段(3/4) → 合成 的实时状态与错误原因 |
 | **成品区** | 每个变体一个内联预览播放器 + 下载按钮(签名 URL);外加"全部下载" |
+
+四块在同一页上依次展开(不跳页、不换路由),符合"输入合并到一个页面"的要求。头像确认区是唯一会阻塞的地方。
 
 **原三步向导 + Avatar + Studio 完全保留不动**,Autopilot 是并列的新入口(仅在 `AUTOPILOT_ENABLED` 时显示)。
 
-文本输入沿用 `components/TextInput.tsx` 的 IME 安全组件。
+头像确认区可复用现有 `components/AvatarGenerator.tsx` 的两项能力:**参考图锁定形象**、**头像历史条**(避免为同一形象重复付费)。文本输入沿用 `components/TextInput.tsx` 的 IME 安全组件。
 
 ---
 
@@ -241,14 +299,19 @@ Cloud Run 默认**请求之外 CPU 被 throttle**(实测当前服务 `cpu-thrott
 | Method | Path | 说明 |
 |---|---|---|
 | `POST` | `/api/autopilot/upload-url` | 换取 gameplay 直传 GCS 的 v4 签名 PUT URL |
-| `POST` | `/api/autopilot/jobs` | 校验入参、建作业 → `{ jobId }` |
-| `GET` | `/api/autopilot/jobs/:id` | 进度 + 各变体状态 + 已完成变体的签名 URL |
-| `POST` | `/api/autopilot/jobs/:id/tick` | **幂等**推进一步(浏览器轮询驱动) |
+| `POST` | `/api/autopilot/jobs` | 校验入参、建作业、**生成头像候选** → `{ jobId }` |
+| `GET` | `/api/autopilot/jobs/:id` | 进度 + 状态 + 头像候选 URL + 已完成变体的签名 URL |
+| `POST` | `/api/autopilot/jobs/:id/avatar/regenerate` | **重新生成头像**(可带新描述 / 参考图),仅在 `awaiting_avatar` 有效 |
+| `POST` | `/api/autopilot/jobs/:id/avatar/upload-url` | 换取"上传我自己的主播图"的签名 PUT URL |
+| `POST` | `/api/autopilot/jobs/:id/avatar/approve` | **确认头像 → 解锁阶段 B**。`vary-avatar` 模式下带选中的候选 index 数组 |
+| `POST` | `/api/autopilot/jobs/:id/tick` | **幂等**推进一步(浏览器轮询驱动)。遇 `awaiting_avatar` 立即返回不推进 |
 | `POST` | `/api/autopilot/jobs/:id/cancel` | 取消作业,止损 |
 | `GET` | `/api/autopilot/jobs` | 我的历史作业列表 |
-| `POST` | `/api/autopilot/resume` | 捡起僵住作业(Cloud Scheduler 可选调用) |
+| `POST` | `/api/autopilot/resume` | 捡起僵住作业(Cloud Scheduler 可选调用)。**跳过 `awaiting_avatar` 的作业** |
 
 `AUTOPILOT_ENABLED` 未开启时,以上全部返回 `404`。
+
+**闸门的服务端强制**:`approve` 是阶段 B 的唯一入口。`tick` 和 `resume` 遇到 `awaiting_avatar` 状态直接返回、不推进,所以即使前端有 bug 也不会误触发 40 次视频生成。
 
 ---
 
@@ -259,11 +322,31 @@ Cloud Run 默认**请求之外 CPU 被 throttle**(实测当前服务 `cpu-thrott
 ```
 indexed:    ownerEmail, status, variantCount, doneCount, failedCount,
             createdAt, updatedAt
-unindexed:  spec     → JSON { gameInfo, layout, ratio, subtitles,
-                              variantMode, gameplayGcsUri, gameplayMeta }
-unindexed:  variants → JSON [ { idx, stage, scriptSegments, avatarUri,
-                                clipUris[], finalUri, error, timings } ]
+unindexed:  spec       → JSON { gameInfo, layout, ratio, subtitles,
+                                variantMode, gameplayGcsUri, gameplayMeta,
+                                avatarPrompt, avatarRefGcsUri }
+unindexed:  avatar     → JSON { candidates:[{idx,gcsUri}], approvedIdx:[],
+                                approvedAt, regenCount, source:'generated'|'uploaded' }
+unindexed:  variants   → JSON [ { idx, stage, scriptSegments, avatarUri,
+                                  clipUris[], finalUri, error, timings } ]
 ```
+
+### 状态机
+
+```
+created
+   ↓ 生成头像候选
+awaiting_avatar ⏸ ──(regenerate，可多次)──┐
+   │                                      └→ awaiting_avatar
+   │ approve
+   ↓
+running ──→ completed          （全部变体成功）
+   │   └──→ partially_completed（部分成功，仍交付已成功的）
+   │   └──→ failed             （全部失败）
+   └──(cancel，任意阶段)──→ cancelled
+```
+
+`awaiting_avatar` 是**唯一会无限期停留**的状态,不设超时(用户可能隔天回来确认)。停留期间不占用任何视频配额,只占 Datastore 一条记录和几张图的存储。
 
 查询仅按 `ownerEmail` 过滤 + 内存排序,**不需要复合索引**(与现有 `Project` 做法一致)。
 
@@ -273,12 +356,13 @@ unindexed:  variants → JSON [ { idx, stage, scriptSegments, avatarUri,
 
 ```
 gs://<bucket>/autopilot/<jobId>/gameplay.<ext>          直传的原始素材
-gs://<bucket>/autopilot/<jobId>/v<n>/avatar.png         各变体头像
+gs://<bucket>/autopilot/<jobId>/avatar-cand-<k>.png     头像候选（确认闸门用）
+gs://<bucket>/autopilot/<jobId>/avatar-ref.<ext>        用户上传的参考图/自备主播图
 gs://<bucket>/autopilot/<jobId>/v<n>/clip-<i>.mp4       各变体片段
 gs://<bucket>/autopilot/<jobId>/v<n>/final.mp4          各变体成片
 ```
 
-按 jobId 分目录,便于整单清理与生命周期规则。
+按 jobId 分目录,便于整单清理与生命周期规则。头像候选放在 job 根目录(而非变体目录),因为它在变体拆分**之前**就产生,且 `vary-script` 模式下被所有变体共用。
 
 ---
 
@@ -346,10 +430,11 @@ gs://<bucket>/autopilot/<jobId>/v<n>/final.mp4          各变体成片
 
 ### 建议的成本护栏
 
-1. **Autopilot 下默认禁用 Veo 兜底**(`VIDEO_MODEL_LAST_RESORT=""`)—— 宁可该变体失败,也不静默烧钱
-2. `AUTOPILOT_MAX_CLIPS_PER_JOB` 熔断
-3. 提交前 UI **显式显示"本次将生成 N 个片段"**并要求确认
-4. 建议给 bucket 加生命周期规则(Autopilot 会显著加快存储增长)
+1. **头像人工确认闸门**(最有效的一道)—— 越过闸门前只花了 1 次图片生成;闸门挡住的是 40 次视频生成。头像不满意时的重生成成本可忽略
+2. **Autopilot 下默认禁用 Veo 兜底**(`VIDEO_MODEL_LAST_RESORT=""`)—— 宁可该变体失败,也不静默烧钱
+3. `AUTOPILOT_MAX_CLIPS_PER_JOB` 熔断
+4. 确认闸门上**显式显示"确认后将生成 N 个片段"**,让花钱这一步有明确知情
+5. 建议给 bucket 加生命周期规则(Autopilot 会显著加快存储增长)
 
 ---
 
@@ -359,9 +444,9 @@ gs://<bucket>/autopilot/<jobId>/v<n>/final.mp4          各变体成片
 |---|---|---|
 | **P1** | 服务端合成:ffmpeg PiP / stacked / 音混 / 字幕 + 服务端 SRT 生成 | 用现有片段合出与浏览器版**视觉一致**的成片(逐帧比对) |
 | **P2** | 直传通道:签名上传 URL + bucket CORS + gameplay 落 GCS | 250 MB 原片成功进桶(验证绕过 32 MiB 限制) |
-| **P3** | 作业状态机:`AutopilotJob` + `tick` + 校验门 + 断点续跑 | 单变体端到端跑通;**杀实例后能续跑** |
+| **P3** | 作业状态机:`AutopilotJob` + `tick` + 校验门 + 断点续跑 + **头像确认闸门** | 单变体端到端跑通;**闸门硬阻塞验证**(未 approve 时 `tick`/`resume` 都不推进);杀实例后能续跑 |
 | **P4** | 批量与并发 + 部分成功交付 + 成本熔断 | 10 变体跑通;故障注入验证部分交付 |
-| **P5** | `Autopilot.tsx` 单页控制台 | **一次输入拿到 10 个下载 URL** |
+| **P5** | `Autopilot.tsx` 单页控制台(输入区 / 头像确认区 / 进度区 / 成品区) | **一次输入 → 确认头像 → 拿到 10 个下载 URL** |
 | **P6** | deploy.sh 模式 4 + README / DEPLOYMENT 更新 | 全新部署 + 老服务升级**双向验证** |
 
 每阶段结束都执行:
@@ -392,7 +477,7 @@ npm run build
 
 ## 17. 待确认事项
 
-需要你拍板三件事,确认后即按 P1 → P6 实施:
+需要你拍板四件事,确认后即按 P1 → P6 实施:
 
 ### ① 变体语义
 
@@ -401,15 +486,27 @@ npm run build
 
 > 影响:(B) 需要多素材上传与管理,批量模型和 UI 都要改。
 
-### ② Veo 兜底
+### ② 确认闸门的范围(本轮新增)
+
+头像已确定要人工确认。需要确认的是**确认到什么粒度**:
+
+- **(A) 建议** —— 只做 `vary-script`:确认 **1 张**主播图 → 10 个文案变体共用。人工负担最小,P5 也最快落地
+- (B) —— 同时做候选图廊:一次生成 N+2 张,**多选**勾中要用的,支持 `vary-avatar` / `vary-both`
+- (C) —— 除头像外,**脚本也要确认**(与"脚本不用每步操作"的原始需求冲突,列出仅供排除)
+
+> 建议先按 (A) 实现,把图廊多选留到 P5 之后作为增量。
+
+### ③ Veo 兜底
 
 - **(A) 建议** —— Autopilot 下默认**关闭** Veo:省钱,失败即失败
 - (B) —— 保留 Veo:成功率优先,但可能显著更贵
 
-### ③ 常驻实例
+### ④ 常驻实例
 
 - **(A) 建议** —— 接受 `min-instances=1` + CPU 常开,换取"关掉页面继续跑"
 - (B) —— 不接受常驻:任务仅在页面开着时推进(靠 L2 轮询驱动)
+
+> 注:头像确认闸门本身**不需要**常驻实例 —— 作业停在 Datastore 里等,与实例是否存活无关。常驻只影响阶段 B(片段+合成)能否在关掉页面后继续。
 
 ---
 

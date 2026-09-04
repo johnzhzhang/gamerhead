@@ -16,7 +16,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import NeonButton from './NeonButton';
 import { TextField, TextArea } from './TextInput';
-import type { LayoutType, PipPlacement, StackedPlacement, TargetAspectRatio } from '../types';
+import type {
+  DialoguePacking, GamingDevice, LayoutType, PipPlacement, StackedPlacement, TargetAspectRatio,
+} from '../types';
 import {
   approveAvatar,
   cancelJob,
@@ -35,6 +37,26 @@ import {
 } from '../services/autopilot';
 
 const POLL_MS = 6000;
+
+/**
+ * Fixed choices, same as the wizard. Neither is free text: the device decides how
+ * the streamer is described relating to the game, and the pacing selects a
+ * word-count table for each shot length — a clip is a fixed 4, 6 or 8 seconds, so
+ * dialogue that runs long is cut off mid-sentence.
+ */
+const DEVICE_OPTIONS: { value: GamingDevice; label: string }[] = [
+  { value: 'PC', label: 'PC (keyboard and mouse)' },
+  { value: 'Console', label: 'Console (controller)' },
+  { value: 'Mobile (Vertical)', label: 'Mobile — held upright' },
+  { value: 'Mobile (Horizontal)', label: 'Mobile — held sideways' },
+  { value: 'Hands-free (No device)', label: 'Hands-free (no device)' },
+];
+
+const PACING_OPTIONS: { value: DialoguePacking; label: string }[] = [
+  { value: 'Slow', label: 'Slow — fewer words, room to breathe' },
+  { value: 'Normal', label: 'Normal — balanced' },
+  { value: 'Fast', label: 'Fast — packed, high energy' },
+];
 
 /**
  * The id of the batch last opened in this browser.
@@ -101,6 +123,33 @@ const Section: React.FC<{ step: string; title: string; hint?: string; children: 
     {children}
   </section>
 );
+
+const SELECT_CLASS = 'w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm '
+  + 'text-gray-200 focus:ring-2 focus:ring-google-blue focus:border-transparent outline-none '
+  + 'transition-all disabled:opacity-50';
+
+/** Label + single-select, for the fields that have a fixed set of choices. */
+function SelectField<T extends string>({ id, label, value, options, onChange, hint, disabled }: {
+  id: string;
+  label: string;
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
+  hint?: string;
+  disabled?: boolean;
+}) {
+  return (
+  <div>
+    <label htmlFor={id} className="block text-xs text-gray-400 mb-1.5">{label}</label>
+    <select id={id} value={value} disabled={disabled}
+            onChange={(e) => onChange(e.target.value as T)}
+            className={SELECT_CLASS}>
+      {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+    </select>
+      {hint && <p className="text-[11px] text-gray-500 mt-1.5">{hint}</p>}
+    </div>
+  );
+}
 
 const INPUT_CLASS = 'w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm '
   + 'text-gray-200 placeholder-gray-500 focus:ring-2 focus:ring-google-blue focus:border-transparent '
@@ -263,14 +312,14 @@ const Autopilot: React.FC = () => {
     gameTitle: '',
     gameUrl: '',
     callToAction: '',
-    gamingDevice: '',
-    dialoguePacing: '',
     extraInstructions: '',
     avatarPrompt: '',
   });
   const commitField = useCallback((name: string, value: string) => {
     setBrief((prev) => (prev[name as keyof typeof prev] === value ? prev : { ...prev, [name]: value }));
   }, []);
+  const [gamingDevice, setGamingDevice] = useState<GamingDevice>('PC');
+  const [dialoguePacing, setDialoguePacing] = useState<DialoguePacking>('Normal');
   const [targetRatio, setTargetRatio] = useState<TargetAspectRatio>('16:9');
   const [layoutType, setLayoutType] = useState<LayoutType>('classic-pip');
   const [pipPlacement, setPipPlacement] = useState<PipPlacement>('bottom-left');
@@ -432,8 +481,8 @@ const Autopilot: React.FC = () => {
         gameTitle: brief.gameTitle.trim(),
         gameUrl: brief.gameUrl.trim(),
         callToAction: brief.callToAction.trim(),
-        gamingDevice: brief.gamingDevice.trim(),
-        dialoguePacing: brief.dialoguePacing.trim(),
+        gamingDevice,
+        dialoguePacing,
         extraInstructions: brief.extraInstructions.trim(),
         targetRatio,
         layoutType,
@@ -456,7 +505,8 @@ const Autopilot: React.FC = () => {
       setBusy(null);
     }
   }, [
-    needsGameplay, gameplayFile, refFile, ownFile, brief, targetRatio, layoutType,
+    needsGameplay, gameplayFile, refFile, ownFile, brief, gamingDevice, dialoguePacing,
+    targetRatio, layoutType,
     pipPlacement, stackedPlacement, subtitles, searchGrounding, groundingAvailable,
     variantCount, refreshJobs,
   ]);
@@ -572,10 +622,12 @@ const Autopilot: React.FC = () => {
                    hint="The game's official store or product page. Needed if you want the script grounded in real facts." />
             <Field name="callToAction" label="Call to action" value={brief.callToAction} onCommit={commitField}
                    placeholder="Play free now" disabled={!!busy} />
-            <Field name="gamingDevice" label="Device / platform" value={brief.gamingDevice} onCommit={commitField}
-                   placeholder="PC, Switch, mobile…" disabled={!!busy} />
-            <Field name="dialoguePacing" label="Dialogue pacing" value={brief.dialoguePacing} onCommit={commitField}
-                   placeholder="Punchy, fast" disabled={!!busy} />
+            <SelectField<GamingDevice> id="ap-device" label="Device / platform" value={gamingDevice}
+                         options={DEVICE_OPTIONS} onChange={setGamingDevice} disabled={!!busy}
+                         hint="Decides how the streamer is shown holding the game." />
+            <SelectField<DialoguePacking> id="ap-pacing" label="Dialogue pacing" value={dialoguePacing}
+                         options={PACING_OPTIONS} onChange={setDialoguePacing} disabled={!!busy}
+                         hint="Sets the word count per shot so lines fit the clip length." />
             <div className="md:col-span-2">
               <Field name="extraInstructions" label="Extra direction (optional)" multiline
                      value={brief.extraInstructions} onCommit={commitField} disabled={!!busy}

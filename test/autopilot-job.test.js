@@ -34,6 +34,8 @@ import {
     canUseVeo,
     summarise,
     actionKey,
+    GAMING_DEVICES,
+    DIALOGUE_PACING,
 } from '../lib/autopilot-job.js';
 
 const BUCKET = 'test-bucket';
@@ -626,4 +628,44 @@ test('grounding is dropped without a store URL rather than silently ignored', ()
 
 test('grounding defaults to off', () => {
     assert.strictEqual(validateJobSpec(goodSpec(), LIMITS).spec.searchGrounding, false);
+});
+
+// ── fixed option sets ────────────────────────────────────────────────────────
+// Device and pacing are not free text. The device changes how the streamer is
+// described relating to the game, and the pacing picks a word-count table — a
+// shot is a fixed 4, 6 or 8 seconds, so dialogue that runs long is cut off.
+
+test('device and pacing accept every listed option', () => {
+    for (const d of GAMING_DEVICES) {
+        assert.strictEqual(validateJobSpec(goodSpec({ gamingDevice: d }), LIMITS).spec.gamingDevice, d);
+    }
+    for (const p of DIALOGUE_PACING) {
+        assert.strictEqual(validateJobSpec(goodSpec({ dialoguePacing: p }), LIMITS).spec.dialoguePacing, p);
+    }
+});
+
+test('an unknown device or pacing falls back to a sane default', () => {
+    // Free text used to reach the prompt verbatim; now anything off-list becomes a
+    // known value rather than silently degrading the script.
+    for (const bad of ['Switch', 'punchy and fast', '', null, undefined, 42, 'PC ']) {
+        const r = validateJobSpec(goodSpec({ gamingDevice: bad, dialoguePacing: bad }), LIMITS);
+        assert.strictEqual(r.ok, true);
+        assert.ok(GAMING_DEVICES.includes(r.spec.gamingDevice), `device fallback for ${String(bad)}`);
+        assert.ok(DIALOGUE_PACING.includes(r.spec.dialoguePacing), `pacing fallback for ${String(bad)}`);
+    }
+});
+
+test('the defaults are PC and Normal', () => {
+    const r = validateJobSpec(goodSpec(), LIMITS);
+    assert.strictEqual(r.spec.gamingDevice, 'PC');
+    assert.strictEqual(r.spec.dialoguePacing, 'Normal');
+});
+
+test('the option sets match what the wizard offers', () => {
+    // Divergence here would mean the two paths produce different scripts from the
+    // same-looking choice.
+    assert.deepStrictEqual(GAMING_DEVICES, [
+        'PC', 'Console', 'Mobile (Vertical)', 'Mobile (Horizontal)', 'Hands-free (No device)',
+    ]);
+    assert.deepStrictEqual(DIALOGUE_PACING, ['Slow', 'Normal', 'Fast']);
 });

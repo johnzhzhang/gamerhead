@@ -2427,6 +2427,28 @@ const generateAvatarImage = async ({ prompt, aspectRatio, referenceGcsUri }) => 
  * prompt asks for a distinct angle. That is what makes ten renders worth having
  * instead of ten copies.
  */
+/**
+ * Word-count ranges per shot length, keyed by pacing.
+ *
+ * These are the wizard's rules. They matter more than they look: a clip is a
+ * fixed 4, 6 or 8 seconds, so dialogue that runs long simply gets cut off
+ * mid-sentence when the shot ends.
+ */
+const PACING_WORD_RANGES = {
+    Slow:   { 4: '8 to 10',   6: '12 to 15', 8: '17 to 20' },
+    Normal: { 4: '10 to 13',  6: '15 to 18', 8: '20 to 23' },
+    Fast:   { 4: '12 to 14',  6: '18 to 21', 8: '23 to 26' },
+};
+
+/** How the streamer physically relates to the game, per device. */
+const DEVICE_HINTS = {
+    'PC': 'They are at a desk with a keyboard and mouse; hands may leave the desk to gesture.',
+    'Console': 'They are holding a controller; gestures happen around it.',
+    'Mobile (Vertical)': 'They are holding a phone upright in one hand.',
+    'Mobile (Horizontal)': 'They are holding a phone sideways in both hands.',
+    'Hands-free (No device)': 'They hold no device at all; both hands are free to gesture.',
+};
+
 const generateAutopilotScript = async (job, variantIdx) => {
     const s = job.spec;
     const angles = [
@@ -2442,6 +2464,8 @@ const generateAutopilotScript = async (job, variantIdx) => {
         'lead with a surprising detail a new player would miss',
     ];
     const angle = angles[variantIdx % angles.length];
+    const pacing = PACING_WORD_RANGES[s.dialoguePacing] ? s.dialoguePacing : 'Normal';
+    const ranges = PACING_WORD_RANGES[pacing];
 
     const promptText = [
         `You are scripting a short promotional video for the game "${s.gameTitle}".`,
@@ -2452,15 +2476,25 @@ const generateAutopilotScript = async (job, variantIdx) => {
               + 'setting, platforms or standout features — so it sounds like someone who '
               + 'has played it. Do not invent facts you did not find.'
             : '',
-        s.gamingDevice ? `Platform / device: ${s.gamingDevice}` : '',
+        s.gamingDevice
+            ? `Platform / device: ${s.gamingDevice}. ${DEVICE_HINTS[s.gamingDevice] || ''}`
+            : '',
         s.callToAction ? `The video must end on this call to action: ${s.callToAction}` : '',
-        s.dialoguePacing ? `Dialogue pacing: ${s.dialoguePacing}` : '',
         s.extraInstructions ? `Additional direction: ${s.extraInstructions}` : '',
         '',
         `Creative direction for this version: ${angle}.`,
         'Produce a timed shot list for an on-camera streamer.',
         'Each shot needs: id, startTime, endTime, duration (4, 6 or 8 seconds),',
         'prompt (what the streamer physically does on camera), and dialogue (what they say).',
+        '',
+        `STRICT WORD COUNTS (pacing: ${pacing}). A shot is a fixed length, so dialogue`,
+        'that runs long is cut off mid-sentence. Count only spoken words:',
+        `  - 4-second shot: ${ranges[4]} words`,
+        `  - 6-second shot: ${ranges[6]} words`,
+        `  - 8-second shot: ${ranges[8]} words`,
+        'Anything in brackets or parentheses is a vocal-effect direction, not speech,',
+        'and does not count towards these limits.',
+        '',
         'Keep the whole video between 16 and 40 seconds. Return JSON only.',
     ].filter(Boolean).join('\n');
 

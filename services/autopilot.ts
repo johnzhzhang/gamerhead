@@ -7,7 +7,7 @@
  */
 
 import { apiFetch } from './auth';
-import type { LayoutType, TargetAspectRatio } from '../types';
+import type { DialoguePacking, GamingDevice, LayoutType, TargetAspectRatio } from '../types';
 
 export type AutopilotStage = 'pending' | 'script' | 'clips' | 'compose' | 'done' | 'failed';
 
@@ -91,8 +91,8 @@ export interface AutopilotSubmitSpec {
   gameTitle: string;
   gameUrl?: string;
   callToAction?: string;
-  gamingDevice?: string;
-  dialoguePacing?: string;
+  gamingDevice?: GamingDevice;
+  dialoguePacing?: DialoguePacking;
   extraInstructions?: string;
   targetRatio: TargetAspectRatio;
   layoutType: LayoutType;

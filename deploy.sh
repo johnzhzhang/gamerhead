@@ -316,7 +316,7 @@ if [ "$DEPLOY_MODE" == "4" ]; then
   {
     "origin": ["${SERVICE_URL}", "${SERVICE_URL_ALT}"],
     "method": ["PUT", "GET", "HEAD", "OPTIONS"],
-    "responseHeader": ["Content-Type", "Content-Length", "x-goog-resumable"],
+    "responseHeader": ["Content-Type", "Content-Length", "Content-Disposition", "x-goog-resumable"],
     "maxAgeSeconds": 3600
   }
 ]
@@ -1143,7 +1143,7 @@ if [ -n "$AUTOPILOT_ENV" ]; then
   {
     "origin": ["${AP_URL}", "${AP_URL_ALT}"],
     "method": ["PUT", "GET", "HEAD", "OPTIONS"],
-    "responseHeader": ["Content-Type", "Content-Length", "x-goog-resumable"],
+    "responseHeader": ["Content-Type", "Content-Length", "Content-Disposition", "x-goog-resumable"],
     "maxAgeSeconds": 3600
   }
 ]

@@ -17,6 +17,7 @@ import {
     IMAGE_UPLOAD_MAX_BYTES,
     extFromImageMime,
     validateImageUploadRequest,
+    attachmentDisposition,
     extFromMime,
     veoBudgetFor,
     validateUploadRequest,
@@ -207,4 +208,46 @@ test('the image ceiling is far below the gameplay one', () => {
     // A reference photo has no business being hundreds of megabytes; keeping the
     // ceilings separate stops one being loosened by accident with the other.
     assert.ok(IMAGE_UPLOAD_MAX_BYTES < 250 * 1024 * 1024);
+});
+
+// ── download headers ─────────────────────────────────────────────────────────
+// A signed storage URL is always cross-origin to the app, so the HTML `download`
+// attribute does nothing: only Content-Disposition makes the browser save the
+// file instead of playing it. That makes this header the whole download feature.
+
+test('a plain filename produces a usable attachment header', () => {
+    const h = attachmentDisposition('Blockfall-v1.mp4');
+    assert.match(h, /^attachment; /);
+    assert.match(h, /filename="Blockfall-v1\.mp4"/);
+    assert.match(h, /filename\*=UTF-8''Blockfall-v1\.mp4/);
+});
+
+test('quotes, backslashes and newlines cannot break the header', () => {
+    const h = attachmentDisposition('ev"il\\name\r\n.mp4');
+    assert.ok(!/[\r\n]/.test(h), 'no line breaks may survive');
+    // Exactly one quoted section: the injected quote must be gone.
+    assert.strictEqual((h.match(/"/g) || []).length, 2);
+});
+
+test('non-ASCII names keep a readable fallback and an exact filename*', () => {
+    const h = attachmentDisposition('我的游戏-v1.mp4');
+    // ASCII fallback keeps the parts a client can read...
+    assert.match(h, /filename="[^"]*-v1\.mp4"/);
+    // ...and filename* carries the real thing, percent-encoded.
+    assert.match(h, /filename\*=UTF-8''/);
+    assert.ok(h.includes(encodeURIComponent('我的游戏-v1.mp4')));
+});
+
+test('an empty or missing name still yields a valid header', () => {
+    for (const v of ['', null, undefined, '   ']) {
+        const h = attachmentDisposition(v);
+        assert.match(h, /^attachment; filename="/);
+        assert.ok(!h.includes('filename=""'), `"${String(v)}" must not produce an empty filename`);
+    }
+});
+
+test('a very long name is truncated rather than emitted whole', () => {
+    const h = attachmentDisposition(`${'a'.repeat(500)}.mp4`);
+    const quoted = h.match(/filename="([^"]*)"/)[1];
+    assert.ok(quoted.length <= 120, `fallback should be bounded, got ${quoted.length}`);
 });

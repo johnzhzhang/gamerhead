@@ -892,7 +892,8 @@ const Autopilot: React.FC = () => {
                 <video src={o.url} controls preload="metadata" className="w-full bg-black" />
                 <div className="p-3 flex items-center justify-between gap-3">
                   <span className="text-xs text-gray-400">Video {o.idx + 1}</span>
-                  <a href={o.url} download={o.downloadName || `video-${o.idx + 1}.mp4`}
+                  <a href={o.downloadUrl || o.url}
+                     download={o.downloadName || `video-${o.idx + 1}.mp4`}
                      className="text-xs text-google-blue hover:underline">
                     Download
                   </a>

@@ -20,6 +20,7 @@ import {
     validateUploadRequest,
     validateImageUploadRequest,
     parseOwnBucketUri,
+    attachmentDisposition,
     IMAGE_UPLOAD_MAX_BYTES,
 } from './lib/autopilot.js';
 import {
@@ -947,6 +948,32 @@ const getStorage = () => {
 };
 
 /**
+ * Signed read URL for a gs:// object in this app's bucket.
+ *
+ * `downloadAs` makes Cloud Storage answer with Content-Disposition: attachment.
+ * That is the only thing that makes a browser save the file instead of playing
+ * it: the HTML `download` attribute is ignored for cross-origin URLs, and a
+ * signed storage URL is always cross-origin to this app.
+ */
+const signedReadUrl = async (gcsUri, { ttlMs = 60 * 60 * 1000, downloadAs = null } = {}) => {
+    const parsed = parseOwnBucketUri(gcsUri, GCS_BUCKET_NAME);
+    if (!parsed.ok) return null;
+    try {
+        const [url] = await getStorage().bucket(parsed.bucket).file(parsed.object).getSignedUrl({
+            version: 'v4',
+            action: 'read',
+            expires: Date.now() + ttlMs,
+            ...(downloadAs ? { responseDisposition: attachmentDisposition(downloadAs) } : {}),
+        });
+        return url;
+    } catch (err) {
+        console.warn('[Media] signing failed:', err.message);
+        return null;
+    }
+};
+
+
+/**
  * Copy a Veo-generated video (gs:// URI) into the customer bucket.
  * Downloads via ADC bearer token (same approach as download-video),
  * then streams the upload to GCS using the Storage client.
@@ -1094,10 +1121,18 @@ apiRouter.get('/admin/signed-url', adminOnly, async (req, res) => {
         }
         const objectName = withoutScheme.slice(slashIdx + 1);
 
+        // ?download=1 asks Cloud Storage for Content-Disposition: attachment.
+        // Without it a media file simply plays in the tab, because the browser
+        // ignores the `download` attribute on a cross-origin URL.
+        const wantsDownload = /^(1|true|yes)$/i.test(String(req.query.download || ''));
         const storage = getStorage();
         const [signedUrl] = await storage.bucket(bucketName).file(objectName).getSignedUrl({
+            version: 'v4',
             action: 'read',
             expires: Date.now() + 15 * 60 * 1000, // 15 minutes
+            ...(wantsDownload
+                ? { responseDisposition: attachmentDisposition(objectName.split('/').pop()) }
+                : {}),
         });
         res.json({ url: signedUrl });
     } catch (err) {
@@ -2141,9 +2176,14 @@ apiRouter.get('/media/export-url', async (req, res) => {
     }
 
     try {
+        const wantsDownload = /^(1|true|yes)$/i.test(String(req.query.download || ''));
         const [url] = await getStorage().bucket(bucketName).file(objectName).getSignedUrl({
+            version: 'v4',
             action: 'read',
             expires: Date.now() + 60 * 60 * 1000, // 1 hour — long enough to watch
+            ...(wantsDownload
+                ? { responseDisposition: attachmentDisposition(objectName.split('/').pop()) }
+                : {}),
         });
         res.json({ url });
     } catch (err) {
@@ -3143,27 +3183,31 @@ apiRouter.post('/autopilot/jobs', autopilotOnly, async (req, res) => {
 
 /** Signed read URLs for whatever the job has produced so far. */
 const signJobMedia = async (job) => {
-    const sign = async (gcsUri) => {
-        if (!gcsUri) return null;
-        const parsed = parseOwnBucketUri(gcsUri, GCS_BUCKET_NAME);
-        if (!parsed.ok) return null;
-        try {
-            const [url] = await getStorage().bucket(parsed.bucket).file(parsed.object).getSignedUrl({
-                action: 'read',
-                expires: Date.now() + 60 * 60 * 1000,
-            });
-            return url;
-        } catch { return null; }
-    };
-    const avatarUrls = await Promise.all(job.avatar.candidates.map((c) => sign(c.gcsUri)));
-    const outputUrls = await Promise.all(job.variants.map((v) => sign(v.finalUri)));
+    const titleBase = String(job.spec.gameTitle || 'video')
+        .trim().replace(/\s+/g, '-').slice(0, 60) || 'video';
+
+    const avatarUrls = await Promise.all(
+        job.avatar.candidates.map((c) => signedReadUrl(c.gcsUri))
+    );
+
+    // Two URLs per finished video, because one cannot do both jobs: the inline
+    // player needs a plain response, while a download needs
+    // Content-Disposition: attachment (the `download` attribute does nothing
+    // cross-origin, so without this the browser just plays the video).
+    const outputs = await Promise.all(job.variants.map(async (v) => {
+        if (!v.finalUri) return null;
+        const downloadName = `${titleBase}-v${v.idx + 1}.mp4`;
+        const [url, downloadUrl] = await Promise.all([
+            signedReadUrl(v.finalUri),
+            signedReadUrl(v.finalUri, { downloadAs: downloadName }),
+        ]);
+        if (!url) return null;
+        return { idx: v.idx, url, downloadUrl: downloadUrl || url, downloadName };
+    }));
+
     return {
         avatarCandidateUrls: avatarUrls,
-        outputs: job.variants.map((v, i) => ({
-            idx: v.idx,
-            url: outputUrls[i],
-            downloadName: outputUrls[i] ? `${job.spec.gameTitle || 'video'}-v${v.idx + 1}.mp4` : null,
-        })).filter((o) => o.url),
+        outputs: outputs.filter(Boolean),
     };
 };
 

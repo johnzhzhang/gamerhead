@@ -448,10 +448,20 @@ const AdminDashboard: React.FC = () => {
                                             const handleFileClick = async (e: React.MouseEvent) => {
                                                 e.preventDefault();
                                                 try {
-                                                    const res = await apiFetch(`/api/admin/signed-url?uri=${encodeURIComponent(uri)}`);
+                                                    // download=1 makes Cloud Storage send
+                                                    // Content-Disposition: attachment. Without it the
+                                                    // browser just plays the file in a new tab, because
+                                                    // the `download` attribute has no effect on a
+                                                    // cross-origin URL.
+                                                    const res = await apiFetch(`/api/admin/signed-url?uri=${encodeURIComponent(uri)}&download=1`);
                                                     if (!res.ok) throw new Error('Failed to get download link');
                                                     const data = await res.json();
-                                                    window.open(data.url, '_blank', 'noopener,noreferrer');
+                                                    const a = document.createElement('a');
+                                                    a.href = data.url;
+                                                    a.rel = 'noopener noreferrer';
+                                                    document.body.appendChild(a);
+                                                    a.click();
+                                                    a.remove();
                                                 } catch (err) {
                                                     console.error('Download error:', err);
                                                     alert('Failed to get download link. Please try again.');

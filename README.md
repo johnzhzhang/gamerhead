@@ -405,6 +405,13 @@ invitation to walk away is empty. Two mechanisms:
 - **The batch list.** `Your batches` lists everything this account has run, newest
   first, with title, status and progress. Opening one shows live progress, and for
   a finished batch it re-signs the download links (they expire after an hour).
+
+Each finished video comes back with **two** signed URLs: a plain one for the inline
+player and one carrying `Content-Disposition: attachment` for the download link.
+One URL cannot do both — the HTML `download` attribute is ignored for cross-origin
+URLs, and a Cloud Storage URL is always cross-origin here, so a single link would
+simply play the video. Verified in Chrome: the plain URL navigates and plays, the
+attachment URL fires a download with the intended filename.
 - **Automatic reopen.** The last batch opened in that browser is remembered in
   `localStorage`; on load the console reopens it. Failing that it reopens the
   newest batch still running, so an interrupted run is never stranded — and on a
@@ -678,7 +685,7 @@ Everything under `/api` except the three public endpoints requires authenticatio
 | `POST` | `/api/gemini/stitch-clips` | multipart `clips[]`, `subtitleSrt?`, `saveToGcs?` → MP4 stream, `X-Gcs-Uri` header when persisted |
 | `POST` | `/api/gemini/burn-subtitles` | multipart `video`, `srt`, `saveToGcs?` → MP4 stream, `X-Gcs-Uri` header |
 | `POST` | `/api/gemini/save-export` | multipart `video`, `label?` → `{gcsUri}`. For renders the server never saw |
-| `GET` | `/api/media/export-url?uri=` | 1-hour signed URL, own bucket only. Used by `<video>`, which cannot send an `Authorization` header |
+| `GET` | `/api/media/export-url?uri=&download=1` | 1-hour signed URL, own bucket only. Used by `<video>`, which cannot send an `Authorization` header. `download=1` adds `Content-Disposition: attachment` |
 | `POST` | `/api/media/save-image` | `{dataUrl, label?}` → `{gcsUri}`. For images the server did not produce — the avatar reference image |
 | `GET` | `/api/media/object?uri=` | Streams an object from the own bucket, same-origin and authenticated. See the note below on why this is not a signed URL |
 
@@ -705,7 +712,7 @@ Everything under `/api` except the three public endpoints requires authenticatio
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/api/admin/stats?from=&to=` | Activity log for the window, 120 days max |
-| `GET` | `/api/admin/signed-url?uri=` | 15-minute signed URL, own bucket only |
+| `GET` | `/api/admin/signed-url?uri=&download=1` | 15-minute signed URL, own bucket only. `download=1` forces a save rather than playback |
 
 ---
 

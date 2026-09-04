@@ -41,7 +41,16 @@ export interface AutopilotVariantView {
 
 export interface AutopilotOutput {
   idx: number;
+  /** Plain signed URL, for the inline player. */
   url: string;
+  /**
+   * Signed URL that responds with Content-Disposition: attachment.
+   *
+   * Needed because the HTML `download` attribute is ignored for cross-origin
+   * URLs, and a Cloud Storage URL is always cross-origin here — so linking to
+   * `url` would just play the video instead of saving it.
+   */
+  downloadUrl: string;
   downloadName: string | null;
 }
 

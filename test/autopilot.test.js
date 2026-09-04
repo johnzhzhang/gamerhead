@@ -13,6 +13,10 @@ import assert from 'node:assert';
 
 import {
     ALLOWED_GAMEPLAY_MIME,
+    ALLOWED_IMAGE_MIME,
+    IMAGE_UPLOAD_MAX_BYTES,
+    extFromImageMime,
+    validateImageUploadRequest,
     extFromMime,
     veoBudgetFor,
     validateUploadRequest,
@@ -142,4 +146,65 @@ test('refuses malformed URIs', () => {
 test('refuses any URI when no bucket is configured', () => {
     const r = parseOwnBucketUri('gs://my-bucket/a.mp4', '');
     assert.strictEqual(r.ok, false);
+});
+
+// ── image uploads ────────────────────────────────────────────────────────────
+// Reference images and user-supplied streamer images must be uploaded, not named
+// by URI, so the validation that guards those signed URLs matters as much as the
+// gameplay one.
+
+test('accepts every allowed image type', () => {
+    for (const mime of ALLOWED_IMAGE_MIME) {
+        const r = validateImageUploadRequest({ contentType: mime, sizeBytes: 2048 });
+        assert.strictEqual(r.ok, true, `${mime} should be accepted`);
+        assert.ok(r.ext, `${mime} should map to an extension`);
+    }
+});
+
+test('rejects a non-image content type', () => {
+    const r = validateImageUploadRequest({ contentType: 'video/mp4', sizeBytes: 100 });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.status, 400);
+    assert.match(r.error, /Unsupported image type/);
+});
+
+test('image kind is constrained and defaults to reference', () => {
+    assert.strictEqual(validateImageUploadRequest({ contentType: 'image/png' }).kind, 'reference');
+    assert.strictEqual(
+        validateImageUploadRequest({ contentType: 'image/png', kind: 'streamer' }).kind,
+        'streamer',
+    );
+    const bad = validateImageUploadRequest({ contentType: 'image/png', kind: 'gameplay' });
+    assert.strictEqual(bad.ok, false);
+    assert.match(bad.error, /kind must be one of/);
+});
+
+test('image size is optional but enforced when given', () => {
+    assert.strictEqual(validateImageUploadRequest({ contentType: 'image/png' }).ok, true);
+    assert.strictEqual(
+        validateImageUploadRequest({ contentType: 'image/png', sizeBytes: IMAGE_UPLOAD_MAX_BYTES }).ok,
+        true,
+    );
+    const over = validateImageUploadRequest({
+        contentType: 'image/png', sizeBytes: IMAGE_UPLOAD_MAX_BYTES + 1,
+    });
+    assert.strictEqual(over.ok, false);
+    assert.strictEqual(over.status, 413);
+
+    const zero = validateImageUploadRequest({ contentType: 'image/png', sizeBytes: 0 });
+    assert.strictEqual(zero.ok, false);
+    assert.match(zero.error, /positive number/);
+});
+
+test('extFromImageMime maps known types and falls back to png', () => {
+    assert.strictEqual(extFromImageMime('image/png'), 'png');
+    assert.strictEqual(extFromImageMime('image/jpeg'), 'jpg');
+    assert.strictEqual(extFromImageMime('image/webp'), 'webp');
+    assert.strictEqual(extFromImageMime('image/gif'), 'png');
+});
+
+test('the image ceiling is far below the gameplay one', () => {
+    // A reference photo has no business being hundreds of megabytes; keeping the
+    // ceilings separate stops one being loosened by accident with the other.
+    assert.ok(IMAGE_UPLOAD_MAX_BYTES < 250 * 1024 * 1024);
 });

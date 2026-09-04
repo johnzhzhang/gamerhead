@@ -299,6 +299,8 @@ Autopilot 让用户填一次表单、确认一次主播形象，然后一次拿�
 | `AUTOPILOT_VEO_CLIP_BUDGET` | 否 | 一批中最多多少片段可落到按量付费的 Veo，默认为总数的 25%（最低 4） |
 | `AUTOPILOT_UPLOAD_MAX_BYTES` | 否 | 素材上传上限，默认 250 MB |
 
+> 图片（参考图 / 自带主播图）另有固定上限 12 MB，只接受 PNG / JPEG / WebP。这两类图片都通过签名 URL 上传，接口不要求用户自己提供 `gs://` 路径。
+
 > IAP 模式不需要任何登录相关的环境变量——访问权限由 IAM 角色 `roles/iap.httpsResourceAccessor` 控制。但 `ADMIN_USERS` 仍然需要，因为它决定谁能进 Admin 仪表板。
 
 > 无需 Gemini API Key。所有 AI 调用均通过 Vertex AI + ADC（Application Default Credentials）自动鉴权。

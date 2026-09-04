@@ -25,6 +25,8 @@ export interface AutopilotConfig {
   maxClipsPerJob: number;
   uploadMaxBytes: number;
   allowedGameplayTypes: string[];
+  imageUploadMaxBytes?: number;
+  allowedImageTypes?: string[];
   veoSafetyNet: boolean;
 }
 
@@ -88,6 +90,8 @@ export interface AutopilotSubmitSpec {
   gameplayGcsUri?: string | null;
   avatarPrompt: string;
   avatarRefGcsUri?: string | null;
+  /** Supply a finished streamer image instead of generating one. */
+  avatarImageGcsUri?: string | null;
   volumes?: { gameplay: number; streamer: number };
 }
 
@@ -143,6 +147,29 @@ export const uploadGameplay = async (
   });
 
   if (onProgress) onProgress(1);
+  return gcsUri as string;
+};
+
+/**
+ * Upload an image before any job exists.
+ *
+ * `kind: 'reference'` pins the streamer's look for generation; `kind: 'streamer'`
+ * supplies a finished streamer and skips generation entirely. Both need a real
+ * upload path — a caller cannot be expected to produce a gs:// URI by hand.
+ */
+export const uploadImage = async (
+  file: File,
+  kind: 'reference' | 'streamer',
+): Promise<string> => {
+  const { uploadUrl, gcsUri, requiredHeaders } = await json(
+    await apiFetch('/api/autopilot/image-upload-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contentType: file.type || 'image/png', sizeBytes: file.size, kind }),
+    }),
+  );
+  const res = await fetch(uploadUrl, { method: 'PUT', headers: requiredHeaders || {}, body: file });
+  if (!res.ok) throw new Error(`Image upload failed (${res.status})`);
   return gcsUri as string;
 };
 

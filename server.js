@@ -18,7 +18,9 @@ import {
     extFromMime,
     veoBudgetFor,
     validateUploadRequest,
+    validateImageUploadRequest,
     parseOwnBucketUri,
+    IMAGE_UPLOAD_MAX_BYTES,
 } from './lib/autopilot.js';
 import {
     JOB_STATUS,
@@ -3064,26 +3066,57 @@ apiRouter.post('/autopilot/jobs', autopilotOnly, async (req, res) => {
         }
     }
 
+    // Uploaded images are verified the same way the gameplay object is: a URI that
+    // does not resolve must fail now, not halfway through the pipeline.
+    for (const [label, uri] of [
+        ['avatarRefGcsUri', check.spec.avatarRefGcsUri],
+        ['avatarImageGcsUri', check.spec.avatarImageGcsUri],
+    ]) {
+        if (!uri) continue;
+        const parsed = parseOwnBucketUri(uri, GCS_BUCKET_NAME);
+        if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+        try {
+            const [exists] = await getStorage().bucket(parsed.bucket).file(parsed.object).exists();
+            if (!exists) {
+                return res.status(400).json({ error: `${label} does not exist — finish the upload first` });
+            }
+        } catch (err) {
+            return res.status(400).json({ error: `Could not read ${label}: ${err.message}` });
+        }
+    }
+
     try {
         let job = createJob({ id: `ap-${randomUUID()}`, ownerEmail: owner, spec: check.spec });
         await saveJob(job);
 
-        // Render the first candidate now; on failure the job survives so the user
-        // can regenerate rather than losing the whole submission.
-        try {
-            const candidates = await renderAvatarCandidates(job, 1);
-            job = setAvatarCandidates(job, candidates);
-        } catch (err) {
-            console.error('[Autopilot] initial avatar failed:', err.message);
-            job = { ...job, status: JOB_STATUS.AWAITING_AVATAR, error: `Avatar generation failed: ${err.message}` };
+        if (check.spec.avatarImageGcsUri) {
+            // The user brought their own streamer, so nothing needs generating —
+            // but it still goes to the gate, because confirming is what authorises
+            // the expensive half of the run.
+            job = useUploadedAvatar(job, check.spec.avatarImageGcsUri);
+        } else {
+            // Render the first candidate now; on failure the job survives so the
+            // user can regenerate rather than losing the whole submission.
+            try {
+                const candidates = await renderAvatarCandidates(job, 1);
+                job = setAvatarCandidates(job, candidates);
+            } catch (err) {
+                console.error('[Autopilot] initial avatar failed:', err.message);
+                job = { ...job, status: JOB_STATUS.AWAITING_AVATAR, error: `Avatar generation failed: ${err.message}` };
+            }
         }
         await saveJob(job);
 
         const plannedClips = check.spec.variantCount * 4;
         console.log(`[Autopilot] created ${job.id} (${check.spec.variantCount} variants) for ${owner}`);
+        // Sign the candidate here rather than leaving it to the first poll: with a
+        // user-supplied streamer the response is instant, so the gate would
+        // otherwise sit blank for a polling interval.
+        const media = await signJobMedia(job);
         res.status(201).json({
             jobId: job.id,
             ...summarise(job),
+            ...media,
             // Surfaced so the confirmation gate can state the cost before the
             // user unlocks the expensive half of the pipeline.
             costPreview: {
@@ -3174,6 +3207,10 @@ apiRouter.post('/autopilot/jobs/:id/avatar/regenerate', autopilotOnly, async (re
         if (avatarRefGcsUri) {
             const parsed = parseOwnBucketUri(avatarRefGcsUri, GCS_BUCKET_NAME);
             if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+            const [exists] = await getStorage().bucket(parsed.bucket).file(parsed.object).exists();
+            if (!exists) {
+                return res.status(400).json({ error: 'That reference image has not been uploaded yet' });
+            }
         }
         const staged = {
             ...job,
@@ -3318,6 +3355,44 @@ apiRouter.post('/autopilot/jobs/:id/cancel', autopilotOnly, async (req, res) => 
     }
 });
 
+// POST /api/autopilot/image-upload-url
+// Body: { contentType: string, kind?: 'reference'|'streamer', sizeBytes?: number }
+// Returns: { uploadUrl, gcsUri, requiredHeaders, expiresAt }
+//
+// Deliberately not scoped to a job: the reference image is chosen while filling in
+// the brief, before any job exists. Asking the caller for a gs:// URI instead of
+// giving them somewhere to upload to would be unusable — and would mean acting on
+// a pointer this app never wrote.
+apiRouter.post('/autopilot/image-upload-url', autopilotOnly, async (req, res) => {
+    const check = validateImageUploadRequest(req.body || {});
+    if (!check.ok) return res.status(check.status).json({ error: check.error });
+
+    try {
+        const uploadId = randomUUID();
+        const objectName = `${AUTOPILOT_UPLOAD_PREFIX}/${uploadId}/${check.kind}.${check.ext}`;
+        const expiresAt = Date.now() + 30 * 60 * 1000;
+        const [uploadUrl] = await getStorage()
+            .bucket(GCS_BUCKET_NAME)
+            .file(objectName)
+            .getSignedUrl({
+                version: 'v4',
+                action: 'write',
+                expires: expiresAt,
+                contentType: check.contentType,
+            });
+        console.log(`[Autopilot] image upload URL (${check.kind}) → ${objectName}`);
+        res.json({
+            uploadUrl,
+            gcsUri: `gs://${GCS_BUCKET_NAME}/${objectName}`,
+            expiresAt,
+            requiredHeaders: { 'Content-Type': check.contentType },
+        });
+    } catch (err) {
+        console.error('[Autopilot] image-upload-url error:', err);
+        res.status(500).json({ error: 'Failed to create image upload URL: ' + err.message });
+    }
+});
+
 // GET /api/autopilot/config
 // Returns the caller-visible limits so the UI can validate before uploading.
 apiRouter.get('/autopilot/config', autopilotOnly, (req, res) => {
@@ -3326,6 +3401,8 @@ apiRouter.get('/autopilot/config', autopilotOnly, (req, res) => {
         maxClipsPerJob: AUTOPILOT_MAX_CLIPS_PER_JOB,
         uploadMaxBytes: AUTOPILOT_UPLOAD_MAX_BYTES,
         allowedGameplayTypes: ALLOWED_GAMEPLAY_MIME,
+        imageUploadMaxBytes: IMAGE_UPLOAD_MAX_BYTES,
+        allowedImageTypes: ['image/png', 'image/jpeg', 'image/webp'],
         veoSafetyNet: Boolean(VIDEO_MODEL_LAST_RESORT),
     });
 });

@@ -155,6 +155,8 @@ gcloud beta iap web add-iam-policy-binding \
 | `AUTOPILOT_MAX_CLIPS_PER_JOB` | no | Cost breaker: refuses a job that would need more clips than this. Defaults to `60`. |
 | `AUTOPILOT_VEO_CLIP_BUDGET` | no | How many clips of one batch may fall through to pay-as-you-go Veo. Defaults to 25% of the batch, minimum 4. |
 | `AUTOPILOT_UPLOAD_MAX_BYTES` | no | Gameplay upload ceiling. Defaults to 250 MB. |
+
+Image uploads have their own fixed ceiling of 12 MB (PNG / JPEG / WebP).
 | `PORT` | no | Defaults to `8080`. |
 | `NODE_ENV` | no | Anything other than `development` means production (static `dist/`). `development` mounts Vite middleware. |
 
@@ -361,9 +363,27 @@ preview:
 | **Not reproducible** | Image generation is non-deterministic; regenerating never returns the same person (the same reason the Studio keeps an avatar history). Settling it first is the only reliable order. |
 | **Amortised** | One confirmation unlocks the whole batch. |
 
-At the gate you can regenerate (with an edited description), upload your own
-streamer image, or cancel. Regenerating is cheap and unlimited — only images have
-been produced at that point.
+At the gate you can regenerate (with an edited description or a reference image),
+upload your own streamer image, or cancel. Regenerating is cheap and unlimited —
+only images have been produced at that point.
+
+### Where the streamer comes from
+
+Three routes, and **all images are uploaded** — the API never asks anyone to
+supply a `gs://` URI by hand:
+
+| Route | How | When it helps |
+|---|---|---|
+| **Describe it** | `avatarPrompt` | The default. Nothing to prepare |
+| **Describe it, with a reference image** | Upload via `POST /api/autopilot/image-upload-url` (`kind: reference`) | Pins a face or character so generation follows it instead of inventing someone. Since the streamer appears in every video of the batch and regeneration never returns the same person, this is the reliable way to hit a specific look |
+| **Supply a finished streamer** | Upload with `kind: streamer` | You already have a mascot or a person. Generation is skipped entirely |
+
+A supplied streamer image **still goes to the confirmation gate**: confirming is
+what authorises the expensive half of the run, so it is never skipped just because
+no generation happened.
+
+Image uploads are capped at 12 MB and limited to PNG / JPEG / WebP, separately
+from the 250 MB gameplay ceiling.
 
 The gate is enforced server-side, not just in the UI: the job sits in
 `awaiting_avatar` and **no automatic mechanism advances it**. The in-process
@@ -581,6 +601,8 @@ gs://<bucket>/avatars/<YYYY>/<MM>/avatar-<epoch>-<uuid8>.png     generated avata
 gs://<bucket>/avatars/<YYYY>/<MM>/avatar-ref-<epoch>-<uuid8>.*   uploaded reference images
 gs://<bucket>/exports/<YYYY>/<MM>/<label>-<epoch>-<uuid8>.<ext>  finished renders
 gs://<bucket>/autopilot/uploads/<uuid>/gameplay.<ext>            Autopilot source footage
+gs://<bucket>/autopilot/uploads/<uuid>/reference.<ext>           reference image for the streamer
+gs://<bucket>/autopilot/uploads/<uuid>/streamer.<ext>            user-supplied streamer image
 gs://<bucket>/autopilot/<jobId>/avatar-*.png                     streamer candidates
 ```
 
@@ -640,6 +662,7 @@ Everything under `/api` except the three public endpoints requires authenticatio
 |---|---|---|
 | `GET` | `/api/autopilot/config` | Limits for the UI to validate against before uploading |
 | `POST` | `/api/autopilot/upload-url` | v4 signed PUT URL for the gameplay file, bound to its content type |
+| `POST` | `/api/autopilot/image-upload-url` | v4 signed PUT URL for a reference or streamer image. Not scoped to a job, because the reference is chosen while the brief is being filled in |
 | `POST` | `/api/autopilot/jobs` | Validate the brief, create the job, render the first streamer candidate |
 | `GET` | `/api/autopilot/jobs` | Caller's jobs |
 | `GET` | `/api/autopilot/jobs/:id` | Progress, signed URLs for candidates and finished videos. Also advances the pipeline one step |

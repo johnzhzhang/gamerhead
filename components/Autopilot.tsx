@@ -26,6 +26,7 @@ import {
   isTerminalStatus,
   regenerateAvatar,
   uploadGameplay,
+  uploadImage,
   uploadOwnAvatar,
   useUploadedAvatar,
   type AutopilotConfig,
@@ -108,6 +109,47 @@ const Field: React.FC<{
   </div>
 );
 
+/**
+ * A file picker with a thumbnail. Images go through an upload, never a URI the
+ * user has to construct.
+ */
+const ImagePicker: React.FC<{
+  id: string;
+  label: string;
+  hint?: string;
+  file: File | null;
+  preview: string | null;
+  accept: string;
+  disabled?: boolean;
+  disabledNote?: string;
+  onPick: (f: File | null) => void;
+}> = ({ id, label, hint, file, preview, accept, disabled, disabledNote, onPick }) => (
+  <div className={disabled ? 'opacity-50' : ''}>
+    <label htmlFor={id} className="block text-xs text-gray-400 mb-1.5">{label}</label>
+    <div className="flex items-start gap-3">
+      {preview && (
+        <img src={preview} alt={`${label} preview`}
+             className="w-16 h-16 rounded-lg object-cover border border-gray-600 flex-shrink-0" />
+      )}
+      <div className="flex-1 min-w-0">
+        <input id={id} type="file" accept={accept} disabled={disabled}
+               onChange={(e) => onPick(e.target.files?.[0] || null)}
+               className="w-full text-xs text-gray-400 file:mr-2 file:py-1.5 file:px-3 file:rounded-full file:border-0 file:text-xs file:bg-gray-700 file:text-gray-200 hover:file:bg-gray-600 disabled:cursor-not-allowed" />
+        {file && (
+          <p className="text-[11px] text-gray-500 mt-1 truncate">
+            {file.name} — {(file.size / 1024).toFixed(0)} KB
+            <button type="button" onClick={() => onPick(null)} disabled={disabled}
+                    className="ml-2 text-gray-500 hover:text-gray-300">remove</button>
+          </p>
+        )}
+        {disabledNote
+          ? <p className="text-[11px] text-gray-500 mt-1">{disabledNote}</p>
+          : hint && <p className="text-[11px] text-gray-500 mt-1">{hint}</p>}
+      </div>
+    </div>
+  </div>
+);
+
 const Bar: React.FC<{ value: number; total: number }> = ({ value, total }) => {
   const pct = total > 0 ? Math.round((value / total) * 100) : 0;
   return (
@@ -142,6 +184,15 @@ const Autopilot: React.FC = () => {
   const [subtitles, setSubtitles] = useState(false);
   const [variantCount, setVariantCount] = useState(3);
   const [gameplayFile, setGameplayFile] = useState<File | null>(null);
+  // Two optional images, both uploaded rather than referenced by URI:
+  //   reference — pins the streamer's look while it is generated
+  //   streamer  — a finished streamer, which skips generation altogether
+  const [refFile, setRefFile] = useState<File | null>(null);
+  const [refPreview, setRefPreview] = useState<string | null>(null);
+  const [ownFile, setOwnFile] = useState<File | null>(null);
+  const [ownPreview, setOwnPreview] = useState<string | null>(null);
+  const [gateRefFile, setGateRefFile] = useState<File | null>(null);
+  const gateRefInput = useRef<HTMLInputElement>(null);
 
   // job
   const [job, setJob] = useState<AutopilotJobView | null>(null);
@@ -152,6 +203,21 @@ const Autopilot: React.FC = () => {
   const [regenPrompt, setRegenPrompt] = useState('');
   const commitRegen = useCallback((_n: string, v: string) => setRegenPrompt(v), []);
   const ownAvatarInput = useRef<HTMLInputElement>(null);
+
+  // Object URLs have to be revoked or the blob leaks for the page's lifetime.
+  useEffect(() => {
+    if (!refFile) { setRefPreview(null); return undefined; }
+    const url = URL.createObjectURL(refFile);
+    setRefPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [refFile]);
+
+  useEffect(() => {
+    if (!ownFile) { setOwnPreview(null); return undefined; }
+    const url = URL.createObjectURL(ownFile);
+    setOwnPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [ownFile]);
 
   useEffect(() => {
     fetchAutopilotConfig()
@@ -193,15 +259,19 @@ const Autopilot: React.FC = () => {
   }, [jobId]);
 
   const needsGameplay = layoutType !== 'streamer-only';
+  const imageAccept = (config?.allowedImageTypes || ['image/png', 'image/jpeg', 'image/webp']).join(',');
   const estimatedClips = variantCount * 4;
 
+  // A streamer has to come from somewhere: either a description to generate from,
+  // or a finished image the user supplies.
+  const hasStreamerSource = brief.avatarPrompt.trim().length > 0 || !!ownFile;
   const formValid = useMemo(() => (
     brief.gameTitle.trim().length > 0
-    && brief.avatarPrompt.trim().length > 0
+    && hasStreamerSource
     && (!needsGameplay || !!gameplayFile)
     && variantCount >= 1
     && (!config || variantCount <= config.maxBatch)
-  ), [brief.gameTitle, brief.avatarPrompt, needsGameplay, gameplayFile, variantCount, config]);
+  ), [brief.gameTitle, hasStreamerSource, needsGameplay, gameplayFile, variantCount, config]);
 
   const submit = useCallback(async () => {
     setError(null);
@@ -213,7 +283,18 @@ const Autopilot: React.FC = () => {
         setBusy('Uploading gameplay');
         gameplayGcsUri = await uploadGameplay(gameplayFile, setUploadPct);
       }
-      setBusy('Generating the streamer');
+
+      let avatarRefGcsUri: string | null = null;
+      let avatarImageGcsUri: string | null = null;
+      if (ownFile) {
+        setBusy('Uploading your streamer image');
+        avatarImageGcsUri = await uploadImage(ownFile, 'streamer');
+      } else if (refFile) {
+        setBusy('Uploading the reference image');
+        avatarRefGcsUri = await uploadImage(refFile, 'reference');
+      }
+
+      setBusy(ownFile ? 'Preparing' : 'Generating the streamer');
       const created = await createJob({
         gameTitle: brief.gameTitle.trim(),
         gameUrl: brief.gameUrl.trim(),
@@ -229,6 +310,8 @@ const Autopilot: React.FC = () => {
         variantCount,
         gameplayGcsUri,
         avatarPrompt: brief.avatarPrompt.trim(),
+        avatarRefGcsUri,
+        avatarImageGcsUri,
       });
       setJob(created);
       setJobId(created.jobId || created.id);
@@ -238,8 +321,8 @@ const Autopilot: React.FC = () => {
       setBusy(null);
     }
   }, [
-    needsGameplay, gameplayFile, brief, targetRatio, layoutType, pipPlacement,
-    stackedPlacement, subtitles, variantCount,
+    needsGameplay, gameplayFile, refFile, ownFile, brief, targetRatio, layoutType,
+    pipPlacement, stackedPlacement, subtitles, variantCount,
   ]);
 
   const act = useCallback(async (label: string, fn: () => Promise<AutopilotJobView>) => {
@@ -328,11 +411,40 @@ const Autopilot: React.FC = () => {
                      placeholder="Anything the script should mention or avoid" />
             </div>
             <div className="md:col-span-2">
-              <Field name="avatarPrompt" label="Streamer appearance and background" multiline required
-                     value={brief.avatarPrompt} onCommit={commitField} disabled={!!busy}
+              <Field name="avatarPrompt" label="Streamer appearance and background"
+                     multiline required={!ownFile}
+                     value={brief.avatarPrompt} onCommit={commitField} disabled={!!busy || !!ownFile}
                      placeholder="An energetic streamer with headphones in a neon-lit room"
-                     hint="This is what gets rendered next for your confirmation." />
+                     hint={ownFile
+                       ? 'Ignored while you are supplying your own streamer image.'
+                       : 'This is what gets rendered next for your confirmation.'} />
             </div>
+          </div>
+
+          {/* Two optional images. Both are uploaded — the API never asks the user
+              for a storage URI. */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-6">
+            <ImagePicker
+              id="ap-ref"
+              label="Reference image (optional)"
+              hint="Pins the streamer's look. Generation follows this face or character instead of inventing one."
+              file={refFile}
+              preview={refPreview}
+              accept={imageAccept}
+              disabled={!!busy || !!ownFile}
+              disabledNote={ownFile ? 'Not needed — you are supplying the streamer directly.' : undefined}
+              onPick={setRefFile}
+            />
+            <ImagePicker
+              id="ap-own"
+              label="Or use my own streamer image (optional)"
+              hint="Skips generation entirely. You will still confirm it before any video is produced."
+              file={ownFile}
+              preview={ownPreview}
+              accept={imageAccept}
+              disabled={!!busy}
+              onPick={(f) => { setOwnFile(f); if (f) setRefFile(null); }}
+            />
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-6">
@@ -455,18 +567,42 @@ const Autopilot: React.FC = () => {
               <Field name="regenPrompt" label="Adjust the description and try again" multiline rows={3}
                      value={regenPrompt} onCommit={commitRegen} disabled={!!busy}
                      placeholder="Leave blank to reuse the description you gave" />
+              <div className="mt-3">
+                <button type="button" disabled={!!busy}
+                        onClick={() => gateRefInput.current?.click()}
+                        className="text-xs text-google-blue hover:underline disabled:opacity-50">
+                  {gateRefFile ? `Reference: ${gateRefFile.name} (change)` : 'Attach a reference image'}
+                </button>
+                {gateRefFile && (
+                  <button type="button" disabled={!!busy} onClick={() => setGateRefFile(null)}
+                          className="text-xs text-gray-500 hover:text-gray-300 ml-3">
+                    remove
+                  </button>
+                )}
+                <input id="ap-gate-ref" ref={gateRefInput} type="file" accept={imageAccept}
+                       className="hidden" aria-hidden="true"
+                       onChange={(e) => { setGateRefFile(e.target.files?.[0] || null); e.target.value = ''; }} />
+                <p className="text-[11px] text-gray-500 mt-1">
+                  A reference image makes the next attempt follow that look instead of inventing a new person.
+                </p>
+              </div>
+
               <div className="flex flex-wrap gap-3 mt-4">
                 <NeonButton variant="secondary" disabled={!!busy}
-                            onClick={() => act('Regenerating', () => regenerateAvatar(jobId!, {
-                              avatarPrompt: regenPrompt.trim() || undefined,
-                            }))}>
+                            onClick={() => act('Regenerating', async () => {
+                              const refUri = gateRefFile ? await uploadImage(gateRefFile, 'reference') : undefined;
+                              return regenerateAvatar(jobId!, {
+                                avatarPrompt: regenPrompt.trim() || undefined,
+                                ...(refUri ? { avatarRefGcsUri: refUri } : {}),
+                              });
+                            })}>
                   Regenerate
                 </NeonButton>
                 <NeonButton variant="secondary" disabled={!!busy}
                             onClick={() => ownAvatarInput.current?.click()}>
                   Upload my own
                 </NeonButton>
-                <input ref={ownAvatarInput} type="file" accept="image/png,image/jpeg,image/webp"
+                <input id="ap-gate-own" ref={ownAvatarInput} type="file" accept={imageAccept}
                        className="hidden" aria-hidden="true"
                        onChange={(e) => {
                          const f = e.target.files?.[0];

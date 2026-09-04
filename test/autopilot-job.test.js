@@ -532,3 +532,64 @@ test('scripts are handed out before clips so every variant starts early', () => 
     const second = nextAction(job, { exclude: claimed });
     assert.strictEqual(second.type, ACTION.GENERATE_SCRIPT);
 });
+
+// ── image sources for the streamer ───────────────────────────────────────────
+
+test('a supplied streamer image removes the need for a description', () => {
+    const r = validateJobSpec(
+        goodSpec({ avatarPrompt: '', avatarImageGcsUri: `gs://${BUCKET}/autopilot/uploads/x/streamer.png` }),
+        LIMITS,
+    );
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.spec.avatarImageGcsUri, `gs://${BUCKET}/autopilot/uploads/x/streamer.png`);
+});
+
+test('with neither a description nor an image the spec is refused', () => {
+    const r = validateJobSpec(goodSpec({ avatarPrompt: '', avatarImageGcsUri: null }), LIMITS);
+    assert.strictEqual(r.ok, false);
+    assert.match(r.error, /avatarPrompt or avatarImageGcsUri/);
+});
+
+test('a reference image is accepted alongside a description', () => {
+    const uri = `gs://${BUCKET}/autopilot/uploads/y/reference.jpg`;
+    const r = validateJobSpec(goodSpec({ avatarRefGcsUri: uri }), LIMITS);
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.spec.avatarRefGcsUri, uri);
+});
+
+test('image URIs outside the application bucket are refused', () => {
+    for (const field of ['avatarRefGcsUri', 'avatarImageGcsUri']) {
+        const r = validateJobSpec(goodSpec({ [field]: 'gs://someone-else/pic.png' }), LIMITS);
+        assert.strictEqual(r.ok, false, `${field} in a foreign bucket must be refused`);
+        assert.match(r.error, /application bucket/);
+        // The message has to point at the upload route, not just complain.
+        assert.match(r.error, /image-upload-url/);
+    }
+});
+
+test('a bare filename or http URL is not accepted as an image', () => {
+    for (const bad of ['reference.png', 'https://example.com/a.png', '/tmp/a.png', 42]) {
+        const r = validateJobSpec(goodSpec({ avatarRefGcsUri: bad }), LIMITS);
+        assert.strictEqual(r.ok, false, `${String(bad)} must be refused`);
+    }
+});
+
+test('empty image fields are normalised to null rather than kept as blanks', () => {
+    const r = validateJobSpec(goodSpec({ avatarRefGcsUri: '', avatarImageGcsUri: '' }), LIMITS);
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.spec.avatarRefGcsUri, null);
+    assert.strictEqual(r.spec.avatarImageGcsUri, null);
+});
+
+test('a supplied streamer image still has to pass the gate', () => {
+    const v = validateJobSpec(
+        goodSpec({ avatarPrompt: '', avatarImageGcsUri: `gs://${BUCKET}/u/streamer.png` }), LIMITS,
+    );
+    let job = createJob({ id: 'job-img', ownerEmail: 'a@b.c', spec: v.spec });
+    // The server adopts it as the single candidate, exactly like a generated one.
+    job = useUploadedAvatar(job, v.spec.avatarImageGcsUri);
+    assert.strictEqual(job.status, JOB_STATUS.AWAITING_AVATAR);
+    assert.strictEqual(job.avatar.source, 'uploaded');
+    assert.strictEqual(nextAction(job).type, ACTION.WAIT_APPROVAL,
+        'bringing your own image does not skip confirmation');
+});

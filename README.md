@@ -14,6 +14,7 @@ Every AI call runs server-side through Vertex AI with Application Default Creden
 - [Authentication modes](#authentication-modes)
 - [Environment variables](#environment-variables)
 - [The deploy script](#the-deploy-script)
+- [Upgrading an existing deployment](#upgrading-an-existing-deployment)
 - [Video generation models](#video-generation-models)
 - [Autopilot: batch production](#autopilot-batch-production)
 - [User workflow](#user-workflow)
@@ -265,6 +266,67 @@ The language is asked once and then remembered in `.deploy-lang` (gitignored), s
 it does not reappear on later runs. `--lang=zh|en` or `GH_DEPLOY_LANG` override it
 and are the right choice for automation. Without either, a piped run still consumes
 one line for the language, which keeps older pipelines working.
+
+---
+
+## Upgrading an existing deployment
+
+Upgrading is **mode 2, and nothing else is required**. It rebuilds the image from
+your local source and leaves the rest of the service exactly as it was —
+environment variables, authentication mode, IAP, `min-instances` and IAM are all
+carried over, because mode 2 deliberately passes neither `--iap` nor `--no-iap`
+and never uses `--env-vars-file`.
+
+```bash
+git pull
+./deploy.sh --lang=en <<< $'2\ny\nYOUR_SERVICE\nYOUR_REGION\ny\n'
+# or just ./deploy.sh and pick 2
+```
+
+New features ship switched **off**. A deployment that upgrades and stops there
+behaves exactly as before: `/api/autopilot/*` returns 404 and no Autopilot tab
+appears, because the code checks `AUTOPILOT_ENABLED` at runtime rather than
+assuming the feature is wanted.
+
+### Turning Autopilot on afterwards
+
+```bash
+./deploy.sh        # → 3 (manage service configuration) → 3 (Autopilot) → 1 (enable)
+```
+
+That step is separate from the code upgrade on purpose, because enabling does
+things a code deploy must not do on its own:
+
+| It changes | Why it cannot be skipped |
+|---|---|
+| `AUTOPILOT_ENABLED` + the batch limits | Without them every Autopilot route stays 404 |
+| A **CORS rule on the bucket** | Gameplay is uploaded straight to Cloud Storage. With no CORS rule the upload fails in the browser with an opaque error and leaves no server-side trace. The app cannot add the rule itself: the runtime service account holds `roles/storage.objectAdmin`, which does not include `storage.buckets.update` |
+| `--min-instances=1 --no-cpu-throttling` | Cloud Run throttles CPU outside requests, so without a warm instance a batch only advances while a tab is open. This is the one setting that costs money while idle; option 2 reverses it |
+
+Nothing about an older deployment blocks this. Firestore in Datastore mode is
+schemaless, so the new `AutopilotJob` kind needs no migration and no index — a
+database created before Autopilot existed accepts the first job as-is.
+
+### The upgrade path, verified end to end
+
+Checked against a service deployed from the pre-Autopilot commit with the *old*
+`deploy.sh`, then upgraded and switched on:
+
+| Stage | Observed |
+|---|---|
+| Before upgrade | 5 env vars · no bucket CORS · `min-instances` unset · every `/api/autopilot/*` → 404 |
+| After mode 2 | still 5 env vars, no `AUTOPILOT_*` invented · CORS still absent · IAP still on · no `allUsers` · Autopilot routes still 404 · `/api/health` and `/api/me` fine · new bundle shipped but shows the "not enabled" fallback |
+| After enabling | original 5 vars kept, 4 added · CORS created with both Cloud Run host forms · `min-instances=1`, CPU always on · IAP untouched |
+| Then, on that upgraded service | 250 MB-capable signed upload returned 200 and the object landed · image upload 200 · a job was created and stopped at the confirmation gate · three consecutive `tick` calls refused to advance it · the batch list read back from the pre-existing database |
+| After disabling | back to 5 vars · `min-instances` unset · CPU throttled again · routes 404 · existing jobs and videos still in Datastore and the bucket |
+
+If the Autopilot tab does not appear after enabling, the running image predates
+the feature — run mode 2 first. Mode 3 only changes configuration.
+
+> ⚠️ Do not "upgrade" by re-running mode 1. It rewrites the authentication
+> configuration, and picking option 1 or 2 there passes
+> `--allow-unauthenticated`, which lets traffic reach the container without
+> passing IAP.
 
 ---
 

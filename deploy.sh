@@ -107,10 +107,29 @@ fi
 echo "$(_t "请选择操作:" "Select an operation:")"
 echo "  1) $(_t "全新部署" "Fresh deployment")"
 echo "  2) $(_t "更新已有服务 (仅更新代码，保留现有配置)" "Update existing service (code only, keep existing config)")"
-echo "  3) $(_t "管理授权用户 (添加/删除可登录的邮箱)" "Manage authorized users (add/remove login emails)")"
-echo "  4) $(_t "配置 Autopilot (批量成片)" "Configure Autopilot (batch production)")"
-read -p "$(_t "输入选项 [1/2/3/4, 默认: 1]: " "Enter option [1/2/3/4, default: 1]: ")" DEPLOY_MODE
+echo "  3) $(_t "管理服务配置 (用户 / 管理员 / Autopilot)" "Manage service configuration (users / admins / Autopilot)")"
+read -p "$(_t "输入选项 [1/2/3, 默认: 1]: " "Enter option [1/2/3, default: 1]: ")" DEPLOY_MODE
 DEPLOY_MODE=${DEPLOY_MODE:-1}
+
+# 4 曾是 Autopilot 的独立模式，现已并入模式 3。保留为别名，免得既有习惯和
+# 脚本失效。
+# 4 used to be a separate Autopilot mode; it now lives inside mode 3. Kept as an
+# alias so existing habits and scripts do not break.
+if [ "$DEPLOY_MODE" == "4" ]; then
+    DEPLOY_MODE="3"
+    AUTOPILOT_DIRECT="yes"
+fi
+
+# 未知输入不能一路落到「全新部署」—— 那条路径会改动认证配置，打错一个字
+# 不该有这种后果。
+# An unknown choice must not fall through to a fresh deployment: that path
+# rewrites the auth configuration, which is far too much for a typo.
+case "$DEPLOY_MODE" in
+    1|2|3) ;;
+    *)
+        echo "$(_t "❌ 无效选项: $DEPLOY_MODE (只接受 1 / 2 / 3)" "❌ Invalid option: $DEPLOY_MODE (expected 1, 2 or 3)")"
+        exit 1 ;;
+esac
 echo ""
 
 # 获取当前项目ID / Get current project ID
@@ -132,134 +151,18 @@ else
     fi
 fi
 
-# ══════════════════════════════════════════════════════════════
-# 更新模式 / Update mode
-# ══════════════════════════════════════════════════════════════
-if [ "$DEPLOY_MODE" == "2" ]; then
-    echo ""
-    echo "$(_t "🔍 正在查询项目 [$PROJECT_ID] 中的 Cloud Run 服务..." "🔍 Fetching Cloud Run services in project [$PROJECT_ID]...")"
-    SERVICES_RAW=$(gcloud run services list \
-        --project=$PROJECT_ID \
-        --platform=managed \
-        --format="csv[no-heading](metadata.name,metadata.labels['cloud.googleapis.com/location'])" \
-        2>/dev/null || echo "")
-
-    if [ -z "$SERVICES_RAW" ]; then
-        echo "$(_t "❌ 未找到任何 Cloud Run 服务，请先执行全新部署。" "❌ No Cloud Run services found. Please perform a fresh deployment first.")"
-        exit 1
-    fi
-
-    echo ""
-    echo "$(_t "已有服务列表:" "Existing services:")"
-    echo "$SERVICES_RAW" | while IFS=',' read -r svc_name svc_region; do
-        echo "   • $svc_name  ($svc_region)"
-    done
-
-    FIRST_SVC=$(echo "$SERVICES_RAW" | head -1 | cut -d',' -f1)
-    FIRST_REGION=$(echo "$SERVICES_RAW" | head -1 | cut -d',' -f2)
-    echo ""
-    read -p "$(_t "输入要更新的服务名称 [默认: ${FIRST_SVC}]: " "Enter the service name to update [default: ${FIRST_SVC}]: ")" SERVICE_NAME
-    SERVICE_NAME=${SERVICE_NAME:-$FIRST_SVC}
-    read -p "$(_t "输入服务所在区域 [默认: ${FIRST_REGION}]: " "Enter the service region [default: ${FIRST_REGION}]: ")" REGION
-    REGION=${REGION:-$FIRST_REGION}
-
-    # 验证服务是否存在 / Verify service exists
-    if ! gcloud run services describe "$SERVICE_NAME" \
-            --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
-        echo "$(_t "❌ 服务 [$SERVICE_NAME] 在区域 [$REGION] 不存在，请检查名称和区域。" "❌ Service [$SERVICE_NAME] not found in region [$REGION]. Please check the name and region.")"
-        exit 1
-    fi
-
-    # 读取并展示现有配置 / Show existing config
-    echo ""
-    echo "$(_t "📋 现有服务配置 (将完整保留):" "📋 Existing service config (will be fully preserved):")"
-    gcloud run services describe "$SERVICE_NAME" \
-        --region="$REGION" --project="$PROJECT_ID" \
-        --format="table[no-heading,box](
-            spec.template.spec.containers[0].env[].name,
-            spec.template.spec.containers[0].env[].value
-        )" 2>/dev/null | sed 's/^/   /' || true
-
-    echo ""
-    echo "$(_t "📋 更新确认:" "📋 Update confirmation:")"
-    echo "   $(_t "项目ID : $PROJECT_ID" "Project ID : $PROJECT_ID")"
-    echo "   $(_t "服务名 : $SERVICE_NAME" "Service    : $SERVICE_NAME")"
-    echo "   $(_t "区域   : $REGION" "Region     : $REGION")"
-    UPD_IAP=$(gcloud run services describe "$SERVICE_NAME" \
-        --region="$REGION" --project="$PROJECT_ID" \
-        --format="value(metadata.annotations['run.googleapis.com/iap-enabled'])" 2>/dev/null)
-    if [ "$UPD_IAP" == "true" ] || [ "$UPD_IAP" == "True" ]; then
-        echo "   $(_t "IAP    : 已启用 (更新代码不会改动它)" "IAP        : enabled (a code update leaves it untouched)")"
-    fi
-    echo "   $(_t "操作   : 仅更新代码，所有环境变量/配置保持不变" "Action     : Code update only, all env vars/config unchanged")"
-    echo ""
-    read -p "$(_t "确认开始更新? (y/n) [默认: y]: " "Confirm update? (y/n) [default: y]: ")" CONFIRM
-    CONFIRM=${CONFIRM:-y}
-    if [ "$CONFIRM" != "y" ]; then
-        echo "$(_t "❌ 已取消" "❌ Cancelled")"
-        exit 0
-    fi
-
-    echo ""
-    echo "$(_t "🏗️  开始更新 Cloud Run 服务..." "🏗️  Starting Cloud Run service update...")"
-    echo "$(_t "📦 正在将本地源码打包并通过 Cloud Build 构建 (大约需要 3-5 分钟)..." "📦 Packaging local source and building via Cloud Build (approx. 3-5 minutes)...")"
-
-    gcloud run deploy "$SERVICE_NAME" \
-        --source . \
-        --region="$REGION" \
-        --platform=managed \
-        --project="$PROJECT_ID"
-
-    echo ""
-    echo "$(_t "✅ 更新成功!" "✅ Update successful!")"
-    echo ""
-    PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
-    SERVICE_URL="https://${SERVICE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
-    echo "$(_t "🌐 服务访问地址: $SERVICE_URL" "🌐 Service URL: $SERVICE_URL")"
-    echo ""
-    echo "$(_t "🎉 代码已更新，原有配置（Bucket、验证方式等）均保持不变。" "🎉 Code updated. Existing config (Bucket, auth settings, etc.) remains unchanged.")"
-    exit 0
-fi
-
-# ══════════════════════════════════════════════════════════════
-# Autopilot 配置模式 / Configure Autopilot mode
-# ══════════════════════════════════════════════════════════════
+# ── Autopilot 配置 / Autopilot configuration ───────────────────
+# 作为「管理服务配置」的一个子项，而不是主菜单的独立模式：主菜单不该每加一个
+# 功能就多一行。调用前需已确定 PROJECT_ID / SERVICE_NAME / REGION。
+#
+# A sub-item of "manage configuration" rather than a top-level mode: the main menu
+# should not grow a row per feature. Expects PROJECT_ID / SERVICE_NAME / REGION.
+#
 # 只用 --update-env-vars / --remove-env-vars，绝不用 --env-vars-file：
 # 后者会先清空所有现有变量，历史上曾因此丢掉 ADMIN_USERS。
 # Only ever uses --update-env-vars / --remove-env-vars. --env-vars-file wipes
 # every existing variable first, which is how ADMIN_USERS was once silently lost.
-if [ "$DEPLOY_MODE" == "4" ]; then
-    echo ""
-    echo "$(_t "🔍 正在查询项目 [$PROJECT_ID] 中的 Cloud Run 服务..." "🔍 Fetching Cloud Run services in project [$PROJECT_ID]...")"
-    SERVICES_RAW=$(gcloud run services list \
-        --project=$PROJECT_ID --platform=managed \
-        --format="csv[no-heading](metadata.name,metadata.labels['cloud.googleapis.com/location'])" \
-        2>/dev/null || echo "")
-
-    if [ -z "$SERVICES_RAW" ]; then
-        echo "$(_t "❌ 未找到任何 Cloud Run 服务" "❌ No Cloud Run services found")"
-        exit 1
-    fi
-    echo ""
-    echo "$(_t "已有服务列表:" "Existing services:")"
-    echo "$SERVICES_RAW" | while IFS=',' read -r svc_name svc_region; do
-        echo "   • $svc_name  ($svc_region)"
-    done
-
-    FIRST_SVC=$(echo "$SERVICES_RAW" | head -1 | cut -d',' -f1)
-    FIRST_REGION=$(echo "$SERVICES_RAW" | head -1 | cut -d',' -f2)
-    echo ""
-    read -p "$(_t "输入服务名称 [默认: ${FIRST_SVC}]: " "Enter service name [default: ${FIRST_SVC}]: ")" SERVICE_NAME
-    SERVICE_NAME=${SERVICE_NAME:-$FIRST_SVC}
-    read -p "$(_t "输入服务区域 [默认: ${FIRST_REGION}]: " "Enter service region [default: ${FIRST_REGION}]: ")" REGION
-    REGION=${REGION:-$FIRST_REGION}
-
-    if ! gcloud run services describe "$SERVICE_NAME" \
-            --region="$REGION" --project="$PROJECT_ID" &>/dev/null </dev/null; then
-        echo "$(_t "❌ 服务 [$SERVICE_NAME] 在区域 [$REGION] 不存在。" "❌ Service [$SERVICE_NAME] not found in region [$REGION].")"
-        exit 1
-    fi
-
+configure_autopilot() {
     # 读取当前状态 / Read the current state
     AP_ENABLED_NOW=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
         --format="value(spec.template.spec.containers[0].env.filter(\"name:AUTOPILOT_ENABLED\").extract(\"value\"))" 2>/dev/null </dev/null | tr -d '[]"'"'"' ')
@@ -292,7 +195,7 @@ if [ "$DEPLOY_MODE" == "4" ]; then
     if [ "$AP_OP" == "3" ]; then
         echo ""
         echo "$(_t "✅ 完成 (未做修改)。" "✅ Done (nothing changed).")"
-        exit 0
+        return 0
     fi
 
     # ── 关闭 / Disable ────────────────────────────────────────
@@ -308,7 +211,7 @@ if [ "$DEPLOY_MODE" == "4" ]; then
         echo ""
         echo "$(_t "✅ Autopilot 已关闭，min-instances 回落为 0。" "✅ Autopilot disabled; min-instances back to 0.")"
         echo "$(_t "   已产出的作业与视频保留在 Datastore 和存储桶中。" "   Existing jobs and videos are left untouched in Datastore and the bucket.")"
-        exit 0
+        return 0
     fi
 
     # ── 启用 / Enable ─────────────────────────────────────────
@@ -316,7 +219,7 @@ if [ "$DEPLOY_MODE" == "4" ]; then
         echo ""
         echo "$(_t "❌ 该服务没有配置 GCS_BUCKET_NAME。" "❌ This service has no GCS_BUCKET_NAME configured.")"
         echo "$(_t "   Autopilot 需要存储桶来存放素材与成片。" "   Autopilot needs a bucket for footage and finished videos.")"
-        exit 1
+        return 1
     fi
 
     echo ""
@@ -346,7 +249,7 @@ if [ "$DEPLOY_MODE" == "4" ]; then
     AP_CONFIRM=${AP_CONFIRM:-y}
     if [ "$AP_CONFIRM" != "y" ] && [ "$AP_CONFIRM" != "Y" ]; then
         echo "$(_t "已取消。" "Cancelled.")"
-        exit 0
+        return 0
     fi
 
     # 1) 环境变量 / Environment variables
@@ -439,6 +342,96 @@ CORSEOF
     echo ""
     echo "$(_t "💡 成本提醒: 一批 ${AP_MAX_BATCH} 个成片约需 ${AP_MAX_BATCH}×4 次视频生成。" "💡 Cost note: a batch of ${AP_MAX_BATCH} videos is roughly ${AP_MAX_BATCH}×4 video generations.")"
     echo "$(_t "   界面会在确认主播那一步显示本次将生成多少片段，确认后才开始花费。" "   The console states the clip count at the streamer-confirmation step; nothing is spent until you confirm.")"
+    return 0
+}
+
+
+# ══════════════════════════════════════════════════════════════
+# 更新模式 / Update mode
+# ══════════════════════════════════════════════════════════════
+if [ "$DEPLOY_MODE" == "2" ]; then
+    echo ""
+    echo "$(_t "🔍 正在查询项目 [$PROJECT_ID] 中的 Cloud Run 服务..." "🔍 Fetching Cloud Run services in project [$PROJECT_ID]...")"
+    SERVICES_RAW=$(gcloud run services list \
+        --project=$PROJECT_ID \
+        --platform=managed \
+        --format="csv[no-heading](metadata.name,metadata.labels['cloud.googleapis.com/location'])" \
+        2>/dev/null || echo "")
+
+    if [ -z "$SERVICES_RAW" ]; then
+        echo "$(_t "❌ 未找到任何 Cloud Run 服务，请先执行全新部署。" "❌ No Cloud Run services found. Please perform a fresh deployment first.")"
+        exit 1
+    fi
+
+    echo ""
+    echo "$(_t "已有服务列表:" "Existing services:")"
+    echo "$SERVICES_RAW" | while IFS=',' read -r svc_name svc_region; do
+        echo "   • $svc_name  ($svc_region)"
+    done
+
+    FIRST_SVC=$(echo "$SERVICES_RAW" | head -1 | cut -d',' -f1)
+    FIRST_REGION=$(echo "$SERVICES_RAW" | head -1 | cut -d',' -f2)
+    echo ""
+    read -p "$(_t "输入要更新的服务名称 [默认: ${FIRST_SVC}]: " "Enter the service name to update [default: ${FIRST_SVC}]: ")" SERVICE_NAME
+    SERVICE_NAME=${SERVICE_NAME:-$FIRST_SVC}
+    read -p "$(_t "输入服务所在区域 [默认: ${FIRST_REGION}]: " "Enter the service region [default: ${FIRST_REGION}]: ")" REGION
+    REGION=${REGION:-$FIRST_REGION}
+
+    # 验证服务是否存在 / Verify service exists
+    if ! gcloud run services describe "$SERVICE_NAME" \
+            --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
+        echo "$(_t "❌ 服务 [$SERVICE_NAME] 在区域 [$REGION] 不存在，请检查名称和区域。" "❌ Service [$SERVICE_NAME] not found in region [$REGION]. Please check the name and region.")"
+        exit 1
+    fi
+
+    # 读取并展示现有配置 / Show existing config
+    echo ""
+    echo "$(_t "📋 现有服务配置 (将完整保留):" "📋 Existing service config (will be fully preserved):")"
+    gcloud run services describe "$SERVICE_NAME" \
+        --region="$REGION" --project="$PROJECT_ID" \
+        --format="table[no-heading,box](
+            spec.template.spec.containers[0].env[].name,
+            spec.template.spec.containers[0].env[].value
+        )" 2>/dev/null | sed 's/^/   /' || true
+
+    echo ""
+    echo "$(_t "📋 更新确认:" "📋 Update confirmation:")"
+    echo "   $(_t "项目ID : $PROJECT_ID" "Project ID : $PROJECT_ID")"
+    echo "   $(_t "服务名 : $SERVICE_NAME" "Service    : $SERVICE_NAME")"
+    echo "   $(_t "区域   : $REGION" "Region     : $REGION")"
+    UPD_IAP=$(gcloud run services describe "$SERVICE_NAME" \
+        --region="$REGION" --project="$PROJECT_ID" \
+        --format="value(metadata.annotations['run.googleapis.com/iap-enabled'])" 2>/dev/null)
+    if [ "$UPD_IAP" == "true" ] || [ "$UPD_IAP" == "True" ]; then
+        echo "   $(_t "IAP    : 已启用 (更新代码不会改动它)" "IAP        : enabled (a code update leaves it untouched)")"
+    fi
+    echo "   $(_t "操作   : 仅更新代码，所有环境变量/配置保持不变" "Action     : Code update only, all env vars/config unchanged")"
+    echo ""
+    read -p "$(_t "确认开始更新? (y/n) [默认: y]: " "Confirm update? (y/n) [default: y]: ")" CONFIRM
+    CONFIRM=${CONFIRM:-y}
+    if [ "$CONFIRM" != "y" ]; then
+        echo "$(_t "❌ 已取消" "❌ Cancelled")"
+        exit 0
+    fi
+
+    echo ""
+    echo "$(_t "🏗️  开始更新 Cloud Run 服务..." "🏗️  Starting Cloud Run service update...")"
+    echo "$(_t "📦 正在将本地源码打包并通过 Cloud Build 构建 (大约需要 3-5 分钟)..." "📦 Packaging local source and building via Cloud Build (approx. 3-5 minutes)...")"
+
+    gcloud run deploy "$SERVICE_NAME" \
+        --source . \
+        --region="$REGION" \
+        --platform=managed \
+        --project="$PROJECT_ID"
+
+    echo ""
+    echo "$(_t "✅ 更新成功!" "✅ Update successful!")"
+    echo ""
+    PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+    SERVICE_URL="https://${SERVICE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
+    echo "$(_t "🌐 服务访问地址: $SERVICE_URL" "🌐 Service URL: $SERVICE_URL")"
+    echo ""
+    echo "$(_t "🎉 代码已更新，原有配置（Bucket、验证方式等）均保持不变。" "🎉 Code updated. Existing config (Bucket, auth settings, etc.) remains unchanged.")"
     exit 0
 fi
 
@@ -650,9 +643,22 @@ if [ "$DEPLOY_MODE" == "3" ]; then
     echo "$(_t "请选择要管理的内容:" "What would you like to manage?")"
     echo "  1) $(_t "可登录用户" "Users allowed to sign in")"
     echo "  2) $(_t "管理员 (可访问 Admin 仪表板, ADMIN_USERS)" "Admins (Admin dashboard access, ADMIN_USERS)")"
-    echo "  3) $(_t "退出" "Exit")"
-    read -p "$(_t "输入选项 [1/2/3, 默认: 1]: " "Enter option [1/2/3, default: 1]: ")" MANAGE_WHAT
-    MANAGE_WHAT=${MANAGE_WHAT:-1}
+    echo "  3) $(_t "Autopilot 批量成片 (开启 / 关闭 / 查看)" "Autopilot batch production (enable / disable / view)")"
+    echo "  4) $(_t "退出" "Exit")"
+    # 从旧的「模式 4」进来时直接跳到 Autopilot，不再多问一次
+    # Coming in via the old "mode 4" goes straight to Autopilot without asking again
+    if [ "$AUTOPILOT_DIRECT" == "yes" ]; then
+        MANAGE_WHAT="3"
+        echo "$(_t "→ 已选择: Autopilot" "→ Selected: Autopilot")"
+    else
+        read -p "$(_t "输入选项 [1/2/3/4, 默认: 1]: " "Enter option [1/2/3/4, default: 1]: ")" MANAGE_WHAT
+        MANAGE_WHAT=${MANAGE_WHAT:-1}
+    fi
+
+    if [ "$MANAGE_WHAT" == "3" ]; then
+        configure_autopilot
+        exit $?
+    fi
 
     # ── 管理员名单 (所有登录方式通用) / Admin list (all auth modes) ──────────
     if [ "$MANAGE_WHAT" == "2" ]; then
@@ -673,7 +679,7 @@ if [ "$DEPLOY_MODE" == "3" ]; then
         exit 0
     fi
 
-    if [ "$MANAGE_WHAT" == "3" ]; then
+    if [ "$MANAGE_WHAT" == "4" ]; then
         exit 0
     fi
 

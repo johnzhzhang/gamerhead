@@ -210,7 +210,7 @@ The **Cloud Build Service Account** gets `roles/artifactregistry.writer`.
 
 Rebuilds and redeploys from local source. Touches nothing else: environment variables, IAM, and the IAP setting all carry over (the script deliberately passes neither `--iap` nor `--no-iap`). The confirmation screen shows the current IAP state so you can see what is being preserved.
 
-### Mode 3 — Manage users and admins
+### Mode 3 — Manage service configuration
 
 Detects the service's auth mode and adapts. Two things to manage:
 
@@ -218,10 +218,15 @@ Detects the service's auth mode and adapts. Two things to manage:
 |---|---|
 | **1) Users allowed to sign in** | IAP → IAM bindings · GIS → `AUTHORIZED_USERS` · Basic → prints the manual command · unprotected → warns you |
 | **2) Admins** | `ADMIN_USERS`, identical in every mode |
+| **3) Autopilot** | Enable / disable / view batch production — see below |
 
 Only ever uses `--update-env-vars` / `--remove-env-vars`, so unrelated variables are left alone.
 
-### Mode 4 — Configure Autopilot
+### Mode 3, option 3 — Configure Autopilot
+
+Autopilot lives inside mode 3 rather than as a top-level mode: the main menu should
+not grow a row for every feature. (`4` still works as an alias and jumps straight
+here, so older habits and scripts keep working.)
 
 Enables or disables batch production on an existing service. Enabling:
 
@@ -237,11 +242,15 @@ Enables or disables batch production on an existing service. Enabling:
 Disabling removes the variables and returns `min-instances` to 0. Existing jobs
 and videos are left in place.
 
-Mode 4 changes configuration only. If the tab does not appear afterwards, the
+This changes configuration only. If the tab does not appear afterwards, the
 running image predates the feature — run mode 2 first.
 
 Mode 1 also offers Autopilot as a single optional question, defaulting to **no**,
 so pressing Enter yields exactly the pre-Autopilot deployment.
+
+An unrecognised menu choice now exits with an error instead of falling through to a
+fresh deployment. That fall-through was a real hazard: mode 1 rewrites the auth
+configuration, which is far too much to trigger with a typo.
 
 ### Running it non-interactively
 
@@ -456,7 +465,7 @@ reverting to running.
 **Gameplay is uploaded straight to Cloud Storage.** Cloud Run caps an HTTP/1
 request body at 32 MiB and the limit cannot be raised, while the UI accepts up to
 250 MB, so the browser PUTs the file to a v4 signed URL and the app never sees the
-bytes. This requires a **CORS rule on the bucket** — `deploy.sh` mode 4 configures
+bytes. This requires a **CORS rule on the bucket** — `deploy.sh` mode 3 → Autopilot configures
 it and reads it back, because a missing rule fails uploads with an opaque browser
 error and no server-side trace.
 

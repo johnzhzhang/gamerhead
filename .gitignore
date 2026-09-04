@@ -36,3 +36,4 @@ subtitle-preview/
 *.njsproj
 *.sln
 *.sw?
+.deploy-lang

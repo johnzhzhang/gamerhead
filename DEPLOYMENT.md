@@ -75,6 +75,18 @@ chmod +x deploy.sh
 ./deploy.sh
 ```
 
+界面语言只在第一次运行时询问，之后记在 `.deploy-lang`（已加入 gitignore），不再打扰。
+需要切换或用于自动化时直接指定：
+
+```bash
+./deploy.sh --lang=en          # 或 --lang=zh
+GH_DEPLOY_LANG=en ./deploy.sh  # 等价的环境变量形式
+./deploy.sh --help             # 查看参数
+```
+
+> 非交互调用建议带上 `--lang`，这样喂进去的输入就只是各步的答案，不必再为语言
+> 预留一行。未指定且从管道读入时，脚本仍会消耗一行作为语言选择，以兼容既有流水线。
+
 脚本提供四种操作模式，按提示选择：
 
 ```

@@ -6,18 +6,82 @@
 
 set -e
 
-# ── Language Selection / 语言选择 ─────────────────────────────
-echo "Please select language / 请选择语言:"
-echo "  1) 中文"
-echo "  2) English"
-read -p "Enter / 输入 [1/2, default/默认: 1]: " LANG_SEL
-LANG_SEL=${LANG_SEL:-1}
-if [ "$LANG_SEL" == "2" ]; then
-    LANG_CHOICE="en"
-else
-    LANG_CHOICE="zh"
+# ── Language / 语言 ───────────────────────────────────────────
+# 语言不该每次都问。优先级：命令行参数 > 环境变量 > 上次记住的选择 > 询问。
+# 记住之后交互运行就不再打扰；自动化用 --lang 一次讲清，无需再喂一行输入。
+#
+# Language should not be asked every run. Precedence: flag > env > remembered
+# choice > ask. Once remembered, interactive runs stop asking; automation passes
+# --lang instead of feeding an extra input line.
+LANG_PREF_FILE="$(dirname "$0")/.deploy-lang"
+LANG_CHOICE=""
+
+# 1) 命令行参数 / Flag
+DEPLOY_ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --lang=*)   LANG_CHOICE="${1#*=}" ;;
+        --lang|-l)  shift; LANG_CHOICE="${1:-}" ;;
+        -h|--help)
+            echo "Usage: ./deploy.sh [--lang=zh|en]"
+            echo ""
+            echo "  --lang=zh|en   Interface language; skips the language prompt."
+            echo "                 Also settable with GH_DEPLOY_LANG=en."
+            echo "                 Remembered in .deploy-lang after the first run."
+            exit 0 ;;
+        *) DEPLOY_ARGS+=("$1") ;;
+    esac
+    shift
+done
+
+# 2) 环境变量 / Env
+if [ -z "$LANG_CHOICE" ] && [ -n "$GH_DEPLOY_LANG" ]; then
+    LANG_CHOICE="$GH_DEPLOY_LANG"
 fi
-echo ""
+
+# 3) 上次记住的 / Remembered
+LANG_FROM_FILE=""
+if [ -z "$LANG_CHOICE" ] && [ -f "$LANG_PREF_FILE" ]; then
+    LANG_CHOICE="$(tr -d '[:space:]' < "$LANG_PREF_FILE" 2>/dev/null)"
+    LANG_FROM_FILE="yes"
+fi
+
+# 只接受已知值，避免脏值静默改变界面语言
+# Only accept known values so a stray value cannot silently flip the interface
+case "$LANG_CHOICE" in
+    zh|en) ;;
+    *) LANG_CHOICE=""; LANG_FROM_FILE="" ;;
+esac
+
+# 4) 仍未确定：交互时问一次并记住；管道输入沿用旧约定（读一行），
+#    以免既有的 printf '1\n...' | ./deploy.sh 流水线错位。
+# 4) Still undecided: ask once interactively and remember it. When stdin is a
+#    pipe, keep the documented contract of consuming one line so existing
+#    printf '1\n...' | ./deploy.sh pipelines do not shift.
+if [ -z "$LANG_CHOICE" ]; then
+    echo "Please select language / 请选择语言:"
+    echo "  1) 中文"
+    echo "  2) English"
+    read -p "Enter / 输入 [1/2, default/默认: 1]: " LANG_SEL
+    LANG_SEL=${LANG_SEL:-1}
+    if [ "$LANG_SEL" == "2" ] || [ "$LANG_SEL" == "en" ]; then
+        LANG_CHOICE="en"
+    else
+        LANG_CHOICE="zh"
+    fi
+    # 记住它，下次不再问 / Remember it so the next run does not ask
+    printf '%s\n' "$LANG_CHOICE" > "$LANG_PREF_FILE" 2>/dev/null || true
+    echo ""
+elif [ -n "$LANG_FROM_FILE" ] && [ -t 0 ]; then
+    if [ "$LANG_CHOICE" == "en" ]; then
+        echo "Language: English  (change with ./deploy.sh --lang=zh)"
+    else
+        echo "语言: 中文  (切换: ./deploy.sh --lang=en)"
+    fi
+    echo ""
+fi
+
+set -- "${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}"
 
 # Translation helper: _t "Chinese text" "English text"
 _t() {

@@ -248,8 +248,14 @@ so pressing Enter yields exactly the pre-Autopilot deployment.
 Every non-interactive `gcloud`/`gsutil` call is invoked with `</dev/null`, because `gcloud` will otherwise consume the piped stdin and the following `read` hits EOF (which, under `set -e`, kills the script). So feeding answers from a file works:
 
 ```bash
-printf '1\n2\ny\ngamerheads\nus-central1\ny\n' | ./deploy.sh   # mode 2, non-interactive
+# --lang skips the language question entirely, so the input is just the answers
+./deploy.sh --lang=zh <<< $'2\ny\ngamerheads\nus-central1\ny\n'
 ```
+
+The language is asked once and then remembered in `.deploy-lang` (gitignored), so
+it does not reappear on later runs. `--lang=zh|en` or `GH_DEPLOY_LANG` override it
+and are the right choice for automation. Without either, a piped run still consumes
+one line for the language, which keeps older pipelines working.
 
 ---
 

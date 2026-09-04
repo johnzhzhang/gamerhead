@@ -44,7 +44,8 @@ echo "$(_t "请选择操作:" "Select an operation:")"
 echo "  1) $(_t "全新部署" "Fresh deployment")"
 echo "  2) $(_t "更新已有服务 (仅更新代码，保留现有配置)" "Update existing service (code only, keep existing config)")"
 echo "  3) $(_t "管理授权用户 (添加/删除可登录的邮箱)" "Manage authorized users (add/remove login emails)")"
-read -p "$(_t "输入选项 [1/2/3, 默认: 1]: " "Enter option [1/2/3, default: 1]: ")" DEPLOY_MODE
+echo "  4) $(_t "配置 Autopilot (批量成片)" "Configure Autopilot (batch production)")"
+read -p "$(_t "输入选项 [1/2/3/4, 默认: 1]: " "Enter option [1/2/3/4, default: 1]: ")" DEPLOY_MODE
 DEPLOY_MODE=${DEPLOY_MODE:-1}
 echo ""
 
@@ -153,6 +154,227 @@ if [ "$DEPLOY_MODE" == "2" ]; then
     echo "$(_t "🌐 服务访问地址: $SERVICE_URL" "🌐 Service URL: $SERVICE_URL")"
     echo ""
     echo "$(_t "🎉 代码已更新，原有配置（Bucket、验证方式等）均保持不变。" "🎉 Code updated. Existing config (Bucket, auth settings, etc.) remains unchanged.")"
+    exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════
+# Autopilot 配置模式 / Configure Autopilot mode
+# ══════════════════════════════════════════════════════════════
+# 只用 --update-env-vars / --remove-env-vars，绝不用 --env-vars-file：
+# 后者会先清空所有现有变量，历史上曾因此丢掉 ADMIN_USERS。
+# Only ever uses --update-env-vars / --remove-env-vars. --env-vars-file wipes
+# every existing variable first, which is how ADMIN_USERS was once silently lost.
+if [ "$DEPLOY_MODE" == "4" ]; then
+    echo ""
+    echo "$(_t "🔍 正在查询项目 [$PROJECT_ID] 中的 Cloud Run 服务..." "🔍 Fetching Cloud Run services in project [$PROJECT_ID]...")"
+    SERVICES_RAW=$(gcloud run services list \
+        --project=$PROJECT_ID --platform=managed \
+        --format="csv[no-heading](metadata.name,metadata.labels['cloud.googleapis.com/location'])" \
+        2>/dev/null || echo "")
+
+    if [ -z "$SERVICES_RAW" ]; then
+        echo "$(_t "❌ 未找到任何 Cloud Run 服务" "❌ No Cloud Run services found")"
+        exit 1
+    fi
+    echo ""
+    echo "$(_t "已有服务列表:" "Existing services:")"
+    echo "$SERVICES_RAW" | while IFS=',' read -r svc_name svc_region; do
+        echo "   • $svc_name  ($svc_region)"
+    done
+
+    FIRST_SVC=$(echo "$SERVICES_RAW" | head -1 | cut -d',' -f1)
+    FIRST_REGION=$(echo "$SERVICES_RAW" | head -1 | cut -d',' -f2)
+    echo ""
+    read -p "$(_t "输入服务名称 [默认: ${FIRST_SVC}]: " "Enter service name [default: ${FIRST_SVC}]: ")" SERVICE_NAME
+    SERVICE_NAME=${SERVICE_NAME:-$FIRST_SVC}
+    read -p "$(_t "输入服务区域 [默认: ${FIRST_REGION}]: " "Enter service region [default: ${FIRST_REGION}]: ")" REGION
+    REGION=${REGION:-$FIRST_REGION}
+
+    if ! gcloud run services describe "$SERVICE_NAME" \
+            --region="$REGION" --project="$PROJECT_ID" &>/dev/null </dev/null; then
+        echo "$(_t "❌ 服务 [$SERVICE_NAME] 在区域 [$REGION] 不存在。" "❌ Service [$SERVICE_NAME] not found in region [$REGION].")"
+        exit 1
+    fi
+
+    # 读取当前状态 / Read the current state
+    AP_ENABLED_NOW=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+        --format="value(spec.template.spec.containers[0].env.filter(\"name:AUTOPILOT_ENABLED\").extract(\"value\"))" 2>/dev/null </dev/null | tr -d '[]"'"'"' ')
+    AP_BUCKET=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+        --format="value(spec.template.spec.containers[0].env.filter(\"name:GCS_BUCKET_NAME\").extract(\"value\"))" 2>/dev/null </dev/null | tr -d '[]"'"'"' ')
+    AP_CPU_THROTTLE=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+        --format="value(spec.template.metadata.annotations['run.googleapis.com/cpu-throttling'])" 2>/dev/null </dev/null)
+    AP_MIN_SCALE=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+        --format="value(spec.template.metadata.annotations['autoscaling.knative.dev/minScale'])" 2>/dev/null </dev/null)
+
+    echo ""
+    echo "$(_t "📋 当前 Autopilot 配置:" "📋 Current Autopilot configuration:")"
+    if [ -n "$AP_ENABLED_NOW" ]; then
+        echo "   $(_t "状态" "State")        : $(_t "已启用" "enabled") (AUTOPILOT_ENABLED=$AP_ENABLED_NOW)"
+    else
+        echo "   $(_t "状态" "State")        : $(_t "未启用" "not enabled")"
+    fi
+    echo "   $(_t "存储桶" "Bucket")      : ${AP_BUCKET:-$(_t "未设置" "not set")}"
+    echo "   CPU              : $([ "$AP_CPU_THROTTLE" == "false" ] && echo "$(_t "常开 (请求外也运行)" "always allocated")" || echo "$(_t "仅请求期间 (默认)" "throttled outside requests (default)")")"
+    echo "   min-instances    : ${AP_MIN_SCALE:-0}"
+
+    echo ""
+    echo "$(_t "请选择操作:" "Select an operation:")"
+    echo "  1) $(_t "启用 Autopilot" "Enable Autopilot")"
+    echo "  2) $(_t "关闭 Autopilot" "Disable Autopilot")"
+    echo "  3) $(_t "仅查看配置 (已显示在上方)" "View configuration only (shown above)")"
+    read -p "$(_t "输入选项 [1/2/3, 默认: 1]: " "Enter option [1/2/3, default: 1]: ")" AP_OP
+    AP_OP=${AP_OP:-1}
+
+    if [ "$AP_OP" == "3" ]; then
+        echo ""
+        echo "$(_t "✅ 完成 (未做修改)。" "✅ Done (nothing changed).")"
+        exit 0
+    fi
+
+    # ── 关闭 / Disable ────────────────────────────────────────
+    if [ "$AP_OP" == "2" ]; then
+        echo ""
+        echo "$(_t "🔻 关闭 Autopilot..." "🔻 Disabling Autopilot...")"
+        gcloud run services update "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+            --remove-env-vars=AUTOPILOT_ENABLED,AUTOPILOT_MAX_BATCH,AUTOPILOT_CONCURRENCY,AUTOPILOT_COMPOSE_CONCURRENCY,AUTOPILOT_MAX_CLIPS_PER_JOB,AUTOPILOT_VEO_CLIP_BUDGET \
+            --quiet </dev/null 2>&1 | tail -2
+        # 回落到按需实例，空闲不再计费 / Scale back to zero so idle costs nothing
+        gcloud run services update "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+            --min-instances=0 --cpu-throttling --quiet </dev/null 2>&1 | tail -2
+        echo ""
+        echo "$(_t "✅ Autopilot 已关闭，min-instances 回落为 0。" "✅ Autopilot disabled; min-instances back to 0.")"
+        echo "$(_t "   已产出的作业与视频保留在 Datastore 和存储桶中。" "   Existing jobs and videos are left untouched in Datastore and the bucket.")"
+        exit 0
+    fi
+
+    # ── 启用 / Enable ─────────────────────────────────────────
+    if [ -z "$AP_BUCKET" ]; then
+        echo ""
+        echo "$(_t "❌ 该服务没有配置 GCS_BUCKET_NAME。" "❌ This service has no GCS_BUCKET_NAME configured.")"
+        echo "$(_t "   Autopilot 需要存储桶来存放素材与成片。" "   Autopilot needs a bucket for footage and finished videos.")"
+        exit 1
+    fi
+
+    echo ""
+    read -p "$(_t "单次批量最多几个成片 [默认: 10]: " "Maximum videos per batch [default: 10]: ")" AP_MAX_BATCH
+    AP_MAX_BATCH=${AP_MAX_BATCH:-10}
+    read -p "$(_t "并发片段生成数 (受模型配额约束) [默认: 4]: " "Concurrent clip generations (bounded by model quota) [default: 4]: ")" AP_CONC
+    AP_CONC=${AP_CONC:-4}
+    read -p "$(_t "单个作业片段总数上限 (成本熔断) [默认: 60]: " "Clip ceiling per job (cost breaker) [default: 60]: ")" AP_MAX_CLIPS
+    AP_MAX_CLIPS=${AP_MAX_CLIPS:-60}
+
+    echo ""
+    echo "$(_t "🖥️  后台推进方式" "🖥️  How batches keep running")"
+    echo "$(_t "   Cloud Run 默认在请求之外会限制 CPU，作业只能在页面打开时推进。" "   Cloud Run throttles CPU outside requests by default, so a batch only advances while a tab is open.")"
+    echo "$(_t "   常驻一个实例可以让用户关掉页面后继续跑，代价是空闲也计费。" "   Keeping one instance warm lets it continue after the tab closes, at the cost of paying while idle.")"
+    read -p "$(_t "启用常驻实例 (min-instances=1, CPU 常开)? (y/n) [默认: y]: " "Keep one instance warm (min-instances=1, CPU always on)? (y/n) [default: y]: ")" AP_WARM
+    AP_WARM=${AP_WARM:-y}
+
+    echo ""
+    echo "$(_t "📋 即将应用:" "📋 About to apply:")"
+    echo "   $(_t "服务" "Service")           : $SERVICE_NAME ($REGION)"
+    echo "   AUTOPILOT_MAX_BATCH           : $AP_MAX_BATCH"
+    echo "   AUTOPILOT_CONCURRENCY         : $AP_CONC"
+    echo "   AUTOPILOT_MAX_CLIPS_PER_JOB   : $AP_MAX_CLIPS"
+    echo "   $(_t "常驻实例" "Warm instance")       : $AP_WARM"
+    echo "   $(_t "存储桶 CORS" "Bucket CORS")     : gs://$AP_BUCKET"
+    read -p "$(_t "确认? (y/n) [默认: y]: " "Confirm? (y/n) [default: y]: ")" AP_CONFIRM
+    AP_CONFIRM=${AP_CONFIRM:-y}
+    if [ "$AP_CONFIRM" != "y" ] && [ "$AP_CONFIRM" != "Y" ]; then
+        echo "$(_t "已取消。" "Cancelled.")"
+        exit 0
+    fi
+
+    # 1) 环境变量 / Environment variables
+    echo ""
+    echo "$(_t "⚙️  写入环境变量..." "⚙️  Writing environment variables...")"
+    gcloud run services update "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+        --update-env-vars="AUTOPILOT_ENABLED=1,AUTOPILOT_MAX_BATCH=${AP_MAX_BATCH},AUTOPILOT_CONCURRENCY=${AP_CONC},AUTOPILOT_MAX_CLIPS_PER_JOB=${AP_MAX_CLIPS}" \
+        --quiet </dev/null 2>&1 | tail -2
+
+    # 2) 常驻实例 / Warm instance
+    if [ "$AP_WARM" == "y" ] || [ "$AP_WARM" == "Y" ]; then
+        echo "$(_t "⚙️  配置常驻实例 (min-instances=1, CPU 常开)..." "⚙️  Configuring a warm instance (min-instances=1, CPU always on)...")"
+        gcloud run services update "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+            --min-instances=1 --no-cpu-throttling --quiet </dev/null 2>&1 | tail -2
+    fi
+
+    # 3) 存储桶 CORS —— 浏览器直传的必要条件
+    #    Bucket CORS: required for the browser to PUT gameplay straight to GCS,
+    #    which is unavoidable because Cloud Run caps a request body at 32 MiB.
+    echo "$(_t "⚙️  配置存储桶 CORS (浏览器直传素材所必需)..." "⚙️  Configuring bucket CORS (required for direct uploads)...")"
+    SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+        --format="value(status.url)" 2>/dev/null </dev/null)
+    # Cloud Run answers on two host forms and a user may arrive on either, so both
+    # have to be allowed — a missing origin makes the upload fail with an opaque
+    # CORS error and no server-side trace.
+    AP_PNUM=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null </dev/null)
+    SERVICE_URL_ALT="https://${SERVICE_NAME}-${AP_PNUM}.${REGION}.run.app"
+    CORS_FILE=$(mktemp)
+    cat > "$CORS_FILE" <<CORSEOF
+[
+  {
+    "origin": ["${SERVICE_URL}", "${SERVICE_URL_ALT}"],
+    "method": ["PUT", "GET", "HEAD", "OPTIONS"],
+    "responseHeader": ["Content-Type", "Content-Length", "x-goog-resumable"],
+    "maxAgeSeconds": 3600
+  }
+]
+CORSEOF
+    if gcloud storage buckets update "gs://${AP_BUCKET}" --cors-file="$CORS_FILE" --quiet </dev/null >/dev/null 2>&1; then
+        # 回读校验：配错了上传会静默失败，必须确认真的写进去了
+        # Read back: a wrong CORS rule fails uploads silently, so verify it landed.
+        CORS_CHECK=$(gcloud storage buckets describe "gs://${AP_BUCKET}" --format=json 2>/dev/null </dev/null \
+            | grep -c "$SERVICE_URL" || echo 0)
+        if [ "$CORS_CHECK" -gt 0 ]; then
+            echo "   ✅ $(_t "CORS 已配置并回读确认" "CORS applied and verified") ($SERVICE_URL)"
+        else
+            echo "   ⚠️  $(_t "CORS 已提交但回读未匹配，请手动确认" "CORS submitted but the read-back did not match; please verify manually")"
+        fi
+    else
+        echo "   ❌ $(_t "CORS 配置失败。素材直传会失败，请手动配置:" "CORS configuration failed. Direct uploads will fail; configure it manually:")"
+        echo "      gcloud storage buckets update gs://${AP_BUCKET} --cors-file=cors.json"
+    fi
+    rm -f "$CORS_FILE"
+
+    # 4) 可选：Cloud Scheduler 续跑 / Optional resume cron
+    echo ""
+    echo "$(_t "⏰ 可选：定时唤醒停滞作业" "⏰ Optional: a cron that picks up stalled batches")"
+    echo "$(_t "   即使实例被回收，也能让未完成的批次继续。等待确认头像的作业不会被唤醒。" "   Lets an unfinished batch continue even if the instance was recycled. Jobs waiting for avatar confirmation are never woken.")"
+    read -p "$(_t "创建 Cloud Scheduler 任务? (y/n) [默认: n]: " "Create a Cloud Scheduler job? (y/n) [default: n]: ")" AP_CRON
+    AP_CRON=${AP_CRON:-n}
+    if [ "$AP_CRON" == "y" ] || [ "$AP_CRON" == "Y" ]; then
+        gcloud services enable cloudscheduler.googleapis.com --project="$PROJECT_ID" --quiet </dev/null 2>&1 | tail -1
+        PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null </dev/null)
+        SCHED_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+        SCHED_NAME="${SERVICE_NAME}-autopilot-resume"
+        gcloud scheduler jobs delete "$SCHED_NAME" --location="$REGION" --project="$PROJECT_ID" --quiet </dev/null >/dev/null 2>&1
+        if gcloud scheduler jobs create http "$SCHED_NAME" \
+                --location="$REGION" --project="$PROJECT_ID" \
+                --schedule="*/5 * * * *" \
+                --uri="${SERVICE_URL}/api/autopilot/resume" \
+                --http-method=POST \
+                --oidc-service-account-email="$SCHED_SA" \
+                --oidc-token-audience="$SERVICE_URL" \
+                --quiet </dev/null 2>&1 | tail -2; then
+            echo "   ✅ $(_t "已创建定时任务" "Scheduler job created"): $SCHED_NAME ($(_t "每 5 分钟" "every 5 minutes"))"
+        else
+            echo "   ⚠️  $(_t "定时任务创建失败，可稍后手动创建。批次在页面打开时仍会推进。" "Scheduler job creation failed; you can add it later. Batches still advance while a tab is open.")"
+        fi
+    fi
+
+    echo ""
+    echo "$(_t "✅ Autopilot 已启用!" "✅ Autopilot enabled!")"
+    echo ""
+    echo "$(_t "⚠️  本模式只改配置，不部署代码。" "⚠️  This mode only changes configuration; it does not deploy code.")"
+    echo "$(_t "   若打开服务后看不到 Autopilot 标签，说明当前运行的镜像还没有这个功能，" "   If the Autopilot tab does not appear, the running image predates the feature;")"
+    echo "$(_t "   请先执行 ./deploy.sh → 模式 2 更新代码。" "   run ./deploy.sh → mode 2 to update the code first.")"
+    echo ""
+    echo "$(_t "🌐 打开服务后会多出一个 Autopilot 标签:" "🌐 Open the service and you will see an extra Autopilot tab:")"
+    echo "   $SERVICE_URL"
+    echo ""
+    echo "$(_t "💡 成本提醒: 一批 ${AP_MAX_BATCH} 个成片约需 ${AP_MAX_BATCH}×4 次视频生成。" "💡 Cost note: a batch of ${AP_MAX_BATCH} videos is roughly ${AP_MAX_BATCH}×4 video generations.")"
+    echo "$(_t "   界面会在确认主播那一步显示本次将生成多少片段，确认后才开始花费。" "   The console states the clip count at the streamer-confirmation step; nothing is spent until you confirm.")"
     exit 0
 fi
 
@@ -742,6 +964,26 @@ echo ""
 read -p "👉 $(_t "管理员名单: " "Admin list: ")" ADMIN_USERS_INPUT
 ADMIN_USERS_ENV="$ADMIN_USERS_INPUT"
 
+# ── Autopilot (可选) / Autopilot (optional) ────────────────────
+# 默认关闭：直接回车得到的部署与加入该功能之前完全一致。
+# Defaults to off, so pressing Enter yields exactly the pre-Autopilot deployment.
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "$(_t "🤖 Autopilot (批量成片，可选)" "🤖 Autopilot (batch production, optional)")"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "   $(_t "填一次表单，确认主播形象，然后一次拿到多个成片。" "Fill one form, confirm the streamer, then collect several finished videos.")"
+echo "   $(_t "启用会额外配置存储桶 CORS 与常驻实例 (空闲也计费)。" "Enabling also configures bucket CORS and a warm instance (billed while idle).")"
+echo "   $(_t "现在跳过也可以，之后用 ./deploy.sh → 模式 4 随时开启。" "You can skip this and enable it later with ./deploy.sh → mode 4.")"
+echo ""
+read -p "👉 $(_t "启用 Autopilot? (y/n) [默认: n]: " "Enable Autopilot? (y/n) [default: n]: ")" AUTOPILOT_INPUT
+AUTOPILOT_INPUT=${AUTOPILOT_INPUT:-n}
+if [ "$AUTOPILOT_INPUT" == "y" ] || [ "$AUTOPILOT_INPUT" == "Y" ]; then
+    AUTOPILOT_ENV="1"
+else
+    AUTOPILOT_ENV=""
+fi
+
 echo ""
 echo "$(_t "📋 部署确认:" "📋 Deployment confirmation:")"
 echo "   $(_t "项目ID: $PROJECT_ID" "Project ID: $PROJECT_ID")"
@@ -767,6 +1009,9 @@ elif [ "$AUTH_MODE" == "3" ]; then
     else
         echo "   $(_t "授权用户: 暂无 (部署后需用模式 3 添加)" "Authorized users: none yet (add them with mode 3 after deploying)")"
     fi
+fi
+if [ -n "$AUTOPILOT_ENV" ]; then
+    echo "   $(_t "Autopilot: 启用" "Autopilot : enabled")"
 fi
 if [ -n "$ADMIN_USERS_ENV" ]; then
     echo "   $(_t "管理员: $ADMIN_USERS_ENV" "Admins    : $ADMIN_USERS_ENV")"
@@ -847,6 +1092,9 @@ elif [ "$AUTH_MODE" == "2" ]; then
     # Single quotes prevent YAML parser from escaping special characters
     echo "BASIC_AUTH_USERS: '${BASIC_AUTH_ENV}'" >> "$ENV_FILE"
 fi
+if [ -n "$AUTOPILOT_ENV" ]; then
+    echo "AUTOPILOT_ENABLED: \"1\"" >> "$ENV_FILE"
+fi
 if [ -n "$ADMIN_USERS_ENV" ]; then
     echo "ADMIN_USERS: '${ADMIN_USERS_ENV}'" >> "$ENV_FILE"
 fi
@@ -876,6 +1124,52 @@ gcloud run deploy $SERVICE_NAME \
   --project=$PROJECT_ID
 
 rm -f "$ENV_FILE"
+
+# Autopilot 启用时的追加配置 / Extra setup when Autopilot was enabled
+# 直传素材需要存储桶 CORS；后台推进需要常驻实例。
+# Direct uploads need bucket CORS; unattended progress needs a warm instance.
+if [ -n "$AUTOPILOT_ENV" ]; then
+    echo ""
+    echo "🤖 $(_t "配置 Autopilot..." "Configuring Autopilot...")"
+    AP_URL=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+        --format="value(status.url)" 2>/dev/null </dev/null)
+
+    # Both Cloud Run host forms must be allowed; see the note in mode 4.
+    AP_URL_ALT="https://${SERVICE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
+    if [ -n "$GCS_BUCKET_NAME_ENV" ] && [ -n "$AP_URL" ]; then
+        AP_CORS=$(mktemp)
+        cat > "$AP_CORS" <<APCORSEOF
+[
+  {
+    "origin": ["${AP_URL}", "${AP_URL_ALT}"],
+    "method": ["PUT", "GET", "HEAD", "OPTIONS"],
+    "responseHeader": ["Content-Type", "Content-Length", "x-goog-resumable"],
+    "maxAgeSeconds": 3600
+  }
+]
+APCORSEOF
+        if gcloud storage buckets update "gs://${GCS_BUCKET_NAME_ENV}" --cors-file="$AP_CORS" --quiet </dev/null >/dev/null 2>&1; then
+            AP_CORS_OK=$(gcloud storage buckets describe "gs://${GCS_BUCKET_NAME_ENV}" --format=json 2>/dev/null </dev/null | grep -c "$AP_URL" || echo 0)
+            if [ "$AP_CORS_OK" -gt 0 ]; then
+                echo "   ✅ $(_t "存储桶 CORS 已配置并回读确认" "Bucket CORS applied and verified")"
+            else
+                echo "   ⚠️  $(_t "CORS 已提交但回读未匹配，请手动确认" "CORS submitted but the read-back did not match; verify manually")"
+            fi
+        else
+            echo "   ❌ $(_t "CORS 配置失败，素材直传会失败。手动执行:" "CORS failed; direct uploads will fail. Run manually:")"
+            echo "      gcloud storage buckets update gs://${GCS_BUCKET_NAME_ENV} --cors-file=cors.json"
+        fi
+        rm -f "$AP_CORS"
+    fi
+
+    if gcloud run services update "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+            --min-instances=1 --no-cpu-throttling --quiet </dev/null >/dev/null 2>&1; then
+        echo "   ✅ $(_t "常驻实例已启用 (关掉页面后批次继续跑)" "Warm instance enabled (batches continue after the tab closes)")"
+        echo "      $(_t "如需省钱可用 ./deploy.sh → 模式 4 → 关闭" "To stop paying while idle use ./deploy.sh → mode 4 → disable")"
+    else
+        echo "   ⚠️  $(_t "常驻实例配置失败；批次只在页面打开时推进。" "Warm instance failed; batches will only advance while a tab is open.")"
+    fi
+fi
 
 # IAP 模式：把授权邮箱绑定到 IAP 资源上 / IAP mode: grant access to the listed members
 if [ "$AUTH_MODE" == "3" ] && [ -n "$IAP_MEMBERS_INPUT" ]; then

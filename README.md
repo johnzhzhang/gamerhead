@@ -15,6 +15,7 @@ Every AI call runs server-side through Vertex AI with Application Default Creden
 - [Environment variables](#environment-variables)
 - [The deploy script](#the-deploy-script)
 - [Video generation models](#video-generation-models)
+- [Autopilot: batch production](#autopilot-batch-production)
 - [User workflow](#user-workflow)
 - [Project history](#project-history)
 - [Exports and previews](#exports-and-previews)
@@ -42,6 +43,7 @@ Every AI call runs server-side through Vertex AI with Application Default Creden
 | **Durable output** | Clips land in `gs://<bucket>/videos/`, finished renders in `gs://<bucket>/exports/YYYY/MM/`. |
 | **Project history** | The whole working set — including the avatar image and every generated clip — is autosaved server-side per user, so a reload or a lost session does not mean re-typing and re-generating. |
 | **Admin dashboard** | Usage scorecards, per-model trend chart, activity log with CSV export and authenticated file download. Restricted to `ADMIN_USERS`. |
+| **Autopilot** | Optional. One form, one confirmation of the streamer image, then up to 10 finished videos produced unattended and delivered as download links. Off by default. |
 | **Three auth modes** | Cloud Run native IAP, Google Sign-In via GIS, or fixed username/password. |
 
 ---
@@ -146,6 +148,13 @@ gcloud beta iap web add-iam-policy-binding \
 | `VIDEO_MODEL_LAST_RESORT` | no | Model used when every Omni candidate is unavailable or the output is safety-blocked. Defaults to `veo-3.1-fast-generate-001`; set to empty to disable the net. |
 | `VIDEO_BLOCK_RETRIES` | no | How many times to retry Omni on a `content_blocked` result before falling through to Veo. Defaults to `1`. |
 | `VIDEO_RESOLUTION` | no | Gemini Omni output resolution: `360p` / `720p` / `1080p` / `4k`. Defaults to `720p`. |
+| `AUTOPILOT_ENABLED` | no | Set to `1` to expose Autopilot. Unset means every `/api/autopilot/*` route returns 404 and the tab is hidden. |
+| `AUTOPILOT_MAX_BATCH` | no | Videos per batch. Defaults to `10`. |
+| `AUTOPILOT_CONCURRENCY` | no | Clips generated in parallel. Defaults to `4`; bounded by the Omni per-minute quota. |
+| `AUTOPILOT_COMPOSE_CONCURRENCY` | no | Parallel ffmpeg composites. Defaults to `2`; bounded by container CPU. |
+| `AUTOPILOT_MAX_CLIPS_PER_JOB` | no | Cost breaker: refuses a job that would need more clips than this. Defaults to `60`. |
+| `AUTOPILOT_VEO_CLIP_BUDGET` | no | How many clips of one batch may fall through to pay-as-you-go Veo. Defaults to 25% of the batch, minimum 4. |
+| `AUTOPILOT_UPLOAD_MAX_BYTES` | no | Gameplay upload ceiling. Defaults to 250 MB. |
 | `PORT` | no | Defaults to `8080`. |
 | `NODE_ENV` | no | Anything other than `development` means production (static `dist/`). `development` mounts Vite middleware. |
 
@@ -209,6 +218,28 @@ Detects the service's auth mode and adapts. Two things to manage:
 | **2) Admins** | `ADMIN_USERS`, identical in every mode |
 
 Only ever uses `--update-env-vars` / `--remove-env-vars`, so unrelated variables are left alone.
+
+### Mode 4 — Configure Autopilot
+
+Enables or disables batch production on an existing service. Enabling:
+
+- writes `AUTOPILOT_ENABLED` and the batch limits
+- sets `--min-instances=1 --no-cpu-throttling` so a batch continues after the
+  user closes the tab (this is what makes an idle service cost money; option 2
+  reverses it)
+- configures the bucket **CORS** rule needed for direct uploads, covering both
+  Cloud Run host forms, and reads it back to confirm
+- optionally creates a Cloud Scheduler job that calls `/api/autopilot/resume`
+  every five minutes to pick up batches stalled by a recycled instance
+
+Disabling removes the variables and returns `min-instances` to 0. Existing jobs
+and videos are left in place.
+
+Mode 4 changes configuration only. If the tab does not appear afterwards, the
+running image predates the feature — run mode 2 first.
+
+Mode 1 also offers Autopilot as a single optional question, defaulting to **no**,
+so pressing Enter yields exactly the pre-Autopilot deployment.
 
 ### Running it non-interactively
 
@@ -304,6 +335,93 @@ The server turns that into an actionable message and points at the Veo fallback
 rather than surfacing a raw quota error.
 
 ---
+
+## Autopilot: batch production
+
+Optional and off by default. The three-step wizard is unchanged; Autopilot is a
+separate tab that only appears when the server has `AUTOPILOT_ENABLED` set.
+
+Where the wizard asks for a decision at every step, Autopilot asks once:
+
+```
+fill one form → ⏸ confirm the streamer image → N finished videos, as download links
+```
+
+Script, shot list, clips, concatenation, subtitles and compositing all run
+server-side without further input.
+
+### The one place a human is required
+
+The streamer image is confirmed before anything else runs. That is not merely a
+preview:
+
+| Why | Detail |
+|---|---|
+| **Cost** | The streamer appears in every video in the batch. A wrong image wastes the whole run — roughly 40 clip generations for 10 videos. Crossing the gate is what authorises that spend, so the console states the clip count on the confirm button. |
+| **Not reproducible** | Image generation is non-deterministic; regenerating never returns the same person (the same reason the Studio keeps an avatar history). Settling it first is the only reliable order. |
+| **Amortised** | One confirmation unlocks the whole batch. |
+
+At the gate you can regenerate (with an edited description), upload your own
+streamer image, or cancel. Regenerating is cheap and unlimited — only images have
+been produced at that point.
+
+The gate is enforced server-side, not just in the UI: the job sits in
+`awaiting_avatar` and **no automatic mechanism advances it**. The in-process
+worker, the poll-driven `tick` and the `resume` sweep all consult one function
+that yields "wait" in that state, so a front-end bug cannot trigger the expensive
+half of the run.
+
+### Variants
+
+A batch is one brief rendered several ways. Each variant gets its own script with
+a different opening angle (the temperature climbs with the index); all variants
+share the confirmed streamer and the single uploaded gameplay file.
+
+### Durability
+
+Everything is checkpointed to a Datastore `AutopilotJob` after each step, so:
+
+- closing the tab does not stop the batch (given a warm instance — see below)
+- an instance being recycled mid-batch costs at most one clip; the replacement
+  resumes from the checkpoint rather than starting over
+- **partial delivery is intentional**: if 8 of 10 succeed you get 8 links plus the
+  reasons for the other 2, rather than losing the batch
+
+Several workers progress one batch at a time. Checkpoints are written in a
+transaction, because a plain read-modify-write loses updates when workers overlap —
+in testing that showed up as the clip count going backwards and a failed variant
+reverting to running.
+
+### Two things Autopilot needs that the wizard does not
+
+**Gameplay is uploaded straight to Cloud Storage.** Cloud Run caps an HTTP/1
+request body at 32 MiB and the limit cannot be raised, while the UI accepts up to
+250 MB, so the browser PUTs the file to a v4 signed URL and the app never sees the
+bytes. This requires a **CORS rule on the bucket** — `deploy.sh` mode 4 configures
+it and reads it back, because a missing rule fails uploads with an opaque browser
+error and no server-side trace.
+
+**Compositing happens in ffmpeg, not the browser.** The Studio composites
+picture-in-picture with Canvas and `MediaRecorder`, which cannot work with no tab
+open. `lib/compose.js` is a port of that geometry: same canvas sizes, the same
+cover-fit crop, a picture-in-picture box at 10% of the frame area with 2% padding,
+20 px rounded corners and a 6 px white stroke, the 30% / 35% stacked splits, and
+the same rule that output length follows the gameplay while the streamer's slot
+turns black once it ends. The only omission is the drop shadow behind the PiP box.
+
+### Costs
+
+A batch is the most expensive thing this app does. Three guards, in order of
+effectiveness:
+
+1. **The confirmation gate** — before it, one image has been generated; after it,
+   tens of videos
+2. **`AUTOPILOT_VEO_CLIP_BUDGET`** — Veo stays available as the rescue for a
+   safety-blocked clip (it honours `personGeneration: allow_adult`), but it is
+   pay-as-you-go, so only a fraction of a batch may fall through to it. Without
+   this, "Omni is out of quota" would quietly become a whole batch of Veo renders
+3. **`AUTOPILOT_MAX_CLIPS_PER_JOB`** — refuses an oversized job up front, and again
+   once the real shot count is known from the first script
 
 ## User workflow
 
@@ -434,6 +552,26 @@ The blob shape exists because Datastore caps indexed properties at 1500 bytes an
 
 Queries filter on `ownerEmail` only and sort in memory, so no composite index is needed. `firestore.indexes.json` in the repo is a leftover from a Native-mode design and is not deployed by anything.
 
+**`AutopilotJob`** — one row per batch. Same indexed-summary plus unindexed-JSON
+shape as `Project`, for the same reason.
+
+```
+indexed:    ownerEmail, status, variantCount, doneCount, failedCount,
+            createdAt, updatedAt, veoBudget
+unindexed:  spec      → JSON { brief, layout, ratio, subtitles, variantMode,
+                               gameplayGcsUri, avatarPrompt, volumes }
+unindexed:  avatar    → JSON { candidates[], approvedIdx[], approvedAt,
+                               regenCount, source }
+unindexed:  variants  → JSON [ { idx, stage, scriptSegments, clipUris[],
+                                 finalUri, error, veoClips } ]
+unindexed:  counters  → JSON { veoUsed }
+```
+
+Status moves `created` → `awaiting_avatar` → `running` → `completed` /
+`partially_completed` / `failed`, or `cancelled` from anywhere. `awaiting_avatar`
+has no timeout: it costs one Datastore row and a couple of images, and the user
+may come back the next day.
+
 ### Cloud Storage
 
 ```
@@ -442,6 +580,8 @@ gs://<bucket>/frames/<YYYY>/<MM>/startframe-<epoch>-<uuid8>.png  clip start fram
 gs://<bucket>/avatars/<YYYY>/<MM>/avatar-<epoch>-<uuid8>.png     generated avatars
 gs://<bucket>/avatars/<YYYY>/<MM>/avatar-ref-<epoch>-<uuid8>.*   uploaded reference images
 gs://<bucket>/exports/<YYYY>/<MM>/<label>-<epoch>-<uuid8>.<ext>  finished renders
+gs://<bucket>/autopilot/uploads/<uuid>/gameplay.<ext>            Autopilot source footage
+gs://<bucket>/autopilot/<jobId>/avatar-*.png                     streamer candidates
 ```
 
 The bucket is private. Access is always mediated by the server: a streaming proxy, or a short-lived signed URL.
@@ -494,6 +634,23 @@ Everything under `/api` except the three public endpoints requires authenticatio
 | `POST` | `/api/media/save-image` | `{dataUrl, label?}` → `{gcsUri}`. For images the server did not produce — the avatar reference image |
 | `GET` | `/api/media/object?uri=` | Streams an object from the own bucket, same-origin and authenticated. See the note below on why this is not a signed URL |
 
+### Autopilot — only when `AUTOPILOT_ENABLED` is set (404 otherwise)
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/autopilot/config` | Limits for the UI to validate against before uploading |
+| `POST` | `/api/autopilot/upload-url` | v4 signed PUT URL for the gameplay file, bound to its content type |
+| `POST` | `/api/autopilot/jobs` | Validate the brief, create the job, render the first streamer candidate |
+| `GET` | `/api/autopilot/jobs` | Caller's jobs |
+| `GET` | `/api/autopilot/jobs/:id` | Progress, signed URLs for candidates and finished videos. Also advances the pipeline one step |
+| `POST` | `/api/autopilot/jobs/:id/avatar/regenerate` | New candidate, optionally with an edited description |
+| `POST` | `/api/autopilot/jobs/:id/avatar/upload-url` | Signed PUT URL for your own streamer image |
+| `POST` | `/api/autopilot/jobs/:id/avatar/use-uploaded` | Adopt an uploaded image as the candidate |
+| `POST` | `/api/autopilot/jobs/:id/avatar/approve` | **The only way out of the gate** |
+| `POST` | `/api/autopilot/jobs/:id/tick` | Idempotent single-step advance; returns without working at the gate |
+| `POST` | `/api/autopilot/jobs/:id/cancel` | Stop the batch |
+| `POST` | `/api/autopilot/resume` | Sweep for stalled jobs. Skips anything at the gate |
+
 ### Admin — requires `ADMIN_USERS` membership
 
 | Method | Path | Notes |
@@ -543,6 +700,16 @@ Type-check without emitting:
 npx tsc --noEmit
 ```
 
+Run the test suite (no extra dependencies — Node's built-in runner):
+
+```bash
+npm test
+```
+
+The compositor tests render synthetic footage and then sample the output pixels,
+so they verify that things land where the geometry says rather than merely that
+the code ran. ffmpeg must be on `PATH`.
+
 ### Container
 
 ```bash
@@ -567,6 +734,7 @@ components/
   ProjectForm.tsx          Three-step wizard
   AvatarGenerator.tsx      Avatar prompt, reference image, ratio enforcement
   Studio.tsx               Clip generation, final page, export + preview
+  Autopilot.tsx            Single-page batch console (brief → confirm → results)
   ProjectHistory.tsx       History modal
   AdminDashboard.tsx       Charts, activity log, CSV, file links
   TextInput.tsx            IME-safe text field / textarea
@@ -576,6 +744,7 @@ services/
   auth.ts                  Token storage, refresh, session-expired event, apiFetch
   projects.ts              Project history client
   gemini.ts                Typed wrappers over /api/gemini/*
+  autopilot.ts             Typed wrappers over /api/autopilot/* + direct upload
   prompts.ts               Prompt construction
   logging.ts               Fire-and-forget activity logging
 
@@ -583,7 +752,14 @@ utils/
   videoUtils.ts            Canvas/MediaRecorder composite, compression, frame extraction
   subtitles.ts             Shot list → SRT
 
-deploy.sh                  Interactive deployment / user management  (~930 lines)
+lib/
+  compose.js               Server-side ffmpeg compositor (port of the browser one)
+  autopilot.js             Upload validation, Veo budget, bucket scoping
+  autopilot-job.js         Job state machine (pure; includes the approval gate)
+
+test/                      node:test suites; run with `npm test`
+
+deploy.sh                  Interactive deployment / user management  (~1150 lines)
 Dockerfile                 node:20-slim + FFmpeg
 DEPLOYMENT.md              Deployment guide (Chinese, more operational detail)
 ```

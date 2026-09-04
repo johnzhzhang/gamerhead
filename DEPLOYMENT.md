@@ -75,16 +75,19 @@ chmod +x deploy.sh
 ./deploy.sh
 ```
 
-脚本提供三种操作模式，按提示选择：
+脚本提供四种操作模式，按提示选择：
 
 ```
 请选择操作:
   1) 全新部署
   2) 更新已有服务 (仅更新代码，保留现有配置)
   3) 管理授权用户 (添加/删除可登录的邮箱)
+  4) 配置 Autopilot (批量成片)
 ```
 
 > 模式 3 除了可登录用户，也用来管理 Admin 仪表板的管理员名单，并且会自动适配 IAP / GIS / 固定密码三种登录方式。
+>
+> 模式 4 用来开关「批量成片」。**默认关闭**，不开启的部署与加入该功能之前完全一致。
 
 ---
 
@@ -152,6 +155,12 @@ IAP 在 Cloud Run 前面拦截所有请求，未登录会跳转 `accounts.google
 - 两者都空 → `/api/admin/*` 整体返回 403，仪表板不可用
 
 固定密码模式下这里填用户名，不是邮箱。
+
+### 步骤 5.5：是否启用 Autopilot（可选）
+
+会问一次「启用 Autopilot?」，**默认 n**。直接回车得到的部署与加入该功能之前完全一致。
+
+选 `y` 时会在部署完成后自动配置存储桶 CORS 与常驻实例。之后随时可用模式 4 开关。
 
 ### 步骤 6：自动配置 IAM 权限
 
@@ -228,7 +237,48 @@ IAP 模式下还会额外做两件事：为服务设置 IAP 服务代理，并�
 
 ---
 
-## 七、环境变量说明
+
+## 七、配置 Autopilot 批量成片（模式 4）
+
+Autopilot 让用户填一次表单、确认一次主播形象，然后一次拿到多个成片。**默认关闭**。
+
+```bash
+./deploy.sh
+# 选择 4
+```
+
+选服务和区域后，脚本先显示当前状态，再给三个选项：
+
+| 选项 | 作用 |
+|------|------|
+| `1` 启用 | 写入环境变量、配置存储桶 CORS、可选开启常驻实例与续跑定时任务 |
+| `2` 关闭 | 移除环境变量、min-instances 回落为 0（空闲不再计费），已有作业与视频保留 |
+| `3` 仅查看 | 只打印当前配置，不做任何修改 |
+
+### 启用时脚本做了什么
+
+| 动作 | 为什么必须 |
+|------|-----------|
+| 写入 `AUTOPILOT_ENABLED` 等变量 | 未设置时所有 `/api/autopilot/*` 返回 404，前端不显示入口 |
+| 配置存储桶 **CORS** | 素材要由浏览器直传 GCS。Cloud Run 的 HTTP/1 请求体上限是 32 MiB 且不可调，而界面允许 250 MB，所以不能经应用上传。CORS 缺失时上传会以浏览器端的模糊错误失败，服务端看不到任何记录，因此脚本配置后会**回读校验** |
+| 覆盖两种 Cloud Run 域名 | 服务同时响应 `SERVICE-项目编号.区域.run.app` 与 `SERVICE-哈希-区域码.a.run.app`，用户可能从任一个进来，两个都要在 CORS 里 |
+| `--min-instances=1 --no-cpu-throttling`（可选，默认是） | Cloud Run 默认在请求之外限制 CPU，不常驻的话批次只能在页面打开时推进。常驻能让用户关掉页面后继续跑，代价是空闲也计费 |
+| Cloud Scheduler 续跑任务（可选，默认否） | 每 5 分钟调 `/api/autopilot/resume`，捡起因实例回收而停滞的批次。等待确认主播的作业不会被唤醒 |
+
+> ⚠️ **模式 4 只改配置，不部署代码。** 如果开启后界面上看不到 Autopilot 标签，说明当前运行的镜像还没有这个功能，先执行模式 2 更新代码。
+
+### 成本注意
+
+一批 10 个成片约需 40 次视频生成，是这个应用最花钱的操作。三道护栏：
+
+1. **确认主播的闸门** —— 越过之前只生成了一张图片，越过之后才是几十个视频。界面会在确认按钮上写明本次将生成多少片段
+2. `AUTOPILOT_VEO_CLIP_BUDGET` —— Veo 保留作为安全拦截的救援手段（它支持 `personGeneration: allow_adult`），但按量付费，故限制一批中最多多少片段可以落到它上面
+3. `AUTOPILOT_MAX_CLIPS_PER_JOB` —— 提交时按预估拒绝超大作业，拿到第一份脚本知道真实分镜数后再校验一次
+
+常驻实例是唯一会产生固定费用的配置项，用模式 4 的选项 2 可随时关掉。
+
+---
+## 八、环境变量说明
 
 | 变量名 | 必需 | 说明 |
 |--------|------|------|
@@ -241,6 +291,13 @@ IAP 模式下还会额外做两件事：为服务设置 IAP 服务代理，并�
 | `AUTHORIZED_USERS` | 否 | GIS 模式下的授权邮箱列表，逗号分隔；留空则不限制 |
 | `AUTHORIZED_DOMAIN` | 否 | GIS 模式下限制单一邮箱网域（如 `example.com`） |
 | `BASIC_AUTH_USERS` | 条件必需 | 固定密码模式下的账号列表，格式 `user:pass,user2:pass2` |
+| `AUTOPILOT_ENABLED` | 否 | 设为 `1` 才开放批量成片。未设置时所有 `/api/autopilot/*` 返回 404，界面不显示入口 |
+| `AUTOPILOT_MAX_BATCH` | 否 | 单批最多几个成片，默认 `10` |
+| `AUTOPILOT_CONCURRENCY` | 否 | 并发生成的片段数，默认 `4`，上限受模型每分钟配额约束 |
+| `AUTOPILOT_COMPOSE_CONCURRENCY` | 否 | 并发 ffmpeg 合成数，默认 `2`，受容器 CPU 约束 |
+| `AUTOPILOT_MAX_CLIPS_PER_JOB` | 否 | 成本熔断：单作业片段总数上限，默认 `60` |
+| `AUTOPILOT_VEO_CLIP_BUDGET` | 否 | 一批中最多多少片段可落到按量付费的 Veo，默认为总数的 25%（最低 4） |
+| `AUTOPILOT_UPLOAD_MAX_BYTES` | 否 | 素材上传上限，默认 250 MB |
 
 > IAP 模式不需要任何登录相关的环境变量——访问权限由 IAM 角色 `roles/iap.httpsResourceAccessor` 控制。但 `ADMIN_USERS` 仍然需要，因为它决定谁能进 Admin 仪表板。
 
@@ -263,7 +320,7 @@ gcloud run services update gamerheads --region=us-central1 \
 
 ---
 
-## 八、部署后管理
+## 九、部署后管理
 
 ### 查看实时日志
 
@@ -291,7 +348,7 @@ gcloud run services delete gamerheads --region=us-central1
 
 ---
 
-## 九、故障排查
+## 十、故障排查
 
 ### Cloud Build 构建失败
 
@@ -401,7 +458,7 @@ gcloud run services logs read gamerheads --region=us-central1 --limit=50 \
 
 ---
 
-## 十、成本参考
+## 十一、成本参考
 
 Cloud Run 按实际请求计费，无流量时（`min-instances=0`）不产生费用。
 
@@ -417,7 +474,7 @@ Veo 视频生成按 Vertex AI 定价计费，费用取决于视频时长和模�
 
 ---
 
-## 十一、部署检查清单
+## 十二、部署检查清单
 
 - [ ] `gcloud auth login` 登录账号拥有足够权限（见第二节）
 - [ ] GCP 项目已开启结算账户
@@ -431,3 +488,11 @@ Veo 视频生成按 Vertex AI 定价计费，费用取决于视频时长和模�
 - [ ] 导出一次视频，确认成品出现在 `gs://<bucket>/exports/` 下，且导出行有文件链接
 - [ ] （IAP 模式）确认 `gcloud run services get-iam-policy` 里 **没有** `allUsers`，只有 IAP 服务代理
 - [ ] （Google Sign-In 模式）在 OAuth 凭据页面将实际服务 URL 添加到「已获授权的 JavaScript 来源」
+
+**如果启用了 Autopilot（模式 4）还要确认：**
+
+- [ ] 界面上出现了 Autopilot 标签（没有的话先跑模式 2 更新代码）
+- [ ] 存储桶 CORS 已配置，且包含服务的两种域名形式
+- [ ] `min-instances` 与预期一致（1 = 关掉页面后批次继续，但空闲计费；0 = 仅页面打开时推进）
+- [ ] 在确认主播那一步能看到「本次将生成多少片段」的成本提示
+- [ ] 不需要时用模式 4 → 选项 2 关闭，min-instances 回落为 0

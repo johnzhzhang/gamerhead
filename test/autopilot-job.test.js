@@ -441,6 +441,17 @@ test('transitions on a terminal job are inert', () => {
     assert.strictEqual(setAvatarCandidates(done, [{ gcsUri: 'gs://x/a.png' }]).status, JOB_STATUS.COMPLETED);
 });
 
+test('summarise carries enough to identify a batch in a list', () => {
+    // A history list needs a human-readable handle; ids alone are unusable.
+    const job = runningJob(2, 2);
+    const view = summarise(job);
+    assert.strictEqual(view.gameTitle, 'Blockfall');
+    assert.strictEqual(view.layoutType, 'classic-pip');
+    assert.strictEqual(view.targetRatio, '16:9');
+    assert.ok(view.createdAt, 'created time is exposed for sorting');
+    assert.ok(view.updatedAt);
+});
+
 test('summarise exposes progress without leaking internals', () => {
     let job = runningJob(2, 2);
     job = applyClip(job, 0, 0, `gs://${BUCKET}/c.mp4`);
@@ -592,4 +603,27 @@ test('a supplied streamer image still has to pass the gate', () => {
     assert.strictEqual(job.avatar.source, 'uploaded');
     assert.strictEqual(nextAction(job).type, ACTION.WAIT_APPROVAL,
         'bringing your own image does not skip confirmation');
+});
+
+// ── Google Search grounding ──────────────────────────────────────────────────
+
+test('grounding is kept when a store URL is present', () => {
+    const r = validateJobSpec(goodSpec({ searchGrounding: true }), LIMITS);
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.spec.searchGrounding, true);
+});
+
+test('grounding is dropped without a store URL rather than silently ignored', () => {
+    // Nothing to search means the flag would mislead: the UI would claim the
+    // script was grounded when it was not.
+    const r = validateJobSpec(goodSpec({ searchGrounding: true, gameUrl: '' }), LIMITS);
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.spec.searchGrounding, false);
+
+    const blank = validateJobSpec(goodSpec({ searchGrounding: true, gameUrl: '   ' }), LIMITS);
+    assert.strictEqual(blank.spec.searchGrounding, false);
+});
+
+test('grounding defaults to off', () => {
+    assert.strictEqual(validateJobSpec(goodSpec(), LIMITS).spec.searchGrounding, false);
 });

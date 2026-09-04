@@ -50,6 +50,10 @@ export interface AutopilotJobView {
   status: AutopilotStatus;
   createdAt: string;
   updatedAt: string;
+  /** Enough to recognise a batch in the list; ids alone are unusable. */
+  gameTitle: string;
+  layoutType: string | null;
+  targetRatio: string | null;
   awaitingApproval: boolean;
   variantCount: number;
   doneCount: number;
@@ -86,6 +90,8 @@ export interface AutopilotSubmitSpec {
   pipPlacement?: string;
   stackedPlacement?: string;
   subtitles?: boolean;
+  /** Look the game up with Google Search; needs gameUrl to be set. */
+  searchGrounding?: boolean;
   variantCount: number;
   gameplayGcsUri?: string | null;
   avatarPrompt: string;

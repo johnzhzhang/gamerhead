@@ -2405,7 +2405,13 @@ const generateAutopilotScript = async (job, variantIdx) => {
 
     const promptText = [
         `You are scripting a short promotional video for the game "${s.gameTitle}".`,
-        s.gameUrl ? `Store link: ${s.gameUrl}` : '',
+        s.gameUrl ? `Official store page: ${s.gameUrl}` : '',
+        s.searchGrounding && s.gameUrl
+            ? `Use Google Search to look up "${s.gameTitle}" and its store page above. `
+              + 'Work real, verifiable details into the dialogue — actual mechanics, '
+              + 'setting, platforms or standout features — so it sounds like someone who '
+              + 'has played it. Do not invent facts you did not find.'
+            : '',
         s.gamingDevice ? `Platform / device: ${s.gamingDevice}` : '',
         s.callToAction ? `The video must end on this call to action: ${s.callToAction}` : '',
         s.dialoguePacing ? `Dialogue pacing: ${s.dialoguePacing}` : '',
@@ -2427,6 +2433,10 @@ const generateAutopilotScript = async (job, variantIdx) => {
             temperature: Math.min(1.3, 0.7 + variantIdx * 0.12),
             systemInstruction: 'You are an expert content creator scriptwriter. '
                 + 'Adhere strictly to the duration rules.',
+            // Grounding lets the script cite real details about the game instead of
+            // plausible-sounding invention — worth more in a batch, where ten
+            // variants would otherwise repeat the same guesses.
+            tools: (s.searchGrounding && s.gameUrl) ? [{ googleSearch: {} }] : undefined,
             responseMimeType: 'application/json',
             responseSchema: {
                 type: Type.ARRAY,

@@ -24,6 +24,7 @@ import {
   fetchAutopilotConfig,
   getJob,
   isTerminalStatus,
+  listJobs,
   regenerateAvatar,
   uploadGameplay,
   uploadImage,
@@ -34,6 +35,36 @@ import {
 } from '../services/autopilot';
 
 const POLL_MS = 6000;
+
+/**
+ * The id of the batch last opened in this browser.
+ *
+ * A batch runs server-side and outlives the tab, so without this the work would
+ * be unreachable after a reload — the console would claim you can come back and
+ * then offer no way to do it.
+ */
+const LAST_JOB_KEY = 'gh_autopilot_last_job';
+
+const readLastJobId = (): string | null => {
+  try { return localStorage.getItem(LAST_JOB_KEY); } catch { return null; }
+};
+const writeLastJobId = (id: string | null) => {
+  try {
+    if (id) localStorage.setItem(LAST_JOB_KEY, id);
+    else localStorage.removeItem(LAST_JOB_KEY);
+  } catch { /* private mode: recovery falls back to the batch list */ }
+};
+
+const relativeTime = (iso: string): string => {
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return '';
+  const mins = Math.round((Date.now() - then) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+};
 
 const STAGE_LABEL: Record<string, string> = {
   pending: 'Queued',
@@ -150,6 +181,69 @@ const ImagePicker: React.FC<{
   </div>
 );
 
+const STATUS_TONE: Record<string, string> = {
+  completed: 'text-google-blue',
+  partially_completed: 'text-google-yellow',
+  failed: 'text-google-red',
+  cancelled: 'text-gray-500',
+  awaiting_avatar: 'text-google-yellow',
+  running: 'text-gray-200',
+  created: 'text-gray-400',
+};
+
+/**
+ * Batches this user has run.
+ *
+ * The console exists to let people walk away, so there has to be a way back:
+ * reopening a batch shows live progress, and for a finished one it re-signs the
+ * download links (they expire after an hour).
+ */
+const BatchList: React.FC<{
+  jobs: AutopilotJobView[];
+  activeId: string | null;
+  busy: boolean;
+  onOpen: (id: string) => void;
+}> = ({ jobs, activeId, busy, onOpen }) => {
+  if (!jobs.length) return null;
+  return (
+    <section className="bg-google-gray border border-gray-700 rounded-2xl p-5 mb-6">
+      <h2 className="text-sm font-medium text-gray-200 mb-1">Your batches</h2>
+      <p className="text-[11px] text-gray-500 mb-4">
+        Batches keep running after you close this page. Open one to see progress or
+        get fresh download links.
+      </p>
+      <ul className="divide-y divide-gray-700/60">
+        {jobs.map((j) => {
+          const isActive = j.id === activeId;
+          return (
+            <li key={j.id} className="py-2.5 flex items-center gap-3 flex-wrap">
+              <span className="text-sm text-gray-200 flex-1 min-w-[8rem] truncate">
+                {j.gameTitle || 'Untitled'}
+                {isActive && <span className="ml-2 text-[10px] text-google-blue">open</span>}
+              </span>
+              <span className={`text-xs w-40 ${STATUS_TONE[j.status] || 'text-gray-400'}`}>
+                {STATUS_LABEL[j.status] || j.status}
+              </span>
+              <span className="text-xs text-gray-500 w-24">
+                {j.doneCount}/{j.variantCount} ready
+              </span>
+              <span className="text-xs text-gray-500 w-20">{relativeTime(j.updatedAt)}</span>
+              <button
+                type="button"
+                disabled={busy || isActive}
+                onClick={() => onOpen(j.id)}
+                className="text-xs text-google-blue hover:underline disabled:opacity-40 disabled:no-underline"
+              >
+                {isActive ? '—' : 'Open'}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+};
+
 const Bar: React.FC<{ value: number; total: number }> = ({ value, total }) => {
   const pct = total > 0 ? Math.round((value / total) * 100) : 0;
   return (
@@ -182,6 +276,7 @@ const Autopilot: React.FC = () => {
   const [pipPlacement, setPipPlacement] = useState<PipPlacement>('bottom-left');
   const [stackedPlacement, setStackedPlacement] = useState<StackedPlacement>('left');
   const [subtitles, setSubtitles] = useState(false);
+  const [searchGrounding, setSearchGrounding] = useState(false);
   const [variantCount, setVariantCount] = useState(3);
   const [gameplayFile, setGameplayFile] = useState<File | null>(null);
   // Two optional images, both uploaded rather than referenced by URI:
@@ -201,6 +296,8 @@ const Autopilot: React.FC = () => {
   const [uploadPct, setUploadPct] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [regenPrompt, setRegenPrompt] = useState('');
+  const [jobs, setJobs] = useState<AutopilotJobView[]>([]);
+  const [restoring, setRestoring] = useState(true);
   const commitRegen = useCallback((_n: string, v: string) => setRegenPrompt(v), []);
   const ownAvatarInput = useRef<HTMLInputElement>(null);
 
@@ -219,11 +316,42 @@ const Autopilot: React.FC = () => {
     return () => URL.revokeObjectURL(url);
   }, [ownFile]);
 
+  const refreshJobs = useCallback(async () => {
+    try {
+      setJobs(await listJobs());
+    } catch { /* the list is a convenience; failing to load it is not fatal */ }
+  }, []);
+
   useEffect(() => {
-    fetchAutopilotConfig()
-      .then(setConfig)
-      .catch(() => setConfig(null))
-      .finally(() => setConfigChecked(true));
+    let cancelled = false;
+    (async () => {
+      let cfg: AutopilotConfig | null = null;
+      try { cfg = await fetchAutopilotConfig(); } catch { cfg = null; }
+      if (cancelled) return;
+      setConfig(cfg);
+      setConfigChecked(true);
+      if (!cfg) { setRestoring(false); return; }
+
+      // Reopen whatever this browser was last looking at, then fall back to the
+      // newest batch that is still running so an interrupted run is never lost.
+      let list: AutopilotJobView[] = [];
+      try { list = await listJobs(); } catch { list = []; }
+      if (cancelled) return;
+      setJobs(list);
+
+      const remembered = readLastJobId();
+      const target = list.find((j) => j.id === remembered)
+        || list.find((j) => !isTerminalStatus(j.status))
+        || null;
+      if (target) {
+        setJob(target);
+        setJobId(target.id);
+      } else if (remembered) {
+        writeLastJobId(null);
+      }
+      setRestoring(false);
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   // A stacked layout needs the streamer in the opposite orientation, so the
@@ -233,6 +361,8 @@ const Autopilot: React.FC = () => {
       ? (prev === 'top' || prev === 'bottom' ? prev : 'top')
       : (prev === 'left' || prev === 'right' ? prev : 'left')));
   }, [targetRatio]);
+
+  useEffect(() => { writeLastJobId(jobId); }, [jobId]);
 
   // Poll while the job is live. The GET also nudges the server-side pipeline, so
   // an instance with no background CPU still makes progress while this is open.
@@ -247,6 +377,7 @@ const Autopilot: React.FC = () => {
         if (cancelled) return;
         setJob(fresh);
         if (!isTerminalStatus(fresh.status)) timer = window.setTimeout(poll, POLL_MS);
+        else refreshJobs();
       } catch (err: any) {
         if (!cancelled) {
           setError(err.message || 'Lost contact with the job');
@@ -256,10 +387,12 @@ const Autopilot: React.FC = () => {
     };
     poll();
     return () => { cancelled = true; if (timer) window.clearTimeout(timer); };
-  }, [jobId]);
+  }, [jobId, refreshJobs]);
 
   const needsGameplay = layoutType !== 'streamer-only';
   const imageAccept = (config?.allowedImageTypes || ['image/png', 'image/jpeg', 'image/webp']).join(',');
+  // Grounding has nothing to search without a store page, so the toggle follows it.
+  const groundingAvailable = brief.gameUrl.trim().length > 0;
   const estimatedClips = variantCount * 4;
 
   // A streamer has to come from somewhere: either a description to generate from,
@@ -307,6 +440,7 @@ const Autopilot: React.FC = () => {
         pipPlacement,
         stackedPlacement,
         subtitles,
+        searchGrounding: searchGrounding && groundingAvailable,
         variantCount,
         gameplayGcsUri,
         avatarPrompt: brief.avatarPrompt.trim(),
@@ -315,6 +449,7 @@ const Autopilot: React.FC = () => {
       });
       setJob(created);
       setJobId(created.jobId || created.id);
+      refreshJobs();
     } catch (err: any) {
       setError(err.message || 'Could not start the batch');
     } finally {
@@ -322,7 +457,8 @@ const Autopilot: React.FC = () => {
     }
   }, [
     needsGameplay, gameplayFile, refFile, ownFile, brief, targetRatio, layoutType,
-    pipPlacement, stackedPlacement, subtitles, variantCount,
+    pipPlacement, stackedPlacement, subtitles, searchGrounding, groundingAvailable,
+    variantCount, refreshJobs,
   ]);
 
   const act = useCallback(async (label: string, fn: () => Promise<AutopilotJobView>) => {
@@ -345,16 +481,40 @@ const Autopilot: React.FC = () => {
     });
   }, [jobId, act]);
 
+  const openJob = useCallback(async (id: string) => {
+    setError(null);
+    setBusy('Opening');
+    try {
+      // Re-fetching also re-signs the download links, which expire after an hour.
+      const fresh = await getJob(id);
+      setJob(fresh);
+      setJobId(id);
+    } catch (err: any) {
+      setError(err.message || 'Could not open that batch');
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  /** Back to a blank brief. The batch itself is untouched and stays in the list. */
   const reset = useCallback(() => {
     setJob(null);
     setJobId(null);
     setError(null);
     setUploadPct(0);
     setRegenPrompt('');
-  }, []);
+    setGateRefFile(null);
+    setRefFile(null);
+    setOwnFile(null);
+    refreshJobs();
+  }, [refreshJobs]);
 
-  if (!configChecked) {
-    return <div className="max-w-4xl mx-auto py-16 text-center text-gray-500 text-sm">Checking availability…</div>;
+  if (!configChecked || (config && restoring)) {
+    return (
+      <div className="max-w-4xl mx-auto py-16 text-center text-gray-500 text-sm">
+        {configChecked ? 'Looking for batches you left running…' : 'Checking availability…'}
+      </div>
+    );
   }
 
   if (!config) {
@@ -377,12 +537,19 @@ const Autopilot: React.FC = () => {
 
   return (
     <div className="max-w-4xl mx-auto w-full animate-fade-in pb-16">
-      <div className="mb-6">
-        <h1 className="text-2xl font-light text-gray-100">Autopilot</h1>
-        <p className="text-sm text-gray-400 mt-1">
-          Fill this in once, confirm the streamer, and collect the finished videos.
-          Script, shot list, clips and compositing all run unattended.
-        </p>
+      <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-light text-gray-100">Autopilot</h1>
+          <p className="text-sm text-gray-400 mt-1">
+            Fill this in once, confirm the streamer, and collect the finished videos.
+            Script, shot list, clips and compositing all run unattended.
+          </p>
+        </div>
+        {job && (
+          <NeonButton variant="secondary" onClick={reset} disabled={!!busy}>
+            New batch
+          </NeonButton>
+        )}
       </div>
 
       {error && (
@@ -391,14 +558,18 @@ const Autopilot: React.FC = () => {
         </div>
       )}
 
+      <BatchList jobs={jobs} activeId={jobId} busy={!!busy} onOpen={openJob} />
+
       {/* ── 1. brief ─────────────────────────────────────────────────── */}
       {!job && (
         <Section step="1" title="The brief" hint="Everything the pipeline needs. You will not be asked again.">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <Field name="gameTitle" label="Game title" value={brief.gameTitle} onCommit={commitField}
                    placeholder="Blockfall" required disabled={!!busy} />
-            <Field name="gameUrl" label="Store URL" value={brief.gameUrl} onCommit={commitField}
-                   inputMode="url" placeholder="https://…" disabled={!!busy} />
+            <Field name="gameUrl" label="Store page URL" value={brief.gameUrl} onCommit={commitField}
+                   inputMode="url" disabled={!!busy}
+                   placeholder="https://store.steampowered.com/app/123456/Your_Game/"
+                   hint="The game's official store or product page. Needed if you want the script grounded in real facts." />
             <Field name="callToAction" label="Call to action" value={brief.callToAction} onCommit={commitField}
                    placeholder="Play free now" disabled={!!busy} />
             <Field name="gamingDevice" label="Device / platform" value={brief.gamingDevice} onCommit={commitField}
@@ -508,11 +679,27 @@ const Autopilot: React.FC = () => {
                 Each gets its own script and angle; they share the streamer you confirm next.
               </p>
             </div>
-            <label className="flex items-center gap-2 text-sm text-gray-300 pb-2">
-              <input type="checkbox" checked={subtitles} onChange={(e) => setSubtitles(e.target.checked)}
-                     className="w-4 h-4 accent-google-blue" />
-              Burn in subtitles
-            </label>
+            <div className="flex flex-col gap-3 pb-1">
+              <label className="flex items-center gap-2 text-sm text-gray-300">
+                <input type="checkbox" checked={subtitles} onChange={(e) => setSubtitles(e.target.checked)}
+                       className="w-4 h-4 accent-google-blue" />
+                Burn in subtitles
+              </label>
+              <label className={`flex items-start gap-2 text-sm ${groundingAvailable ? 'text-gray-300' : 'text-gray-500'}`}>
+                <input type="checkbox" checked={searchGrounding && groundingAvailable}
+                       disabled={!groundingAvailable}
+                       onChange={(e) => setSearchGrounding(e.target.checked)}
+                       className="w-4 h-4 accent-google-blue mt-0.5" />
+                <span>
+                  Look the game up with Google Search
+                  <span className="block text-[11px] text-gray-500">
+                    {groundingAvailable
+                      ? 'Scripts cite real mechanics and features instead of guessing. Adds a few seconds per variant.'
+                      : 'Add the store page URL above to enable this.'}
+                  </span>
+                </span>
+              </label>
+            </div>
           </div>
 
           {needsGameplay && (

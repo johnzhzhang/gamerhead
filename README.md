@@ -397,6 +397,32 @@ A batch is one brief rendered several ways. Each variant gets its own script wit
 a different opening angle (the temperature climbs with the index); all variants
 share the confirmed streamer and the single uploaded gameplay file.
 
+### Getting back to a batch
+
+A batch outlives the page, so the console has to offer a way back — otherwise the
+invitation to walk away is empty. Two mechanisms:
+
+- **The batch list.** `Your batches` lists everything this account has run, newest
+  first, with title, status and progress. Opening one shows live progress, and for
+  a finished batch it re-signs the download links (they expire after an hour).
+- **Automatic reopen.** The last batch opened in that browser is remembered in
+  `localStorage`; on load the console reopens it. Failing that it reopens the
+  newest batch still running, so an interrupted run is never stranded — and on a
+  different machine, where there is no local memory, the list still finds it.
+
+### Grounding the script in real facts
+
+Optional, off by default, and requires the store page URL: with it on, the script
+model searches for the game and works verifiable details into the dialogue instead
+of writing plausible-sounding filler. That matters more here than in the wizard,
+because ten variants would otherwise repeat the same guesses.
+
+Verified against the live API: with the flag on, the response carries
+`groundingMetadata` and a real search query; with it off, neither appears. Note the
+returned citation list comes back empty on 3.5 and 3.7 alike — a pre-existing
+platform quirk, not specific to Autopilot. The flag is dropped rather than silently
+honoured if no store URL was given.
+
 ### Durability
 
 Everything is checkpointed to a Datastore `AutopilotJob` after each step, so:
@@ -664,7 +690,7 @@ Everything under `/api` except the three public endpoints requires authenticatio
 | `POST` | `/api/autopilot/upload-url` | v4 signed PUT URL for the gameplay file, bound to its content type |
 | `POST` | `/api/autopilot/image-upload-url` | v4 signed PUT URL for a reference or streamer image. Not scoped to a job, because the reference is chosen while the brief is being filled in |
 | `POST` | `/api/autopilot/jobs` | Validate the brief, create the job, render the first streamer candidate |
-| `GET` | `/api/autopilot/jobs` | Caller's jobs |
+| `GET` | `/api/autopilot/jobs` | Caller's batches, newest first — what the console's batch list reads |
 | `GET` | `/api/autopilot/jobs/:id` | Progress, signed URLs for candidates and finished videos. Also advances the pipeline one step |
 | `POST` | `/api/autopilot/jobs/:id/avatar/regenerate` | New candidate, optionally with an edited description |
 | `POST` | `/api/autopilot/jobs/:id/avatar/upload-url` | Signed PUT URL for your own streamer image |

@@ -25,6 +25,7 @@ import {
     probeMedia,
     composeVideo,
     measureGreenScreen,
+    measureGreenScreenImage,
     constants,
 } from '../lib/compose.js';
 
@@ -537,4 +538,39 @@ test('framed mode is untouched by the new option', async () => {
     const edge = await samplePixel(out, box.x + box.w / 2, box.y + 1);
     assert.ok(edge[0] > 150 && edge[1] > 150 && edge[2] > 150,
         'the white webcam border still renders when background removal is off');
+});
+
+test('measureGreenScreenImage judges an in-memory image the same way', async () => {
+    // The avatar gate runs before anything is stored, so it has to work on the
+    // bytes the model returned rather than a file.
+    const green = path.join(TMP, 'g.png');
+    await run('ffmpeg', ['-hide_banner', '-y', '-f', 'lavfi',
+        '-i', 'color=c=0x14E016:s=640x360:d=1', '-frames:v', '1', green]);
+    const gm = await measureGreenScreenImage(fs.readFileSync(green));
+    assert.strictEqual(gm.isGreenScreen, true);
+    assert.ok(gm.fraction > 0.9, `a solid green image should read high, got ${gm.fraction}`);
+
+    const room = path.join(TMP, 'r.png');
+    await run('ffmpeg', ['-hide_banner', '-y', '-f', 'lavfi',
+        '-i', 'testsrc=s=640x360:d=1', '-frames:v', '1', room]);
+    const rm = await measureGreenScreenImage(fs.readFileSync(room));
+    assert.strictEqual(rm.isGreenScreen, false,
+        `a normal picture must not pass as a green screen, got ${(rm.fraction * 100).toFixed(1)}%`);
+});
+
+test('the image and video measurements agree on the same content', async () => {
+    // If these two drifted apart, an avatar could pass the gate and then fail at
+    // composite time — the worst place to find out.
+    const png = path.join(TMP, 'agree.png');
+    await run('ffmpeg', ['-hide_banner', '-y', '-f', 'lavfi',
+        '-i', 'color=c=0x0A9012:s=640x360:d=1', '-frames:v', '1', png]);
+    const vid = path.join(TMP, 'agree.mp4');
+    await run('ffmpeg', ['-hide_banner', '-y', '-loop', '1', '-i', png, '-t', '2',
+        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', vid]);
+
+    const fromImage = await measureGreenScreenImage(fs.readFileSync(png));
+    const fromVideo = await measureGreenScreen(vid);
+    assert.strictEqual(fromImage.isGreenScreen, fromVideo.isGreenScreen);
+    assert.ok(Math.abs(fromImage.fraction - fromVideo.fraction) < 0.05,
+        `image ${fromImage.fraction.toFixed(3)} vs video ${fromVideo.fraction.toFixed(3)}`);
 });

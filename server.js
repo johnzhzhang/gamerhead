@@ -46,7 +46,7 @@ import {
     summarise,
     actionKey,
 } from './lib/autopilot-job.js';
-import { composeVideo, probeMedia } from './lib/compose.js';
+import { composeVideo, probeMedia, measureGreenScreenImage } from './lib/compose.js';
 
 const require = createRequire(import.meta.url);
 const multer = require('multer');
@@ -1261,8 +1261,14 @@ apiRouter.post('/gemini/analyze-script', async (req, res) => {
 
 // POST /api/gemini/generate-avatar
 // Body: { prompt: string, model: string, aspectRatio: string, referenceImageData?: string, referenceImageMime?: string }
+// How many times to re-roll an avatar that came back without a usable green
+// screen. The model does not reliably honour the instruction, and an avatar with a
+// real background would be punched full of holes by the key — so this is checked
+// before the image is ever stored or shown.
+const GREENSCREEN_RETRIES = Number(process.env.GREENSCREEN_RETRIES ?? 2);
+
 apiRouter.post('/gemini/generate-avatar', async (req, res) => {
-    const { prompt, model, aspectRatio, referenceImageData, referenceImageMime } = req.body;
+    const { prompt, model, aspectRatio, referenceImageData, referenceImageMime, removeBackground } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt is required' });
 
     try {
@@ -1274,35 +1280,70 @@ apiRouter.post('/gemini/generate-avatar', async (req, res) => {
         const ai = getVertexAIGlobalClient();   // Image model requires global endpoint
         const resolvedModel = model || 'gemini-3.1-flash-image';
         console.log(`[Gemini] Avatar model: ${resolvedModel} (global endpoint)`);
-        const response = await ai.models.generateContent({
-            model: resolvedModel,
-            contents: [{ role: 'user', parts }],
-            config: {
-                temperature: 0.5,
-                responseModalities: ['IMAGE', 'TEXT'],
-                imageConfig: {
-                    aspectRatio: aspectRatio || '16:9',
-                    imageSize: '1K'
-                },
-                safetySettings: SAFETY_SETTINGS_BLOCK_NONE
-            }
-        });
 
-        if (response.candidates?.[0]?.content?.parts) {
-            for (const part of response.candidates[0].content.parts) {
-                if (part.inlineData) {
-                    const imageData = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-                    // Persist it: a generated avatar cannot be reproduced, and
-                    // without a durable copy a restored project has no streamer
-                    // and the Studio tab stays locked.
-                    const gcsUri = await uploadImageToBucket({
-                        base64: part.inlineData.data,
-                        mimeType: part.inlineData.mimeType,
-                        label: 'avatar',
-                    });
-                    return res.json({ imageData, gcsUri });
+        // Background removal needs a real green screen. The model does not honour
+        // the instruction every time, and an avatar with an actual background would
+        // be punched full of holes by the key — so the image is measured here and
+        // re-rolled before it is stored or shown.
+        let chosen = null;
+        let greenCheck = null;
+        const attempts = removeBackground ? 1 + GREENSCREEN_RETRIES : 1;
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+            const response = await ai.models.generateContent({
+                model: resolvedModel,
+                contents: [{ role: 'user', parts }],
+                config: {
+                    // Nudge later attempts so a re-roll is not the same picture.
+                    temperature: 0.5 + (attempt - 1) * 0.15,
+                    responseModalities: ['IMAGE', 'TEXT'],
+                    imageConfig: {
+                        aspectRatio: aspectRatio || '16:9',
+                        imageSize: '1K'
+                    },
+                    safetySettings: SAFETY_SETTINGS_BLOCK_NONE
                 }
+            });
+
+            const part = (response.candidates?.[0]?.content?.parts || []).find((p) => p.inlineData);
+            if (!part) continue;
+
+            if (!removeBackground) { chosen = part; break; }
+
+            try {
+                greenCheck = await measureGreenScreenImage(Buffer.from(part.inlineData.data, 'base64'));
+            } catch (err) {
+                console.warn('[Avatar] green-screen check failed:', err.message);
+                greenCheck = null;
             }
+            if (!greenCheck || greenCheck.isGreenScreen) { chosen = part; break; }
+            console.warn(
+                `[Avatar] attempt ${attempt}/${attempts}: only `
+                + `${(greenCheck.fraction * 100).toFixed(1)}% green, re-rolling`
+            );
+            // Keep the last one as a fallback rather than failing outright: a
+            // slightly imperfect key beats no avatar at all.
+            chosen = chosen || part;
+        }
+
+        if (chosen) {
+            const imageData = `data:${chosen.inlineData.mimeType};base64,${chosen.inlineData.data}`;
+            // Persist it: a generated avatar cannot be reproduced, and without a
+            // durable copy a restored project has no streamer and the Studio tab
+            // stays locked.
+            const gcsUri = await uploadImageToBucket({
+                base64: chosen.inlineData.data,
+                mimeType: chosen.inlineData.mimeType,
+                label: 'avatar',
+            });
+            return res.json({
+                imageData,
+                gcsUri,
+                ...(removeBackground ? {
+                    greenScreen: greenCheck
+                        ? { ok: greenCheck.isGreenScreen, fraction: greenCheck.fraction }
+                        : null,
+                } : {}),
+            });
         }
         res.status(500).json({ error: 'No image generated in response' });
     } catch (err) {

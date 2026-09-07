@@ -16,6 +16,7 @@ Every AI call runs server-side through Vertex AI with Application Default Creden
 - [The deploy script](#the-deploy-script)
 - [Upgrading an existing deployment](#upgrading-an-existing-deployment)
 - [Video generation models](#video-generation-models)
+- [Removing the streamer's background](#removing-the-streamers-background)
 - [Autopilot: batch production](#autopilot-batch-production)
 - [User workflow](#user-workflow)
 - [Project history](#project-history)
@@ -39,6 +40,7 @@ Every AI call runs server-side through Vertex AI with Application Default Creden
 | **Avatar generation** | `gemini-3.1-flash-image` renders the streamer at the exact aspect ratio the layout needs. You can supply a reference image to lock the character's look and only describe the pose. Every generated avatar is persisted to `gs://<bucket>/avatars/` and listed in the Avatar Lab so it can be reused without paying for a new generation. |
 | **Clip generation** | `gemini-omni-1.1-flash-preview` animates the avatar per shot, with speech. The model is not user-selectable: the server transparently falls back to `gemini-omni-flash-preview` (on quota) and to Veo 3.1 (on quota exhaustion or a content-safety block). Generate one take or two in parallel and pick the better one. Clips can chain from the previous clip's last frame for continuity. |
 | **Composition** | FFmpeg concatenates the clips server-side; the browser then composites the streamer over your gameplay as picture-in-picture, stacked, or streamer-only, with an audio mix slider. |
+| **Background removal** | Optional, picture-in-picture only. The streamer is generated on a green screen and keyed out, so the person sits directly on your gameplay with no webcam frame. |
 | **Burned-in subtitles** | Optional. Built from the script dialogue, rendered as ASS with size pinned to the real video dimensions, burned by FFmpeg onto the full frame (not the tiny PiP window). |
 | **Preview before download** | Every export can be played inline in the browser before you keep it. |
 | **Durable output** | Clips land in `gs://<bucket>/videos/`, finished renders in `gs://<bucket>/exports/YYYY/MM/`. |
@@ -156,6 +158,7 @@ gcloud beta iap web add-iam-policy-binding \
 | `AUTOPILOT_MAX_CLIPS_PER_JOB` | no | Cost breaker: refuses a job that would need more clips than this. Defaults to `60`. |
 | `AUTOPILOT_VEO_CLIP_BUDGET` | no | How many clips of one batch may fall through to pay-as-you-go Veo. Defaults to 25% of the batch, minimum 4. |
 | `AUTOPILOT_UPLOAD_MAX_BYTES` | no | Gameplay upload ceiling. Defaults to 250 MB. |
+| `GREENSCREEN_RETRIES` | no | Re-rolls allowed when an avatar comes back without a usable green screen (background removal only). Defaults to `2`. |
 
 Image uploads have their own fixed ceiling of 12 MB (PNG / JPEG / WebP).
 | `PORT` | no | Defaults to `8080`. |
@@ -414,6 +417,79 @@ The server turns that into an actionable message and points at the Veo fallback
 rather than surfacing a raw quota error.
 
 ---
+
+## Removing the streamer's background
+
+Optional and off by default. A checkbox on the Avatar tab (and in the Autopilot
+brief) turns the streamer into a cutout: no webcam frame, just the person over
+your gameplay.
+
+### Why it works the way it does
+
+**There is no alpha route.** The image model returns an RGB PNG even when a
+transparent background is explicitly requested (`colorType 2`, verified), and both
+video models output h264 `yuv420p`, which has no alpha channel at all. So the
+streamer is generated on a flat green field and keyed out at composite time.
+
+**The key is a ratio test, not a colour match.** Generated green fields are never
+flat — they carry the subject's lighting. One measured image ran from
+`rgb(1,123,2)` in a shadowed corner to `rgb(80,221,76)` at the top. `chromakey`
+measures distance to a single colour and leaves one end of that ramp behind; an
+absolute "green leads by N" test fails at the dark end for the same reason. The
+test used instead is `g > 1.5 × max(r, b)` with a brightness floor, which is
+scale-invariant and covers both ends.
+
+**Sampling a key colour from the corners does not work.** With head-and-shoulders
+framing the subject fills the bottom of the frame, so the bottom corners are not
+background — and in some generations the head fills the top. No fixed region is
+reliably background, which is why nothing is sampled: the ratio test needs no
+reference colour.
+
+### The validation gate
+
+The model does not honour the green-screen instruction every time, and an avatar
+with a real background would be punched full of holes by the key. So the image is
+measured before it is stored: if less than 25% of the frame reads as green, it is
+re-rolled (`GREENSCREEN_RETRIES`, default 2). If every attempt fails the last one
+is returned anyway — an imperfect key beats no streamer — but the UI says so
+rather than letting the problem surface in the export.
+
+Observed: a green-screen prompt passed first try at 71% green; a prompt asking for
+a lit room was correctly rejected three times in a row (0.2% / 0.1% / 0.0%).
+
+### Where it applies
+
+| Layout | Background removal |
+|---|---|
+| `classic-pip` | Available. The rounded corners, white stroke and drop shadow are dropped — a keyed person inside a webcam frame defeats the point |
+| `stacked` | Not offered: the streamer fills its whole slot, so keying would leave a hole |
+| `streamer-only` | Not offered: there is no gameplay to sit on |
+
+The flag is dropped server-side for the layouts where it cannot work, rather than
+silently honoured into a broken video.
+
+### Both compositors implement it
+
+The Studio composites in the browser and Autopilot in ffmpeg, so the same key
+lives in two places (`utils/videoUtils.ts` and `lib/compose.js`) using identical
+thresholds. If they drifted, one avatar would look different depending on which
+path produced the video. The browser version costs 1.57 ms per PiP-sized frame,
+about 21× inside the 30 fps budget, so a per-pixel pass is affordable.
+
+One difference from framed mode: when the streamer clip ends, nothing is drawn and
+the gameplay shows through. Filling black — which is right for a webcam box —
+would leave a hard rectangle on screen.
+
+### Known limits
+
+- **Green clothing or hair gets cut away.** The prompt forbids it and the negative
+  prompt reinforces it, but automatic validation cannot tell "the shirt was keyed
+  through" from "the background was keyed correctly". This one relies on the
+  prompt and on the user looking at the confirmation image.
+- Roughly 9 px of soft edge, an unavoidable consequence of `yuv420p` chroma
+  subsampling. Invisible at picture-in-picture size; it would show on a
+  full-height overlay.
+- Hair detail is approximate, as with any chroma key.
 
 ## Autopilot: batch production
 
@@ -886,7 +962,7 @@ utils/
   subtitles.ts             Shot list → SRT
 
 lib/
-  compose.js               Server-side ffmpeg compositor (port of the browser one)
+  compose.js               Server-side ffmpeg compositor + green-screen keying
   autopilot.js             Upload validation, Veo budget, bucket scoping
   autopilot-job.js         Job state machine (pure; includes the approval gate)
 

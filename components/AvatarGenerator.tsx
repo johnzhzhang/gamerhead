@@ -119,6 +119,7 @@ const AvatarGenerator: React.FC<AvatarGeneratorProps> = ({
   const [generatedImage, setGeneratedImage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [showCropAlert, setShowCropAlert] = useState(false);
   const [pendingReferenceImage, setPendingReferenceImage] = useState<string | null>(null);
 
@@ -130,23 +131,35 @@ const AvatarGenerator: React.FC<AvatarGeneratorProps> = ({
   }, [forcedAspectRatio, setConfig]);
 
   const handleGenerate = async () => {
-    if (!config.appearance || !config.setting) {
-      setError("Please describe both appearance and setting.");
+    // Cutout mode replaces the background entirely, so a setting is meaningless there.
+    if (!config.appearance || (!config.removeBackground && !config.setting)) {
+      setError(config.removeBackground
+        ? "Please describe the streamer's appearance."
+        : "Please describe both appearance and setting.");
       return;
     }
 
     setIsLoading(true);
     setError(null);
+    setNotice(null);
     setGeneratedImage(null);
 
     try {
-      const { imageData, gcsUri } = await generateStreamerAvatar({ ...config, gamingDevice });
+      const { imageData, gcsUri, greenScreen } = await generateStreamerAvatar({ ...config, gamingDevice });
       setGeneratedImage(imageData);
+      // The model does not always honour the green-screen instruction. Say so
+      // rather than letting the user discover a half-keyed streamer in the export.
+      if (config.removeBackground && greenScreen && !greenScreen.ok) {
+        setNotice(
+          'This image did not come back with a clean green screen, so the cutout may '
+          + 'leave edges behind. Try generating again, or simplify the appearance description.'
+        );
+      }
       if (onImageGenerated) onImageGenerated(imageData, gcsUri);
       if (gcsUri && onAvatarGenerated) {
         onAvatarGenerated({
           gcsUri,
-          prompt: `${config.appearance} · ${config.setting}`.slice(0, 500),
+          prompt: `${config.appearance}${config.removeBackground ? ' · cutout' : ` · ${config.setting}`}`.slice(0, 500),
           aspectRatio: config.aspectRatio,
           createdAt: Date.now(),
         });
@@ -309,15 +322,44 @@ const AvatarGenerator: React.FC<AvatarGeneratorProps> = ({
           </div>
 
           <div>
-            <label className="block text-sm font-bold text-gray-300 mb-2">Background Setting</label>
+            <label className="block text-sm font-bold text-gray-300 mb-2">
+              Background Setting
+              {config.removeBackground && (
+                <span className="ml-2 text-xs font-normal text-gray-500">not used in cutout mode</span>
+              )}
+            </label>
             <TextArea
               name="setting"
               value={config.setting}
               onCommit={handleConfigCommit}
-              placeholder="Dark futuristic gamer room"
+              disabled={config.removeBackground}
+              placeholder={config.removeBackground ? 'The streamer will have no background' : 'Dark futuristic gamer room'}
               rows={3}
-              className="w-full bg-[#2D2D2D] border border-gray-600 rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-google-blue focus:border-transparent outline-none transition-all resize-none placeholder-gray-500"
+              className="w-full bg-[#2D2D2D] border border-gray-600 rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-google-blue focus:border-transparent outline-none transition-all resize-none placeholder-gray-500 disabled:opacity-50"
             />
+          </div>
+
+          {/* Cutout mode. Only meaningful for picture-in-picture: stacked fills its
+              whole slot with the streamer, and streamer-only has nothing to sit on. */}
+          <div className="p-3 rounded-lg bg-[#2D2D2D] border border-gray-600">
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={!!config.removeBackground}
+                onChange={(e) => setConfig(prev => ({ ...prev, removeBackground: e.target.checked }))}
+                className="w-4 h-4 mt-0.5 accent-google-blue flex-shrink-0"
+              />
+              <span>
+                <span className="block text-sm font-bold text-gray-300">Remove the streamer's background</span>
+                <span className="block text-xs text-gray-500 mt-1">
+                  The streamer is generated on a green screen and keyed out, so they sit
+                  directly on your gameplay with no webcam frame. Picture-in-picture only.
+                </span>
+                <span className="block text-xs text-gray-500 mt-1">
+                  Avoid green clothing or hair — anything green gets cut away.
+                </span>
+              </span>
+            </label>
           </div>
 
           {/* Model Selection Removed */}
@@ -409,6 +451,13 @@ const AvatarGenerator: React.FC<AvatarGeneratorProps> = ({
           {error && (
             <div className="p-4 bg-red-900/20 border border-red-900/50 text-red-300 rounded-lg text-sm text-center">
               {error}
+            </div>
+          )}
+
+          {notice && (
+            <div className="p-4 bg-yellow-900/20 border border-yellow-900/50 text-google-yellow rounded-lg text-sm"
+                 role="status">
+              {notice}
             </div>
           )}
         </div>

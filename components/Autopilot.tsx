@@ -325,6 +325,7 @@ const Autopilot: React.FC = () => {
   const [pipPlacement, setPipPlacement] = useState<PipPlacement>('bottom-left');
   const [stackedPlacement, setStackedPlacement] = useState<StackedPlacement>('left');
   const [subtitles, setSubtitles] = useState(false);
+  const [removeBackground, setRemoveBackground] = useState(false);
   const [searchGrounding, setSearchGrounding] = useState(false);
   const [variantCount, setVariantCount] = useState(3);
   const [gameplayFile, setGameplayFile] = useState<File | null>(null);
@@ -442,6 +443,9 @@ const Autopilot: React.FC = () => {
   const imageAccept = (config?.allowedImageTypes || ['image/png', 'image/jpeg', 'image/webp']).join(',');
   // Grounding has nothing to search without a store page, so the toggle follows it.
   const groundingAvailable = brief.gameUrl.trim().length > 0;
+  // Keying only works in a picture-in-picture box: stacked fills its whole slot
+  // with the streamer, and streamer-only has no gameplay to sit on.
+  const cutoutAvailable = layoutType === 'classic-pip';
   const estimatedClips = variantCount * 4;
 
   // A streamer has to come from somewhere: either a description to generate from,
@@ -489,6 +493,7 @@ const Autopilot: React.FC = () => {
         pipPlacement,
         stackedPlacement,
         subtitles,
+        removeBackground: removeBackground && cutoutAvailable,
         searchGrounding: searchGrounding && groundingAvailable,
         variantCount,
         gameplayGcsUri,
@@ -507,7 +512,8 @@ const Autopilot: React.FC = () => {
   }, [
     needsGameplay, gameplayFile, refFile, ownFile, brief, gamingDevice, dialoguePacing,
     targetRatio, layoutType,
-    pipPlacement, stackedPlacement, subtitles, searchGrounding, groundingAvailable,
+    pipPlacement, stackedPlacement, subtitles, removeBackground, cutoutAvailable,
+    searchGrounding, groundingAvailable,
     variantCount, refreshJobs,
   ]);
 
@@ -736,6 +742,20 @@ const Autopilot: React.FC = () => {
                 <input type="checkbox" checked={subtitles} onChange={(e) => setSubtitles(e.target.checked)}
                        className="w-4 h-4 accent-google-blue" />
                 Burn in subtitles
+              </label>
+              <label className={`flex items-start gap-2 text-sm ${cutoutAvailable ? 'text-gray-300' : 'text-gray-500'}`}>
+                <input type="checkbox" checked={removeBackground && cutoutAvailable}
+                       disabled={!cutoutAvailable}
+                       onChange={(e) => setRemoveBackground(e.target.checked)}
+                       className="w-4 h-4 accent-google-blue mt-0.5" />
+                <span>
+                  Remove the streamer's background
+                  <span className="block text-[11px] text-gray-500">
+                    {cutoutAvailable
+                      ? 'The streamer sits directly on your gameplay with no webcam frame. Avoid green clothing — anything green gets cut away.'
+                      : 'Only available with the picture-in-picture layout.'}
+                  </span>
+                </span>
               </label>
               <label className={`flex items-start gap-2 text-sm ${groundingAvailable ? 'text-gray-300' : 'text-gray-500'}`}>
                 <input type="checkbox" checked={searchGrounding && groundingAvailable}

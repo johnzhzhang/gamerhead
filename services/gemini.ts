@@ -124,6 +124,12 @@ export const generateStreamerScript = async (
 export interface AvatarResult {
   imageData: string;
   gcsUri?: string;
+  /**
+   * Only present when background removal was requested. `ok: false` means the
+   * model would not produce a usable green screen even after re-rolls, so the key
+   * will be imperfect — worth telling the user rather than hiding.
+   */
+  greenScreen?: { ok: boolean; fraction: number } | null;
 }
 
 export const generateStreamerAvatar = async (config: AvatarConfig): Promise<AvatarResult> => {
@@ -146,7 +152,8 @@ export const generateStreamerAvatar = async (config: AvatarConfig): Promise<Avat
         model: config.model,
         aspectRatio: config.aspectRatio,
         referenceImageData,
-        referenceImageMime
+        referenceImageMime,
+        removeBackground: config.removeBackground || false
       })
     });
 
@@ -156,7 +163,7 @@ export const generateStreamerAvatar = async (config: AvatarConfig): Promise<Avat
       aspectRatio: config.aspectRatio,
       gcsUri: result.gcsUri,
     });
-    return { imageData: result.imageData, gcsUri: result.gcsUri };
+    return { imageData: result.imageData, gcsUri: result.gcsUri, greenScreen: result.greenScreen ?? null };
   } catch (error: any) {
     logEvent('image', config.model, 'failed', { error: error.message });
     throw error;

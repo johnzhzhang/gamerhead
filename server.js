@@ -2432,8 +2432,25 @@ const segmentsToSrt = (segments) => {
 const AVATAR_IMAGE_MODEL = process.env.AVATAR_MODEL || 'gemini-3.1-flash-image';
 
 /** Render one streamer image. Returns raw base64 (no data: prefix). */
-const generateAvatarImage = async ({ prompt, aspectRatio, referenceGcsUri }) => {
-    const parts = [{ text: prompt }];
+/**
+ * Appended when the streamer will be keyed out.
+ *
+ * There is no alpha route — the image model returns RGB PNG even when asked for
+ * transparency — so the background has to be a colour we can key. Green on the
+ * subject is banned because it would be cut away with the background.
+ */
+const GREEN_SCREEN_INSTRUCTION = [
+    '',
+    'BACKGROUND (CRITICAL):',
+    'The entire background must be one flat, uniform pure chroma-key green (#00FF00).',
+    'No gradient, no vignette, no lighting falloff, no shadows cast onto the background,',
+    'no props, no floor or wall lines. Nothing but green behind the subject.',
+    'Do NOT use any green, teal or lime colour on the subject — not on skin, hair,',
+    'clothing, headphones or accessories. Green on the subject will be cut away.',
+].join('\n');
+
+const generateAvatarImage = async ({ prompt, aspectRatio, referenceGcsUri, removeBackground = false }) => {
+    const parts = [{ text: removeBackground ? `${prompt}${GREEN_SCREEN_INSTRUCTION}` : prompt }];
     if (referenceGcsUri) {
         // A reference image is how the user pins the character's look; without it
         // every regeneration returns a different person.
@@ -2442,22 +2459,44 @@ const generateAvatarImage = async ({ prompt, aspectRatio, referenceGcsUri }) => 
     }
 
     const ai = getVertexAIGlobalClient();
-    const response = await ai.models.generateContent({
-        model: AVATAR_IMAGE_MODEL,
-        contents: [{ role: 'user', parts }],
-        config: {
-            temperature: 0.5,
-            responseModalities: ['IMAGE', 'TEXT'],
-            imageConfig: { aspectRatio: aspectRatio || '16:9', imageSize: '1K' },
-            safetySettings: SAFETY_SETTINGS_BLOCK_NONE,
-        },
-    });
+    // Same green-screen gate the interactive path applies: an avatar with a real
+    // background would be punched full of holes by the key, and in a batch that
+    // mistake is multiplied across every variant.
+    const attempts = removeBackground ? 1 + GREENSCREEN_RETRIES : 1;
+    let fallback = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        const response = await ai.models.generateContent({
+            model: AVATAR_IMAGE_MODEL,
+            contents: [{ role: 'user', parts }],
+            config: {
+                temperature: 0.5 + (attempt - 1) * 0.15,
+                responseModalities: ['IMAGE', 'TEXT'],
+                imageConfig: { aspectRatio: aspectRatio || '16:9', imageSize: '1K' },
+                safetySettings: SAFETY_SETTINGS_BLOCK_NONE,
+            },
+        });
 
-    for (const part of response.candidates?.[0]?.content?.parts || []) {
-        if (part.inlineData) {
-            return { imageData: part.inlineData.data, mimeType: part.inlineData.mimeType };
+        const part = (response.candidates?.[0]?.content?.parts || []).find((p) => p.inlineData);
+        if (!part) continue;
+        const out = { imageData: part.inlineData.data, mimeType: part.inlineData.mimeType };
+        if (!removeBackground) return out;
+
+        let check = null;
+        try {
+            check = await measureGreenScreenImage(Buffer.from(part.inlineData.data, 'base64'));
+        } catch (err) {
+            console.warn('[Autopilot] green-screen check failed:', err.message);
         }
+        if (!check || check.isGreenScreen) return { ...out, greenScreen: check };
+        console.warn(
+            `[Autopilot] avatar attempt ${attempt}/${attempts}: only `
+            + `${(check.fraction * 100).toFixed(1)}% green, re-rolling`
+        );
+        fallback = { ...out, greenScreen: check };
     }
+    // Better an imperfect key than no streamer at all; the gate shows the image so
+    // the user can regenerate before anything expensive runs.
+    if (fallback) return fallback;
     throw new Error('The image model returned no image');
 };
 
@@ -2743,6 +2782,7 @@ const deliverAutopilotVariant = async (job, variantIdx) => {
                 pipPlacement: job.spec.pipPlacement,
                 stackedPlacement: job.spec.stackedPlacement,
                 volumes: job.spec.volumes,
+                removeBackground: Boolean(job.spec.removeBackground),
             });
         } else {
             // Validation gate still applies: the concatenation must be playable.
@@ -2911,6 +2951,7 @@ const renderAvatarCandidates = async (job, count = 1) => {
             prompt: job.spec.avatarPrompt,
             aspectRatio: ratio,
             referenceGcsUri: job.spec.avatarRefGcsUri,
+            removeBackground: Boolean(job.spec.removeBackground),
         });
         const gcsUri = await uploadImageToBucket({
             base64: imageData,

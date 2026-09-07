@@ -669,3 +669,29 @@ test('the option sets match what the wizard offers', () => {
     ]);
     assert.deepStrictEqual(DIALOGUE_PACING, ['Slow', 'Normal', 'Fast']);
 });
+
+// ── background removal (cutout mode) ─────────────────────────────────────────
+
+test('cutout mode is kept for picture-in-picture', () => {
+    const r = validateJobSpec(goodSpec({ layoutType: 'classic-pip', removeBackground: true }), LIMITS);
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.spec.removeBackground, true);
+});
+
+test('cutout mode is dropped for layouts where it cannot work', () => {
+    // stacked fills its whole slot with the streamer, so keying would leave a hole;
+    // streamer-only has no gameplay to sit on. Silently honouring the flag there
+    // would produce a broken video instead of an obvious no-op.
+    for (const layout of ['stacked', 'streamer-only']) {
+        const spec = layout === 'streamer-only'
+            ? goodSpec({ layoutType: layout, removeBackground: true, gameplayGcsUri: undefined })
+            : goodSpec({ layoutType: layout, removeBackground: true, stackedPlacement: 'left' });
+        const r = validateJobSpec(spec, LIMITS);
+        assert.strictEqual(r.ok, true, `${layout} spec should still validate`);
+        assert.strictEqual(r.spec.removeBackground, false, `${layout} must not keep the flag`);
+    }
+});
+
+test('cutout mode defaults to off', () => {
+    assert.strictEqual(validateJobSpec(goodSpec(), LIMITS).spec.removeBackground, false);
+});

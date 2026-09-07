@@ -99,6 +99,8 @@ export interface AutopilotSubmitSpec {
   pipPlacement?: string;
   stackedPlacement?: string;
   subtitles?: boolean;
+  /** Key the streamer's own background away; picture-in-picture only. */
+  removeBackground?: boolean;
   /** Look the game up with Google Search; needs gameUrl to be set. */
   searchGrounding?: boolean;
   variantCount: number;

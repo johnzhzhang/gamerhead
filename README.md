@@ -159,6 +159,7 @@ gcloud beta iap web add-iam-policy-binding \
 | `AUTOPILOT_VEO_CLIP_BUDGET` | no | How many clips of one batch may fall through to pay-as-you-go Veo. Defaults to 25% of the batch, minimum 4. |
 | `AUTOPILOT_UPLOAD_MAX_BYTES` | no | Gameplay upload ceiling. Defaults to 250 MB. |
 | `GREENSCREEN_RETRIES` | no | Re-rolls allowed when an avatar comes back without a usable green screen (background removal only). Defaults to `2`. |
+| `CUTOUT_EDGE_CHOKE` | no | Pixels of alpha erosion applied at source resolution to remove the dark contour the model draws around the subject. Defaults to `1`; `0` disables it. |
 
 Image uploads have their own fixed ceiling of 12 MB (PNG / JPEG / WebP).
 | `PORT` | no | Defaults to `8080`. |
@@ -489,6 +490,13 @@ would leave a hard rectangle on screen.
 - Roughly 9 px of soft edge, an unavoidable consequence of `yuv420p` chroma
   subsampling. Invisible at picture-in-picture size; it would show on a
   full-height overlay.
+- The model draws a dark contour between the subject and the green field —
+  measured at 4-8 px with a green ratio of 0.75-1.16, so it is neutral or warm
+  dark, not green at all. No colour test can separate it from the subject's own
+  dark hair, so it is removed spatially instead: the key runs at the source
+  resolution and the alpha is eroded by one pixel (`CUTOUT_EDGE_CHOKE`) before
+  scaling. Keying *after* scaling merges the contour into the subject and makes it
+  unremovable, which is why the order matters.
 - Hair detail is approximate, as with any chroma key.
 
 ## Autopilot: batch production

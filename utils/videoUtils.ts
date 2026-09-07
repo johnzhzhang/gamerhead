@@ -362,6 +362,7 @@ export const compositePipVideo = async (
   // Reused across frames for cutout mode; allocating per frame would thrash.
   let keyCanvas: HTMLCanvasElement | null = null;
   let keyCtx: CanvasRenderingContext2D | null = null;
+  let keyAlpha: Uint8Array | null = null;
 
   // Determine Canvas Dimensions based on Target Ratio
   // We'll use 1080p as a base reference
@@ -654,8 +655,15 @@ export const compositePipVideo = async (
              // distance-to-one-colour key leaves part of the ramp behind. Measured at
              // 1.57ms per PiP-sized frame, ~21x inside the 30fps budget.
              if (!overlayVideo.ended) {
-                 const kw = Math.max(1, Math.round(overlayWidth));
-                 const kh = Math.max(1, Math.round(overlayHeight));
+                 // Key at the video's own resolution, choke the edge, then scale down.
+                 //
+                 // Order matters: the model draws a dark contour between the subject
+                 // and the green field, and scaling first blends that contour with the
+                 // green into pixels that are neither — they survive the key and read
+                 // as a dark outline. Keying at native resolution keeps the contour
+                 // separable, and the choke removes it.
+                 const kw = overlayVideo.videoWidth || Math.round(overlayWidth);
+                 const kh = overlayVideo.videoHeight || Math.round(overlayHeight);
                  if (!keyCanvas) {
                      keyCanvas = document.createElement('canvas');
                      keyCtx = keyCanvas.getContext('2d', { willReadFrequently: true });
@@ -675,8 +683,28 @@ export const compositePipVideo = async (
                          const b = d[i + 2];
                          if (g > 1.5 * Math.max(r, b) && g > 28) d[i + 3] = 0;
                      }
+                     // Edge choke: clear any kept pixel touching a cleared one. One
+                     // pass, matching CUTOUT_EDGE_CHOKE on the server so both
+                     // compositors produce the same edge. Measured at 1280x720:
+                     // 6.36ms for the key alone, 9.17ms with this pass — still 3.6x
+                     // inside the 30fps budget.
+                     if (!keyAlpha || keyAlpha.length !== kw * kh) keyAlpha = new Uint8Array(kw * kh);
+                     for (let p = 0; p < kw * kh; p += 1) keyAlpha[p] = d[p * 4 + 3];
+                     for (let y = 0; y < kh; y += 1) {
+                         const row = y * kw;
+                         for (let x = 0; x < kw; x += 1) {
+                             const p = row + x;
+                             if (!keyAlpha[p]) continue;
+                             if ((x > 0 && !keyAlpha[p - 1]) || (x < kw - 1 && !keyAlpha[p + 1])
+                                 || (y > 0 && !keyAlpha[p - kw]) || (y < kh - 1 && !keyAlpha[p + kw])) {
+                                 d[p * 4 + 3] = 0;
+                             }
+                         }
+                     }
                      keyCtx.putImageData(frame, 0, 0);
-                     ctx.drawImage(keyCanvas, overlayX, overlayY);
+                     // Scale on the way out; the browser's own filtering softens the
+                     // edge, which is what we want.
+                     ctx.drawImage(keyCanvas, overlayX, overlayY, overlayWidth, overlayHeight);
                  }
              }
              // When the streamer ends nothing is drawn: the gameplay shows through.

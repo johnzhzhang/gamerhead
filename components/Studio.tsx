@@ -492,6 +492,10 @@ const Studio: React.FC<StudioProps> = ({
               targetAspectRatio,
               pipPlacement,
               stackedPlacement,
+              undefined,
+              // The avatar was generated on a green screen, so the composite has to
+              // key it out — otherwise the export shows the green field.
+              Boolean(avatarConfig.removeBackground) && layoutType === 'classic-pip',
           );
           URL.revokeObjectURL(stitchedStreamerUrl);
 

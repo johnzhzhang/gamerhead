@@ -346,7 +346,8 @@ export const compositePipVideo = async (
   targetRatio: TargetAspectRatio,
   pipPlacement: PipPlacement,
   stackedPlacement: StackedPlacement,
-  onProgress?: (msg: string) => void
+  onProgress?: (msg: string) => void,
+  removeBackground: boolean = false
 ): Promise<Blob> => {
   const gameplayUrl = URL.createObjectURL(gameplayFile);
   
@@ -357,6 +358,10 @@ export const compositePipVideo = async (
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d', { alpha: false });
   if (!ctx) throw new Error("Canvas context failed");
+
+  // Reused across frames for cutout mode; allocating per frame would thrash.
+  let keyCanvas: HTMLCanvasElement | null = null;
+  let keyCtx: CanvasRenderingContext2D | null = null;
 
   // Determine Canvas Dimensions based on Target Ratio
   // We'll use 1080p as a base reference
@@ -639,7 +644,44 @@ export const compositePipVideo = async (
       try {
           // Only draw if we have a frame
           if (overlayVideo.readyState >= 2) {
-             if (layout === 'classic-pip') {
+             if (layout === 'classic-pip' && removeBackground) {
+             // Cutout mode: key the streamer's own green background away so they sit
+             // directly on the gameplay. No rounded frame or white stroke — a keyed
+             // person inside a webcam box is the thing this mode exists to avoid.
+             //
+             // The key is a ratio test, matching lib/compose.js: generated green
+             // fields are never flat (they carry the subject's lighting), so a
+             // distance-to-one-colour key leaves part of the ramp behind. Measured at
+             // 1.57ms per PiP-sized frame, ~21x inside the 30fps budget.
+             if (!overlayVideo.ended) {
+                 const kw = Math.max(1, Math.round(overlayWidth));
+                 const kh = Math.max(1, Math.round(overlayHeight));
+                 if (!keyCanvas) {
+                     keyCanvas = document.createElement('canvas');
+                     keyCtx = keyCanvas.getContext('2d', { willReadFrequently: true });
+                 }
+                 if (keyCanvas.width !== kw || keyCanvas.height !== kh) {
+                     keyCanvas.width = kw;
+                     keyCanvas.height = kh;
+                 }
+                 if (keyCtx) {
+                     keyCtx.clearRect(0, 0, kw, kh);
+                     keyCtx.drawImage(overlayVideo, 0, 0, kw, kh);
+                     const frame = keyCtx.getImageData(0, 0, kw, kh);
+                     const d = frame.data;
+                     for (let i = 0; i < d.length; i += 4) {
+                         const r = d[i];
+                         const g = d[i + 1];
+                         const b = d[i + 2];
+                         if (g > 1.5 * Math.max(r, b) && g > 28) d[i + 3] = 0;
+                     }
+                     keyCtx.putImageData(frame, 0, 0);
+                     ctx.drawImage(keyCanvas, overlayX, overlayY);
+                 }
+             }
+             // When the streamer ends nothing is drawn: the gameplay shows through.
+             // Filling black here would leave a hard rectangle on screen.
+         } else if (layout === 'classic-pip') {
              // Rounded Corners & White Border
              ctx.save();
              

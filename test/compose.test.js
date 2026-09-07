@@ -24,7 +24,7 @@ import {
     coverBox,
     probeMedia,
     composeVideo,
-    sampleBackgroundColour,
+    measureGreenScreen,
     constants,
 } from '../lib/compose.js';
 
@@ -404,19 +404,40 @@ const makeGreenScreenClip = async (name, {
     return file;
 };
 
-test('sampleBackgroundColour finds the key colour and flags green', async () => {
+test('measureGreenScreen recognises a green-screen clip', async () => {
     const clip = await makeGreenScreenClip('key-probe.mp4');
-    const s = await sampleBackgroundColour(clip);
-    assert.strictEqual(s.greenDominant, true, `corners should read as green, got rgb(${s.r},${s.g},${s.b})`);
-    assert.ok(s.g > s.r + 40 && s.g > s.b + 40);
-    assert.match(s.hex, /^0x[0-9A-F]{6}$/);
-    assert.ok(s.spread < 12, `a synthetic flat field should be uniform, got ${s.spread.toFixed(1)}`);
+    const m = await measureGreenScreen(clip);
+    assert.strictEqual(m.isGreenScreen, true, `expected a green screen, got ${(m.fraction * 100).toFixed(1)}%`);
+    // The synthetic clip is a green field with a subject block covering a sixth of
+    // the area, so most of the frame must read as green.
+    assert.ok(m.fraction > 0.5, `green fraction ${m.fraction.toFixed(2)} is too low`);
 });
 
-test('sampleBackgroundColour reports non-green footage rather than guessing', async () => {
+test('measureGreenScreen rejects footage that is not a green screen', async () => {
     const clip = await makeClip('notgreen.mp4', { color: 'blue', width: 640, height: 360, seconds: 2, freq: 300 });
-    const s = await sampleBackgroundColour(clip);
-    assert.strictEqual(s.greenDominant, false);
+    const m = await measureGreenScreen(clip);
+    assert.strictEqual(m.isGreenScreen, false);
+    assert.ok(m.fraction < 0.05);
+});
+
+test('the key is scale-invariant, so a shaded green field still keys', async () => {
+    // The real failure mode: generated backgrounds carry the subject's lighting, so
+    // the field ramps from near-black green to bright green. A distance-to-one-colour
+    // key leaves one end behind; a ratio test must not.
+    const dark = path.join(TMP, 'darkgreen.mp4');
+    await run('ffmpeg', ['-hide_banner', '-y',
+        '-f', 'lavfi', '-i', 'color=c=0x017B02:s=640x360:r=30:d=2',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', dark]);
+    const bright = path.join(TMP, 'brightgreen.mp4');
+    await run('ffmpeg', ['-hide_banner', '-y',
+        '-f', 'lavfi', '-i', 'color=c=0x50DD4C:s=640x360:r=30:d=2',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', bright]);
+
+    for (const [label, file] of [['shadowed', dark], ['bright', bright]]) {
+        const m = await measureGreenScreen(file);
+        assert.strictEqual(m.isGreenScreen, true,
+            `${label} green should still be recognised, got ${(m.fraction * 100).toFixed(1)}%`);
+    }
 });
 
 test('cutout mode removes the streamer background and keeps the subject', async () => {
@@ -430,8 +451,8 @@ test('cutout mode removes the streamer background and keeps the subject', async 
         removeBackground: true,
     });
 
-    assert.ok(result.key, 'the sampled key colour is reported back');
-    assert.strictEqual(result.key.greenDominant, true);
+    assert.ok(result.key, 'the green-screen measurement is reported back');
+    assert.strictEqual(result.key.isGreenScreen, true);
 
     const { streamer: box } = result.geometry;
     // Centre of the PiP box is the subject block → must survive the key.

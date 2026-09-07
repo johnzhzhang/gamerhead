@@ -145,6 +145,18 @@ export const constructAvatarPrompt = (config: AvatarConfig): string => {
         }
     }
 
+    // Background removal has no alpha route: the image model returns RGB PNG even
+    // when transparency is requested, and the video models output yuv420p. So the
+    // streamer is generated on a flat green field and keyed out at composite time.
+    // Anything green on the subject would be punched through, hence the explicit ban.
+    const backgroundBlock = config.removeBackground
+        ? `- Setting: NONE. The entire background must be one perfectly flat, uniform pure
+  chroma-key green (#00FF00). No gradient, no vignette, no lighting falloff, no
+  shadows cast onto the background, no props, no floor or wall lines.
+- CRITICAL: do NOT use any green, teal or lime colour on the subject — not on skin,
+  hair, clothing, headphones or accessories. Green on the subject will be cut away.`
+        : `- Setting: ${config.setting} (Background must be out of focus/depth of field).`;
+
     return `
 Generate ${hasRef ? "an" : "a photorealistic"} image of a live streamer.
 
@@ -165,10 +177,10 @@ ${gazeInstruction}
 
 SUBJECT:
 - Appearance: ${config.appearance}
-- Setting: ${config.setting} (Background must be out of focus/depth of field).${deviceInstruction}
+${backgroundBlock}${deviceInstruction}
 
 NEGATIVE PROMPT (DO NOT INCLUDE):
-- Text, overlays, UI, HUDs, watermarks, microphones covering the face, headphones covering the eyes${negativeExtra}.
+- Text, overlays, UI, HUDs, watermarks, microphones covering the face, headphones covering the eyes${negativeExtra}${config.removeBackground ? ', any background scenery, room, furniture, window, gradient background, green clothing, green hair' : ''}.
 `;
 };
 

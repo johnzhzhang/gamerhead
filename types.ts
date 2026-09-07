@@ -57,6 +57,11 @@ export interface ScriptResult {
 export interface AvatarConfig {
   appearance: string;
   setting: string;
+  /**
+   * Generate the streamer on a flat green field so the compositor can key the
+   * background away. Makes `setting` irrelevant.
+   */
+  removeBackground?: boolean;
   aspectRatio: '16:9' | '9:16';
   referenceImage?: string; // Base64 string — never persisted
   /** gs:// URI of the reference image, so it survives a project restore. */

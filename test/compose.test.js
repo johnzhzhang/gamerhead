@@ -24,6 +24,7 @@ import {
     coverBox,
     probeMedia,
     composeVideo,
+    sampleBackgroundColour,
     constants,
 } from '../lib/compose.js';
 
@@ -376,4 +377,143 @@ test('probeMedia reports dimensions, duration and audio', async () => {
     assert.strictEqual(meta.height, 480);
     assert.ok(meta.hasAudio);
     near(meta.duration, 3, 0.3, 'probed duration');
+});
+
+// ── background removal (cutout mode) ─────────────────────────────────────────
+// There is no alpha route: the image model returns RGB PNG even when asked for
+// transparency, and the video models output h264 yuv420p. So the streamer is
+// generated on flat green and keyed here. These tests use synthetic green-screen
+// footage and then sample the composite, which is the only way to show that the
+// background really went away and the subject really survived.
+
+/** A "streamer" clip: solid subject block centred on a flat green field. */
+const makeGreenScreenClip = async (name, {
+    green = '0x14E016', subject = 'red', width = 1280, height = 720, seconds = 4,
+} = {}) => {
+    const file = path.join(TMP, name);
+    await run('ffmpeg', [
+        '-hide_banner', '-y',
+        '-f', 'lavfi', '-i', `color=c=${green}:s=${width}x${height}:r=30:d=${seconds}`,
+        '-f', 'lavfi', '-i', `color=c=${subject}:s=${Math.round(width / 3)}x${Math.round(height / 2)}:r=30:d=${seconds}`,
+        '-f', 'lavfi', '-i', `sine=frequency=660:duration=${seconds}`,
+        '-filter_complex', '[0:v][1:v]overlay=x=(W-w)/2:y=(H-h)/2[v]',
+        '-map', '[v]', '-map', '2:a',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-shortest', file,
+    ]);
+    return file;
+};
+
+test('sampleBackgroundColour finds the key colour and flags green', async () => {
+    const clip = await makeGreenScreenClip('key-probe.mp4');
+    const s = await sampleBackgroundColour(clip);
+    assert.strictEqual(s.greenDominant, true, `corners should read as green, got rgb(${s.r},${s.g},${s.b})`);
+    assert.ok(s.g > s.r + 40 && s.g > s.b + 40);
+    assert.match(s.hex, /^0x[0-9A-F]{6}$/);
+    assert.ok(s.spread < 12, `a synthetic flat field should be uniform, got ${s.spread.toFixed(1)}`);
+});
+
+test('sampleBackgroundColour reports non-green footage rather than guessing', async () => {
+    const clip = await makeClip('notgreen.mp4', { color: 'blue', width: 640, height: 360, seconds: 2, freq: 300 });
+    const s = await sampleBackgroundColour(clip);
+    assert.strictEqual(s.greenDominant, false);
+});
+
+test('cutout mode removes the streamer background and keeps the subject', async () => {
+    const gameplay = await makeClip('cut-gp.mp4', { color: 'blue', width: 1280, height: 720, seconds: 5, freq: 220 });
+    const streamer = await makeGreenScreenClip('cut-st.mp4');
+    const out = path.join(TMP, 'cutout.mp4');
+
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
+        removeBackground: true,
+    });
+
+    assert.ok(result.key, 'the sampled key colour is reported back');
+    assert.strictEqual(result.key.greenDominant, true);
+
+    const { streamer: box } = result.geometry;
+    // Centre of the PiP box is the subject block → must survive the key.
+    assertColour(
+        await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2),
+        RED, 'subject survives the key'
+    );
+    // Just inside the box corner is green field → must be keyed away, revealing
+    // the gameplay underneath.
+    assertColour(
+        await samplePixel(out, box.x + 4, box.y + 4),
+        [0, 0, 255], 'streamer background is keyed out, gameplay shows through', 60
+    );
+});
+
+test('cutout mode draws no webcam frame around the streamer', async () => {
+    const gameplay = await makeClip('nf-gp.mp4', { color: 'blue', width: 1280, height: 720, seconds: 4, freq: 220 });
+    const streamer = await makeGreenScreenClip('nf-st.mp4');
+    const out = path.join(TMP, 'noframe.mp4');
+
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
+        removeBackground: true,
+    });
+    const { streamer: box } = result.geometry;
+
+    // The framed mode paints a white stroke here. A keyed cutout must not: a
+    // person inside a webcam frame is the thing this mode exists to avoid.
+    const edge = await samplePixel(out, box.x + box.w / 2, box.y + 1);
+    const isWhite = edge[0] > 150 && edge[1] > 150 && edge[2] > 150;
+    assert.ok(!isWhite, `no white border expected in cutout mode, got rgb(${edge.join(',')})`);
+});
+
+test('cutout mode refuses footage that is not a green screen', async () => {
+    const gameplay = await makeClip('bad-gp.mp4', { color: 'blue', width: 1280, height: 720, seconds: 3, freq: 220 });
+    // A normal avatar clip with a real background: keying it would punch holes in
+    // the picture, so this has to fail loudly instead of producing a mess.
+    const streamer = await makeClip('bad-st.mp4', { color: 'orange', width: 1280, height: 720, seconds: 3, freq: 660 });
+    await assert.rejects(
+        () => composeVideo({
+            gameplayPath: gameplay, streamerPath: streamer,
+            outputPath: path.join(TMP, 'bad.mp4'),
+            layout: 'classic-pip', targetRatio: '16:9',
+            removeBackground: true,
+        }),
+        /needs a green-screen streamer clip/
+    );
+});
+
+test('background removal is ignored for layouts where it makes no sense', async () => {
+    // stacked fills its whole slot with the streamer; keying would leave a hole.
+    const gameplay = await makeClip('st-gp.mp4', { color: 'blue', width: 1280, height: 720, seconds: 3, freq: 220 });
+    const streamer = await makeGreenScreenClip('st-st.mp4', { width: 720, height: 1280 });
+    const out = path.join(TMP, 'stacked-nokey.mp4');
+
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'stacked', targetRatio: '16:9', stackedPlacement: 'left',
+        removeBackground: true,
+    });
+    assert.strictEqual(result.key, null, 'no keying is attempted outside classic-pip');
+    // The slot still shows the streamer's green field, unkeyed.
+    const split = 1920 * constants.STACK_SPLIT_16_9;
+    const px = await samplePixel(out, split / 2, 200);
+    assert.ok(px[1] > px[0] + 40 && px[1] > px[2] + 40,
+        `stacked slot should keep its background, got rgb(${px.join(',')})`);
+});
+
+test('framed mode is untouched by the new option', async () => {
+    const gameplay = await makeClip('fr-gp.mp4', { color: 'red', width: 1280, height: 720, seconds: 4, freq: 220 });
+    const streamer = await makeClip('fr-st.mp4', { color: 'blue', width: 1280, height: 720, seconds: 4, freq: 660 });
+    const out = path.join(TMP, 'framed.mp4');
+
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
+        // default: removeBackground not set
+    });
+    assert.strictEqual(result.key, null);
+    const { streamer: box } = result.geometry;
+    const edge = await samplePixel(out, box.x + box.w / 2, box.y + 1);
+    assert.ok(edge[0] > 150 && edge[1] > 150 && edge[2] > 150,
+        'the white webcam border still renders when background removal is off');
 });

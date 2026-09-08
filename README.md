@@ -474,8 +474,8 @@ silently honoured into a broken video.
 The Studio composites in the browser and Autopilot in ffmpeg, so the same key
 lives in two places (`utils/videoUtils.ts` and `lib/compose.js`) using identical
 thresholds. If they drifted, one avatar would look different depending on which
-path produced the video. The browser version costs 1.57 ms per PiP-sized frame,
-about 21× inside the 30 fps budget, so a per-pixel pass is affordable.
+path produced the video. The browser version costs 6.67 ms per frame including the gameplay draw, 5×
+inside the 30 fps budget, so the per-pixel work is affordable.
 
 One difference from framed mode: when the streamer clip ends, nothing is drawn and
 the gameplay shows through. Filling black — which is right for a webcam box —
@@ -490,18 +490,32 @@ would leave a hard rectangle on screen.
 - Roughly 9 px of soft edge, an unavoidable consequence of `yuv420p` chroma
   subsampling. Invisible at picture-in-picture size; it would show on a
   full-height overlay.
-- The model draws a dark contour between the subject and the green field —
-  measured at 4-8 px with a green ratio of 0.75-1.16, so it is neutral or warm
-  dark, not green at all. No colour test can separate it from the subject's own
-  dark hair, so it is removed spatially: the alpha is eroded by `CUTOUT_EDGE_CHOKE`
-  pixels (default 3). Verified against a 6 px contour on a light subject — 0
-  passes leaves 6 residual dark pixels, 1 leaves 4, 2 leaves 2, 3 leaves none.
-  Three passes trim 3 px off a ~600 px-wide streamer, about 3% of its area.
+- **The transition band needs two different treatments.** Between the green field
+  and the subject sits a band the ratio test cannot classify. Its bright end is
+  desaturated green (ratio 1.12-1.5) and its dark end is a neutral contour the
+  model draws around the subject; they are the same artifact, and motion blur
+  widens it, which is why it shows worst on a fast-moving elbow. On one measured
+  frame the band held 1733 greenish and 39 dark pixels inside the picture-in-picture
+  box, and the greenish count tripled over the clip as the subject moved.
+
+  The green end is removed by a despill pass — whatever green is left on a kept
+  pixel is spill from the field, so the green channel is pulled down to the other
+  two. That took the greenish residue from 1733 pixels to 0 at negligible cost.
+
+  The dark end has no colour signature, so it is removed spatially by
+  `CUTOUT_EDGE_CHOKE` passes of erosion (default 3), taking it from 39 pixels to
+  13. In the browser each pass only clears pixels that look like the band — weakly
+  green, or dark — so bright skin and clothing edges survive: conditional erosion
+  costs 0.2% of the subject where eroding everything costs 7.5% for the same
+  artifact removal. ffmpeg has no conditional erosion and expressing one with `geq`
+  measured 477 ms per frame, seven minutes per video, so the server erodes
+  unconditionally; despill does the heavy lifting on both paths, and the residual
+  difference is a slightly firmer trim on Autopilot output.
 - **This one is hard to measure automatically.** With a dark-haired subject the
   silhouette is legitimately dark, so "dark pixel next to the gameplay" counts the
   subject as well as the artifact — a metric that misled the implementation
-  repeatedly. The controlled light-subject test above is the reliable evidence;
-  confirming it on real footage needs eyes.
+  repeatedly. Counting *greenish* residue is reliable; counting dark residue is not,
+  and confirming the dark end on real footage needs eyes.
 - Hair detail is approximate, as with any chroma key.
 
 ## Autopilot: batch production

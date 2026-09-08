@@ -7,6 +7,14 @@ import { LayoutType, TargetAspectRatio, PipPlacement, StackedPlacement } from '.
  */
 
 // Helper to create an off-screen container for videos
+/**
+ * Pixels of alpha erosion used to remove the dark contour the model draws between
+ * the subject and the green field. Must match CUTOUT_EDGE_CHOKE on the server, or
+ * the same avatar would get a different silhouette depending on which compositor
+ * produced the video.
+ */
+const CUTOUT_EDGE_CHOKE = 3;
+
 const getHiddenContainer = () => {
     let container = document.getElementById('video-processing-container');
     if (!container) {
@@ -655,15 +663,22 @@ export const compositePipVideo = async (
              // distance-to-one-colour key leaves part of the ramp behind. Measured at
              // 1.57ms per PiP-sized frame, ~21x inside the 30fps budget.
              if (!overlayVideo.ended) {
-                 // Key at the video's own resolution, choke the edge, then scale down.
+                 // Key and choke at the picture-in-picture size, then draw 1:1.
                  //
-                 // Order matters: the model draws a dark contour between the subject
-                 // and the green field, and scaling first blends that contour with the
-                 // green into pixels that are neither — they survive the key and read
-                 // as a dark outline. Keying at native resolution keeps the contour
-                 // separable, and the choke removes it.
-                 const kw = overlayVideo.videoWidth || Math.round(overlayWidth);
-                 const kh = overlayVideo.videoHeight || Math.round(overlayHeight);
+                 // The model draws a dark contour between the subject and the green
+                 // field — measured at 4-8px in the source, which survives the key
+                 // because it is neutral dark, not green. Only a spatial operation
+                 // removes it, and erosion does not care whether a pixel is contour
+                 // or the subject's own dark hair: it just trims the silhouette.
+                 //
+                 // Doing this at PiP size rather than the video's native resolution
+                 // is ~4x cheaper for the same result. Measured with a 6px contour:
+                 // 3 passes leave zero residual dark pixels at 5.12ms per frame
+                 // (6.5x inside the 30fps budget); at native resolution the same
+                 // quality cost 19.95ms, only 1.67x — too tight once the background
+                 // draw and the encoder are added.
+                 const kw = Math.max(1, Math.round(overlayWidth));
+                 const kh = Math.max(1, Math.round(overlayHeight));
                  if (!keyCanvas) {
                      keyCanvas = document.createElement('canvas');
                      keyCtx = keyCanvas.getContext('2d', { willReadFrequently: true });
@@ -683,28 +698,26 @@ export const compositePipVideo = async (
                          const b = d[i + 2];
                          if (g > 1.5 * Math.max(r, b) && g > 28) d[i + 3] = 0;
                      }
-                     // Edge choke: clear any kept pixel touching a cleared one. One
-                     // pass, matching CUTOUT_EDGE_CHOKE on the server so both
-                     // compositors produce the same edge. Measured at 1280x720:
-                     // 6.36ms for the key alone, 9.17ms with this pass — still 3.6x
-                     // inside the 30fps budget.
-                     if (!keyAlpha || keyAlpha.length !== kw * kh) keyAlpha = new Uint8Array(kw * kh);
-                     for (let p = 0; p < kw * kh; p += 1) keyAlpha[p] = d[p * 4 + 3];
-                     for (let y = 0; y < kh; y += 1) {
-                         const row = y * kw;
-                         for (let x = 0; x < kw; x += 1) {
-                             const p = row + x;
-                             if (!keyAlpha[p]) continue;
-                             if ((x > 0 && !keyAlpha[p - 1]) || (x < kw - 1 && !keyAlpha[p + 1])
-                                 || (y > 0 && !keyAlpha[p - kw]) || (y < kh - 1 && !keyAlpha[p + kw])) {
-                                 d[p * 4 + 3] = 0;
+                     // Edge choke. CUTOUT_EDGE_CHOKE passes, matching the server so
+                     // both compositors produce the same silhouette.
+                     const n = kw * kh;
+                     if (!keyAlpha || keyAlpha.length !== n) keyAlpha = new Uint8Array(n);
+                     for (let pass = 0; pass < CUTOUT_EDGE_CHOKE; pass += 1) {
+                         for (let p = 0; p < n; p += 1) keyAlpha[p] = d[p * 4 + 3];
+                         for (let y = 0; y < kh; y += 1) {
+                             const row = y * kw;
+                             for (let x = 0; x < kw; x += 1) {
+                                 const p = row + x;
+                                 if (!keyAlpha[p]) continue;
+                                 if ((x > 0 && !keyAlpha[p - 1]) || (x < kw - 1 && !keyAlpha[p + 1])
+                                     || (y > 0 && !keyAlpha[p - kw]) || (y < kh - 1 && !keyAlpha[p + kw])) {
+                                     d[p * 4 + 3] = 0;
+                                 }
                              }
                          }
                      }
                      keyCtx.putImageData(frame, 0, 0);
-                     // Scale on the way out; the browser's own filtering softens the
-                     // edge, which is what we want.
-                     ctx.drawImage(keyCanvas, overlayX, overlayY, overlayWidth, overlayHeight);
+                     ctx.drawImage(keyCanvas, overlayX, overlayY);
                  }
              }
              // When the streamer ends nothing is drawn: the gameplay shows through.

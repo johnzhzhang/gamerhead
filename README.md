@@ -159,7 +159,7 @@ gcloud beta iap web add-iam-policy-binding \
 | `AUTOPILOT_VEO_CLIP_BUDGET` | no | How many clips of one batch may fall through to pay-as-you-go Veo. Defaults to 25% of the batch, minimum 4. |
 | `AUTOPILOT_UPLOAD_MAX_BYTES` | no | Gameplay upload ceiling. Defaults to 250 MB. |
 | `GREENSCREEN_RETRIES` | no | Re-rolls allowed when an avatar comes back without a usable green screen (background removal only). Defaults to `2`. |
-| `CUTOUT_EDGE_CHOKE` | no | Pixels of alpha erosion applied at source resolution to remove the dark contour the model draws around the subject. Defaults to `1`; `0` disables it. |
+| `CUTOUT_EDGE_CHOKE` | no | Pixels of alpha erosion applied to remove the dark contour the model draws around the subject. Defaults to `3`; `0` disables it. |
 
 Image uploads have their own fixed ceiling of 12 MB (PNG / JPEG / WebP).
 | `PORT` | no | Defaults to `8080`. |
@@ -493,10 +493,15 @@ would leave a hard rectangle on screen.
 - The model draws a dark contour between the subject and the green field —
   measured at 4-8 px with a green ratio of 0.75-1.16, so it is neutral or warm
   dark, not green at all. No colour test can separate it from the subject's own
-  dark hair, so it is removed spatially instead: the key runs at the source
-  resolution and the alpha is eroded by one pixel (`CUTOUT_EDGE_CHOKE`) before
-  scaling. Keying *after* scaling merges the contour into the subject and makes it
-  unremovable, which is why the order matters.
+  dark hair, so it is removed spatially: the alpha is eroded by `CUTOUT_EDGE_CHOKE`
+  pixels (default 3). Verified against a 6 px contour on a light subject — 0
+  passes leaves 6 residual dark pixels, 1 leaves 4, 2 leaves 2, 3 leaves none.
+  Three passes trim 3 px off a ~600 px-wide streamer, about 3% of its area.
+- **This one is hard to measure automatically.** With a dark-haired subject the
+  silhouette is legitimately dark, so "dark pixel next to the gameplay" counts the
+  subject as well as the artifact — a metric that misled the implementation
+  repeatedly. The controlled light-subject test above is the reliable evidence;
+  confirming it on real footage needs eyes.
 - Hair detail is approximate, as with any chroma key.
 
 ## Autopilot: batch production

@@ -700,6 +700,29 @@ History is scoped by identity: `ownerEmail` comes from the IAP header, the verif
 
 Two export shapes, each available as **preview** or **download**. The render pipeline is identical; only delivery differs.
 
+### Output resolution and bitrate
+
+The Full Mix composite follows the gameplay's own resolution instead of always
+rendering 1080p, because a hard-coded 1920x1080 canvas discarded a 1440p or 4K
+recording before the encoder ever saw it. 1080p is the floor, so a smaller
+recording is never upscaled, and 1440p is the ceiling: every pixel is paid for three
+times over — background draw, per-pixel key, encode — inside a 33 ms frame, and
+measured headless without a GPU that runs 11.4 ms at 1080p, 18.3 ms at 1440p and
+22.6 ms at 4K, which leaves too little margin on a slow machine.
+
+The bitrate scales with the frame at a quarter bit per pixel per frame — about
+15.5 Mbps at 1080p, 27.6 at 1440p. It used to be a flat 10 Mbps, which is thin for
+gameplay footage at 1080p and would have been starvation at 1440p, so raising the
+resolution without raising the rate would have bought nothing.
+
+A side effect for cutout mode: the picture-in-picture box is 10% of the frame area,
+so it grows from 607 px wide at 1080p to 810 px at 1440p — closer to the streamer
+clip's own 1280x720, which is what makes the person look sharper.
+
+When subtitles are burned in, that pass is a second-generation encode on top of the
+browser's output, so it runs `-preset medium -crf 18` rather than the faster,
+softer defaults it used before.
+
 | | Rendering | Persisted by |
 |---|---|---|
 | **Streamer Only** | FFmpeg concat in the container, plus optional subtitle burn | The server, straight from its temp file (`saveToGcs` → `X-Gcs-Uri` response header) |

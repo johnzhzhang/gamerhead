@@ -2004,8 +2004,11 @@ const burnSrtIntoVideo = async (inputPath, srt, tmpDir, outputName = 'final.mp4'
         '-i', inputPath,
         '-vf', filterArg,
         '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-crf', '20',
+        // A second-generation encode on top of whatever the browser's MediaRecorder
+        // produced, so it has to be gentler than the defaults or it visibly softens the
+        // picture a second time.
+        '-preset', 'medium',
+        '-crf', '18',
         '-c:a', 'copy',
         '-movflags', '+faststart',
         '-y',

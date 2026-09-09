@@ -607,18 +607,6 @@ const GameHeads: React.FC<{
                 >
                     Avatar
                 </button>
-                {autopilotEnabled && (
-                <button
-                    onClick={() => setActiveTab('autopilot')}
-                    className={`px-5 py-1.5 rounded-full text-sm font-medium transition-all whitespace-nowrap ${
-                        activeTab === 'autopilot'
-                        ? 'bg-gray-600 text-white shadow-sm'
-                        : 'text-gray-400 hover:text-gray-200'
-                    }`}
-                >
-                    Autopilot
-                </button>
-                )}
                 <button
                     onClick={() => setActiveTab('studio')}
                     className={`px-5 py-1.5 rounded-full text-sm font-medium transition-all whitespace-nowrap flex items-center gap-2 ${
@@ -632,6 +620,18 @@ const GameHeads: React.FC<{
                         <span className="ml-1 text-[10px] bg-gray-800 text-gray-400 px-1.5 py-0.5 rounded font-bold border border-gray-600">LOCKED</span>
                     )}
                 </button>
+                {autopilotEnabled && (
+                <button
+                    onClick={() => setActiveTab('autopilot')}
+                    className={`px-5 py-1.5 rounded-full text-sm font-medium transition-all whitespace-nowrap ${
+                        activeTab === 'autopilot'
+                        ? 'bg-gray-600 text-white shadow-sm'
+                        : 'text-gray-400 hover:text-gray-200'
+                    }`}
+                >
+                    Autopilot
+                </button>
+                )}
              </div>
             )}
             
@@ -731,12 +731,6 @@ const GameHeads: React.FC<{
                 />
                 </div>
 
-                {autopilotEnabled && activeTab === 'autopilot' && (
-                  <div className="animate-fade-in min-h-[calc(100vh-9rem)]">
-                    <Autopilot />
-                  </div>
-                )}
-
                 <div className={`${activeTab === 'studio' ? 'block' : 'hidden'} animate-fade-in min-h-[calc(100vh-9rem)]`}>
                     {isStudioUnlocked ? (
                         <Studio 
@@ -767,6 +761,12 @@ const GameHeads: React.FC<{
                         </div>
                     )}
                 </div>
+
+                {autopilotEnabled && activeTab === 'autopilot' && (
+                  <div className="animate-fade-in min-h-[calc(100vh-9rem)]">
+                    <Autopilot />
+                  </div>
+                )}
             </>
         )}
 

@@ -658,7 +658,10 @@ effectiveness:
 
 ## User workflow
 
-The UI is a three-step wizard followed by two working tabs.
+The UI is a three-step wizard followed by two working tabs. Tab order is Project
+Details → Avatar → Studio → Autopilot: Autopilot sits last because it is the
+alternative to the wizard rather than a step inside it, so it does not interrupt the
+left-to-right reading of the three steps that lead to the Studio.
 
 **Project Details** — Step 1 picks the aspect ratio (16:9 landscape or 9:16 portrait). Step 2 picks the layout (classic PiP, stacked, streamer-only) and its placement. Step 3 collects the game title, optional store URL, gaming device, dialogue pacing, call to action, free-form instructions, and the gameplay video (≤ 250 MB).
 

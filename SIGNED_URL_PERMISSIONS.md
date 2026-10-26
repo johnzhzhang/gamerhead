@@ -178,6 +178,82 @@ gcloud projects add-iam-policy-binding ... > /dev/null 2>&1 \
 
 ---
 
+## 另一种报错：`Upload was blocked before Cloud Storage could answer`
+
+签名拿到了（说明上一节的权限没问题）,但浏览器 PUT 到存储桶时失败。
+
+**这两种报错的区别值得记住**,它能直接砍掉一半排查范围：
+
+| 报错 | 含义 | 方向 |
+|---|---|---|
+| `Permission ... signBlob denied` | 签名 URL **没能生成** | IAM 权限 / API |
+| `Upload was blocked before ... could answer` | URL 生成了,但**存储桶没有回应** | CORS / 网络 |
+| `Cloud Storage refused the upload (HTTP 403/400)` | 存储桶**回应了并拒绝** | 签名过期 / Content-Type 不符 |
+
+第二种之所以能断定「不是签名被拒」,是因为前端用的是 `XMLHttpRequest`：任何带状态码的
+响应都会走 `onload`,只有完全拿不到响应才走 `onerror`。
+
+### 最可能的原因：Origin 不在 CORS 规则里
+
+`deploy.sh` 只会写两种 `run.app` 地址,并自动探测域名映射。如果用户是通过
+**自定义域名或外部负载均衡**（组织级 IAP 的常见做法）访问的,浏览器发出的 `Origin`
+两者都不匹配,预检就被拒。
+
+`Origin` 必须与浏览器地址栏**完全一致**,只比对 `scheme://host[:port]`——
+带路径、带末尾斜杠、http 与 https 混用都不算匹配。
+
+### 不需要任何 GCP 权限就能确诊
+
+让使用者在浏览器里做,比申请项目权限快得多：
+
+1. F12 打开开发者工具 → Network
+2. 重试上传,找到发往 `storage.googleapis.com` 的失败请求
+3. 看两件事：
+   - **有没有 `OPTIONS` 预检请求?** 没有 → 请求在更早的网络层就被拦了（代理 / 防火墙 / VPC-SC）
+   - **预检的响应头里有 `Access-Control-Allow-Origin` 吗?** 没有,或值与地址栏域名不符 → 就是 CORS 规则缺这个 Origin
+4. 同时记下地址栏的完整域名——这就是需要加进规则的那个 Origin
+
+### 修复
+
+```bash
+./deploy.sh        # → 3 → 4   先看实际允许了哪些 Origin
+./deploy.sh        # → 3 → 3   重写规则，会提示补充自定义域名
+```
+
+手工方式（需要 `storage.buckets.update`,**运行服务账号的 `objectAdmin` 不含这个权限**,
+所以应用无法自我修复）：
+
+```bash
+cat > cors.json <<'EOF'
+[
+  {
+    "origin": ["https://你的服务.run.app", "https://app.example.com"],
+    "method": ["PUT", "GET", "HEAD", "OPTIONS"],
+    "responseHeader": ["Content-Type", "Content-Length", "Content-Disposition", "x-goog-resumable"],
+    "maxAgeSeconds": 3600
+  }
+]
+EOF
+gcloud storage buckets update gs://你的桶 --cors-file=cors.json
+
+# 回读确认
+gcloud storage buckets describe gs://你的桶 --format="value(cors_config)"
+```
+
+> `responseHeader` 里必须保留 `Content-Type`：它决定预检响应中的
+> `Access-Control-Allow-Headers`。而上传请求必然带 `Content-Type: video/mp4`,
+> 这个值不属于 CORS 的「简单」头,所以一定会触发预检。
+
+### 其余可能
+
+- **网络路径被拦**：代理、防火墙或 VPC Service Controls 边界阻断了
+  `storage.googleapis.com`。特征是连 `OPTIONS` 都看不到。
+- **连接中断**：大文件在弱网下断流,同样走 `onerror`。重试一次即可区分。
+- **CORS 当初写入失败过**：执行部署的账号缺 `storage.buckets.update` 时,
+  `deploy.sh` 会打印 ❌,但在长日志里很容易被忽略。用 3 → 4 复查最快。
+
+---
+
 ## 排查清单
 
 逐条确认,通常第 1 或第 2 条就是原因：

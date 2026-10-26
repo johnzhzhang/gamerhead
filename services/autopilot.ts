@@ -145,6 +145,11 @@ export const uploadGameplay = async (
     }),
   );
 
+  // Worth naming the host in any failure: it tells whoever reads the message whether
+  // the request even reached Cloud Storage.
+  let uploadHost = 'storage.googleapis.com';
+  try { uploadHost = new URL(uploadUrl as string).host; } catch { /* keep the default */ }
+
   await new Promise<void>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('PUT', uploadUrl, true);
@@ -152,12 +157,30 @@ export const uploadGameplay = async (
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
     };
+    // A status here means Cloud Storage answered and refused, which is a different
+    // problem from the onerror case below.
     xhr.onload = () => (xhr.status >= 200 && xhr.status < 300
       ? resolve()
-      : reject(new Error(`Upload failed (${xhr.status})`)));
+      : reject(new Error(
+          `Cloud Storage refused the upload (HTTP ${xhr.status}). The signed URL is `
+          + 'bound to the method and content type, so 403 usually means it expired '
+          + 'mid-upload and 400 means the Content-Type did not match.',
+        )));
+    // onerror fires only when the browser got no usable HTTP response at all. A
+    // signature or content-type problem comes back with a real status and lands in
+    // onload above, so reaching here narrows the cause to the network/CORS layer
+    // rather than anything Cloud Storage decided. Say that, instead of asserting one
+    // cause: the old wording blamed CORS and sent people to reconfigure a rule that
+    // was usually already correct.
     xhr.onerror = () => reject(new Error(
-      'Upload failed. If this persists the bucket may be missing its CORS rule '
-      + '(deploy.sh → mode 4 configures it).',
+      `Upload was blocked before Cloud Storage could answer (${uploadHost}). `
+      + 'No HTTP status came back, so this is not a rejected signature — it is the '
+      + "bucket's CORS rule, a blocked network path, or a dropped connection. "
+      + 'In DevTools → Network, find the failed request to that host: if the OPTIONS '
+      + 'preflight is missing or carries no Access-Control-Allow-Origin for '
+      + `${window.location.origin}, the bucket's CORS rule does not list this origin. `
+      + 'That is what happens when the app is reached through a custom domain or a '
+      + 'load balancer instead of its run.app URL. Fix with ./deploy.sh → 3 → 3.',
     ));
     xhr.onabort = () => reject(new Error('Upload cancelled'));
     xhr.send(file);

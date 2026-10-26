@@ -342,7 +342,7 @@ things a code deploy must not do on its own:
 | It changes | Why it cannot be skipped |
 |---|---|
 | `AUTOPILOT_ENABLED` + the batch limits | Without them every Autopilot route stays 404 |
-| A **CORS rule on the bucket** | Gameplay is uploaded straight to Cloud Storage. With no CORS rule the upload fails in the browser with an opaque error and leaves no server-side trace. The app cannot add the rule itself: the runtime service account holds `roles/storage.objectAdmin`, which does not include `storage.buckets.update` |
+| A **CORS rule on the bucket** | Gameplay is uploaded straight to Cloud Storage. With no CORS rule the upload fails in the browser with an opaque error and leaves no server-side trace. The app cannot add the rule itself: the runtime service account holds `roles/storage.objectAdmin`, which does not include `storage.buckets.update`. Both `run.app` host forms are written, domain mappings are detected automatically, and anything else — a custom domain or a load balancer in front of the service — has to be supplied when asked, because the browser's `Origin` must match the rule exactly |
 | `--min-instances=1 --no-cpu-throttling` | Cloud Run throttles CPU outside requests, so without a warm instance a batch only advances while a tab is open. This is the one setting that costs money while idle; option 2 reverses it |
 
 Nothing about an older deployment blocks this. Firestore in Datastore mode is
@@ -1097,6 +1097,16 @@ runtime service account cannot sign URLs. Run `./deploy.sh` → 3 → 4, which d
 and offers to fix it; [SIGNED_URL_PERMISSIONS.md](SIGNED_URL_PERMISSIONS.md) has the
 manual commands and the reasoning. Affects every signed URL, so finished-video links
 and admin downloads fail the same way.
+
+**`Upload was blocked before Cloud Storage could answer`.** The browser got no HTTP
+status back, which rules out a rejected signature — Cloud Storage never answered. It
+is the bucket's CORS rule, a blocked network path, or a dropped connection. The usual
+cause is an origin the rule does not list: `deploy.sh` writes the two `run.app` forms,
+so reaching the app through a **custom domain or load balancer** is not covered unless
+those origins were added. `./deploy.sh` → 3 → 4 prints the allowed origins next to the
+service URL; → 3 → 3 rewrites the rule and asks for extra origins. A refusal *with* a
+status is a different problem: 403 usually means the signed URL expired mid-upload,
+400 that the `Content-Type` did not match the one it was signed for.
 
 **Session keeps expiring.** ID tokens last about an hour and GIS silent refresh is unreliable under FedCM, so the app raises a `gh:session-expired` overlay instead of unmounting — sign in again and your work is still there. Under IAP, re-authentication needs a full page load, which the overlay offers. To lengthen IAP sessions, configure `gcloud iap settings set` with reauth settings.
 

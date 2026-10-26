@@ -284,18 +284,39 @@ check_runtime_prereqs() {
         fi
     done
 
-    # ── Autopilot 专项 ───────────────────────────────────────
-    if [ "$want_autopilot" == "autopilot" ]; then
-        echo "   $(_t "Autopilot 专项:" "Autopilot specifics:")"
-        if [ -n "$AP_BUCKET" ]; then
-            local cors_hit
-            cors_hit=$(gcloud storage buckets describe "gs://${AP_BUCKET}" --format=json 2>/dev/null </dev/null \
-                | grep -c '"origin"' || true)
-            if [ "${cors_hit:-0}" -gt 0 ]; then
-                echo "     ✅ $(_t "存储桶 CORS 已配置" "bucket CORS configured") (gs://${AP_BUCKET})"
+    # ── 存储桶 CORS ──────────────────────────────────────────
+    # 单说"已配置"没用：真正的失败模式是规则存在但不含用户实际使用的 Origin
+    # （自定义域名、负载均衡）。所以把允许的 Origin 和服务地址一起列出来比对。
+    #
+    # "Configured" alone is not useful: the real failure is a rule that exists but
+    # omits the origin users actually arrive on (custom domain, load balancer). So
+    # list the allowed origins next to the service URL for comparison.
+    local bucket="${AP_BUCKET:-}"
+    if [ -z "$bucket" ]; then
+        bucket=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+            --format="value(spec.template.spec.containers[0].env.filter(\"name:GCS_BUCKET_NAME\").extract(\"value\"))" \
+            2>/dev/null </dev/null | tr -d '[]"'"'"' ')
+    fi
+    if [ -n "$bucket" ]; then
+        echo "   $(_t "存储桶 CORS (浏览器直传素材所必需):" "Bucket CORS (required for direct uploads):")"
+        local allowed svc_url
+        allowed=$(gcloud storage buckets describe "gs://${bucket}" --format="value(cors_config)" 2>/dev/null </dev/null \
+            | tr -d "'\"[]" | tr ',' '\n' | grep -oE 'https?://[A-Za-z0-9._:-]+' | sort -u)
+        svc_url=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+            --format="value(status.url)" 2>/dev/null </dev/null)
+        if [ -z "$allowed" ]; then
+            echo "     ❌ $(_t "未配置任何 Origin —— 素材上传会失败，且浏览器只报一个不具名的网络错误" "no origins configured — uploads fail with an opaque browser error") (gs://${bucket})"
+            echo "        $(_t "用 ./deploy.sh → 3 → 3 写入" "Write it with ./deploy.sh → 3 → 3")"
+        else
+            echo "     $(_t "已允许" "Allowed"):"
+            echo "$allowed" | sed 's/^/        /'
+            echo "     $(_t "服务地址" "Service URL"): ${svc_url:-?}"
+            if [ -n "$svc_url" ] && echo "$allowed" | grep -qx "$svc_url"; then
+                echo "     ✅ $(_t "服务地址在允许列表中" "the service URL is allowed")"
             else
-                echo "     ⚠️  $(_t "存储桶 CORS 未配置 —— 本次启用流程会写入" "bucket CORS not configured — this run will write it") (gs://${AP_BUCKET})"
+                echo "     ⚠️  $(_t "服务地址不在允许列表中。若用户正是通过该地址访问，上传会失败。" "the service URL is not in the list. If users arrive on it, uploads will fail.")"
             fi
+            echo "     $(_t "注意: 通过自定义域名或负载均衡访问时，该域名也必须在上面列出。" "Note: if the app is reached through a custom domain or load balancer, that origin must appear above too.")"
         fi
     fi
 
@@ -490,11 +511,51 @@ configure_autopilot() {
     # CORS error and no server-side trace.
     AP_PNUM=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null </dev/null)
     SERVICE_URL_ALT="https://${SERVICE_NAME}-${AP_PNUM}.${REGION}.run.app"
+
+    # 这两个 run.app 地址只覆盖「直接访问 Cloud Run」的情况。客户环境里应用常常挂在
+    # 自定义域名或外部负载均衡（组织级 IAP 的典型做法）后面，此时浏览器发出的 Origin
+    # 两者都不匹配，直传会在预检阶段就被拒，而且浏览器只给一个不具名的网络错误。
+    # 所以先自动探测域名映射，再给一次手工补充的机会。
+    #
+    # The two run.app forms only cover reaching Cloud Run directly. In customer
+    # environments the app often sits behind a custom domain or an external load
+    # balancer (the usual shape for org-level IAP), and then the browser's Origin
+    # matches neither — the upload dies in preflight with an opaque network error.
+    # So detect domain mappings, then offer to add origins by hand.
+    AP_ORIGINS="\"${SERVICE_URL}\", \"${SERVICE_URL_ALT}\""
+    AP_MAPPED=$(gcloud beta run domain-mappings list --region="$REGION" --project="$PROJECT_ID" \
+        --filter="spec.routeName:${SERVICE_NAME}" --format="value(metadata.name)" 2>/dev/null </dev/null)
+    if [ -n "$AP_MAPPED" ]; then
+        echo "   $(_t "检测到域名映射:" "Detected domain mappings:")"
+        while read -r DOM; do
+            [ -z "$DOM" ] && continue
+            echo "     https://${DOM}"
+            AP_ORIGINS="${AP_ORIGINS}, \"https://${DOM}\""
+        done <<< "$AP_MAPPED"
+    fi
+    echo "   $(_t "如果用户通过自定义域名或负载均衡访问，请在此补充（逗号分隔，留空跳过）。" "If users reach the app through a custom domain or load balancer, add those origins (comma-separated, blank to skip).")"
+    echo "   $(_t "例: https://app.example.com" "e.g. https://app.example.com")"
+    read -p "$(_t "追加 Origin: " "Additional origins: ")" AP_EXTRA_ORIGINS
+    if [ -n "$AP_EXTRA_ORIGINS" ]; then
+        IFS=',' read -ra AP_EXTRA_ARR <<< "$AP_EXTRA_ORIGINS"
+        for O in "${AP_EXTRA_ARR[@]}"; do
+            O=$(echo "$O" | tr -d '[:space:]')
+            [ -z "$O" ] && continue
+            # Origin 只比对 scheme://host[:port]，带路径或末尾斜杠都会匹配失败
+            # An Origin is scheme://host[:port] only; a path or trailing slash never matches
+            O=$(echo "$O" | sed -E 's#(https?://[^/]+).*#\1#')
+            case "$O" in
+                http://*|https://*) AP_ORIGINS="${AP_ORIGINS}, \"${O}\"" ;;
+                *) echo "   ⚠️  $(_t "已忽略（必须以 http:// 或 https:// 开头）" "Ignored (must start with http:// or https://)"): $O" ;;
+            esac
+        done
+    fi
+
     CORS_FILE=$(mktemp)
     cat > "$CORS_FILE" <<CORSEOF
 [
   {
-    "origin": ["${SERVICE_URL}", "${SERVICE_URL_ALT}"],
+    "origin": [${AP_ORIGINS}],
     "method": ["PUT", "GET", "HEAD", "OPTIONS"],
     "responseHeader": ["Content-Type", "Content-Length", "Content-Disposition", "x-goog-resumable"],
     "maxAgeSeconds": 3600
@@ -507,7 +568,10 @@ CORSEOF
         CORS_CHECK=$(gcloud storage buckets describe "gs://${AP_BUCKET}" --format=json 2>/dev/null </dev/null \
             | grep -c "$SERVICE_URL" || echo 0)
         if [ "$CORS_CHECK" -gt 0 ]; then
-            echo "   ✅ $(_t "CORS 已配置并回读确认" "CORS applied and verified") ($SERVICE_URL)"
+            echo "   ✅ $(_t "CORS 已配置并回读确认" "CORS applied and verified")"
+            echo "      $(_t "已允许的 Origin（需与浏览器地址栏完全一致）:" "Allowed origins (must match the browser's address bar exactly):")"
+            gcloud storage buckets describe "gs://${AP_BUCKET}" --format="value(cors_config)" 2>/dev/null </dev/null \
+                | tr -d "'\"[]" | tr ',' '\n' | grep -oE 'https?://[A-Za-z0-9._:-]+' | sed 's/^/        /' | sort -u
         else
             echo "   ⚠️  $(_t "CORS 已提交但回读未匹配，请手动确认" "CORS submitted but the read-back did not match; please verify manually")"
         fi

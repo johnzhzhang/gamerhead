@@ -158,6 +158,214 @@ fi
 # A sub-item of "manage configuration" rather than a top-level mode: the main menu
 # should not grow a row per feature. Expects PROJECT_ID / SERVICE_NAME / REGION.
 #
+# ── 运行时依赖检查 / Runtime prerequisite check ───────────────────────────────
+#
+# 为什么需要这个：权限缺失只在运行时才暴露，而且报错落在浏览器里（例如
+# "Permission iam.serviceAccounts.signBlob denied"），与部署动作相隔很远，很难联系起来。
+# 更新配置时顺手校验一遍，比等用户撞上去便宜得多。
+#
+# Why this exists: a missing role only surfaces at runtime, in the browser (e.g.
+# "Permission iam.serviceAccounts.signBlob denied"), far from the deploy that caused
+# it. Checking while configuration is being changed is far cheaper than letting a
+# user hit it.
+
+# 解析服务真正的运行身份。不能假定是默认 Compute SA —— 服务可能跑在自定义账号上，
+# 那样把权限授给 Compute SA 是无效的。
+# Resolve the service's actual runtime identity. Never assume the default compute SA:
+# if the service runs as a custom account, granting to the compute SA does nothing.
+resolve_runtime_sa() {
+    local sa
+    sa=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" \
+        --format="value(spec.template.spec.serviceAccountName)" 2>/dev/null </dev/null)
+    if [ -z "$sa" ]; then
+        local pnum
+        pnum=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null </dev/null)
+        [ -n "$pnum" ] && sa="${pnum}-compute@developer.gserviceaccount.com"
+    fi
+    printf '%s' "$sa"
+}
+
+_api_enabled() {
+    local api="$1" out
+    out=$(gcloud services list --enabled --project="$PROJECT_ID" \
+        --filter="config.name:${api}" --format="value(config.name)" 2>/dev/null </dev/null | head -1)
+    [ -n "$out" ]
+}
+
+# 角色可能绑在项目级或服务账号级，两者都算满足。owner/editor 隐含包含，也要认，
+# 否则会对着一个其实没问题的项目报警。
+# A role can be bound at the project or the service-account level; either counts.
+# owner/editor imply it, so honour those too rather than crying wolf.
+_sa_role_scope() {
+    local sa="$1" role="$2" hit
+    hit=$(gcloud projects get-iam-policy "$PROJECT_ID" --flatten="bindings[].members" \
+        --filter="bindings.members:serviceAccount:${sa} AND bindings.role:${role}" \
+        --format="value(bindings.role)" 2>/dev/null </dev/null | head -1)
+    if [ -n "$hit" ]; then printf 'project'; return 0; fi
+    hit=$(gcloud iam service-accounts get-iam-policy "$sa" --project="$PROJECT_ID" \
+        --flatten="bindings[].members" \
+        --filter="bindings.members:serviceAccount:${sa} AND bindings.role:${role}" \
+        --format="value(bindings.role)" 2>/dev/null </dev/null | head -1)
+    if [ -n "$hit" ]; then printf 'sa'; return 0; fi
+    return 1
+}
+
+_sa_is_privileged() {
+    local sa="$1" hit
+    hit=$(gcloud projects get-iam-policy "$PROJECT_ID" --flatten="bindings[].members" \
+        --filter="bindings.members:serviceAccount:${sa} AND bindings.role:(roles/owner OR roles/editor)" \
+        --format="value(bindings.role)" 2>/dev/null </dev/null | head -1)
+    [ -n "$hit" ]
+}
+
+# $1 = "autopilot" 时额外检查批量成片相关项 / also check Autopilot-specific items
+# 返回 0 表示全部满足 / returns 0 when everything is satisfied
+check_runtime_prereqs() {
+    local want_autopilot="${1:-}"
+    local sa missing_apis=() missing_roles=() privileged=""
+
+    echo ""
+    echo "$(_t "🔍 检查运行时依赖 (API 与权限)..." "🔍 Checking runtime prerequisites (APIs and permissions)...")"
+
+    sa=$(resolve_runtime_sa)
+    if [ -z "$sa" ]; then
+        echo "   ⚠️  $(_t "无法确定服务的运行身份，跳过检查。" "Could not determine the service's runtime identity; skipping.")"
+        return 0
+    fi
+    echo "   $(_t "运行身份" "Runtime identity"): $sa"
+
+    if _sa_is_privileged "$sa"; then
+        privileged="yes"
+    fi
+
+    # ── API ──────────────────────────────────────────────────
+    # iamcredentials 是最容易漏的一项：应用刻意不持有私钥，v4 签名 URL 只能靠
+    # IAM Credentials API 的 signBlob 完成。缺它则素材直传、成片下载、后台文件链接全挂。
+    # iamcredentials is the one most often missed: the app holds no private key by
+    # design, so v4 signed URLs can only be produced through signBlob. Without it the
+    # gameplay upload, finished-video links and admin downloads all fail.
+    local apis=(
+        "run.googleapis.com|$(_t "Cloud Run 本体" "Cloud Run itself")"
+        "storage.googleapis.com|$(_t "素材与成片存储" "footage and renders")"
+        "firestore.googleapis.com|$(_t "项目历史与作业状态" "project history and job state")"
+        "aiplatform.googleapis.com|$(_t "脚本/头像/视频生成" "script, avatar and clip generation")"
+        "iamcredentials.googleapis.com|$(_t "签名 URL (上传/下载/预览)" "signed URLs (upload, download, preview)")"
+    )
+    echo "   $(_t "API:" "APIs:")"
+    local entry api why
+    for entry in "${apis[@]}"; do
+        api="${entry%%|*}"; why="${entry##*|}"
+        if _api_enabled "$api"; then
+            echo "     ✅ $api"
+        else
+            echo "     ❌ $api  ← $why"
+            missing_apis+=("$api")
+        fi
+    done
+
+    # ── 角色 ─────────────────────────────────────────────────
+    local roles=(
+        "roles/aiplatform.user|$(_t "调用 Gemini 与 Veo" "call Gemini and Veo")"
+        "roles/datastore.user|$(_t "读写历史与作业" "read/write history and jobs")"
+        "roles/storage.objectAdmin|$(_t "读写存储桶对象" "read/write bucket objects")"
+        "roles/iam.serviceAccountTokenCreator|$(_t "签发签名 URL (signBlob)" "sign URLs (signBlob)")"
+    )
+    echo "   $(_t "角色 (运行身份):" "Roles (runtime identity):")"
+    local role scope
+    for entry in "${roles[@]}"; do
+        role="${entry%%|*}"; why="${entry##*|}"
+        if scope=$(_sa_role_scope "$sa" "$role"); then
+            echo "     ✅ $role ($([ "$scope" == "sa" ] && _t "服务账号级" "SA-level" || _t "项目级" "project-level"))"
+        elif [ -n "$privileged" ]; then
+            echo "     ✅ $role ($(_t "由 owner/editor 隐含" "implied by owner/editor"))"
+        else
+            echo "     ❌ $role  ← $why"
+            missing_roles+=("$role")
+        fi
+    done
+
+    # ── Autopilot 专项 ───────────────────────────────────────
+    if [ "$want_autopilot" == "autopilot" ]; then
+        echo "   $(_t "Autopilot 专项:" "Autopilot specifics:")"
+        if [ -n "$AP_BUCKET" ]; then
+            local cors_hit
+            cors_hit=$(gcloud storage buckets describe "gs://${AP_BUCKET}" --format=json 2>/dev/null </dev/null \
+                | grep -c '"origin"' || true)
+            if [ "${cors_hit:-0}" -gt 0 ]; then
+                echo "     ✅ $(_t "存储桶 CORS 已配置" "bucket CORS configured") (gs://${AP_BUCKET})"
+            else
+                echo "     ⚠️  $(_t "存储桶 CORS 未配置 —— 本次启用流程会写入" "bucket CORS not configured — this run will write it") (gs://${AP_BUCKET})"
+            fi
+        fi
+    fi
+
+    if [ ${#missing_apis[@]} -eq 0 ] && [ ${#missing_roles[@]} -eq 0 ]; then
+        echo "   ✅ $(_t "运行时依赖齐备。" "All runtime prerequisites are in place.")"
+        return 0
+    fi
+
+    echo ""
+    echo "$(_t "⚠️  发现 $(( ${#missing_apis[@]} + ${#missing_roles[@]} )) 项缺失。" "⚠️  Found $(( ${#missing_apis[@]} + ${#missing_roles[@]} )) missing item(s).")"
+    echo "$(_t "   这些缺失不会让部署失败，只会在用户使用时报错。" "   These do not fail a deployment; they surface as errors when someone uses the app.")"
+    read -p "$(_t "现在修复? (y/n) [默认: y]: " "Fix them now? (y/n) [default: y]: ")" FIX_NOW
+    FIX_NOW=${FIX_NOW:-y}
+    if [ "$FIX_NOW" != "y" ] && [ "$FIX_NOW" != "Y" ]; then
+        echo ""
+        echo "$(_t "已跳过。需要时可手动执行:" "Skipped. Run these manually when needed:")"
+        for api in "${missing_apis[@]}"; do
+            echo "  gcloud services enable $api --project=$PROJECT_ID"
+        done
+        for role in "${missing_roles[@]}"; do
+            if [ "$role" == "roles/iam.serviceAccountTokenCreator" ]; then
+                echo "  gcloud iam service-accounts add-iam-policy-binding $sa \\"
+                echo "    --member=\"serviceAccount:$sa\" --role=\"$role\" --project=$PROJECT_ID"
+            else
+                echo "  gcloud projects add-iam-policy-binding $PROJECT_ID \\"
+                echo "    --member=\"serviceAccount:$sa\" --role=\"$role\" --condition=None"
+            fi
+        done
+        return 1
+    fi
+
+    local failed=0
+    for api in "${missing_apis[@]}"; do
+        echo "   $(_t "启用" "Enabling") $api ..."
+        if ! gcloud services enable "$api" --project="$PROJECT_ID" --quiet </dev/null >/dev/null 2>&1; then
+            echo "     ❌ $(_t "失败 —— 需要 serviceusage.services.enable 权限" "failed — needs serviceusage.services.enable")"
+            failed=$((failed+1))
+        fi
+    done
+    for role in "${missing_roles[@]}"; do
+        echo "   $(_t "授予" "Granting") $role ..."
+        # signBlob 用服务账号级绑定：只允许它为自己签名，比项目级窄得多。
+        # Bind signBlob at the service-account level: it only lets the account sign for
+        # itself, which is far narrower than a project-level grant.
+        if [ "$role" == "roles/iam.serviceAccountTokenCreator" ]; then
+            if ! gcloud iam service-accounts add-iam-policy-binding "$sa" \
+                    --member="serviceAccount:$sa" --role="$role" \
+                    --project="$PROJECT_ID" --quiet </dev/null >/dev/null 2>&1; then
+                echo "     ❌ $(_t "失败 —— 需要 iam.serviceAccounts.setIamPolicy 权限" "failed — needs iam.serviceAccounts.setIamPolicy")"
+                failed=$((failed+1))
+            fi
+        else
+            if ! gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+                    --member="serviceAccount:$sa" --role="$role" --condition=None \
+                    --quiet </dev/null >/dev/null 2>&1; then
+                echo "     ❌ $(_t "失败 —— 需要 resourcemanager.projects.setIamPolicy 权限" "failed — needs resourcemanager.projects.setIamPolicy")"
+                failed=$((failed+1))
+            fi
+        fi
+    done
+
+    echo ""
+    if [ "$failed" -eq 0 ]; then
+        echo "$(_t "✅ 已补齐。IAM 改动约 1 分钟内生效，无需重新部署。" "✅ Done. IAM changes take about a minute to propagate; no redeploy needed.")"
+        return 0
+    fi
+    echo "$(_t "⚠️  有 $failed 项未能自动修复，请让项目管理员执行上面提示的命令。" "⚠️  $failed item(s) could not be fixed automatically; ask a project admin to run the commands above.")"
+    return 1
+}
+
 # 只用 --update-env-vars / --remove-env-vars，绝不用 --env-vars-file：
 # 后者会先清空所有现有变量，历史上曾因此丢掉 ADMIN_USERS。
 # Only ever uses --update-env-vars / --remove-env-vars. --env-vars-file wipes
@@ -266,7 +474,12 @@ configure_autopilot() {
             --min-instances=1 --no-cpu-throttling --quiet </dev/null 2>&1 | tail -2
     fi
 
-    # 3) 存储桶 CORS —— 浏览器直传的必要条件
+    # 3) 运行时依赖 —— 签名 URL 是直传的前提，缺权限只会在用户点上传时才报错
+    #    Runtime prerequisites: the signed URL is what makes the direct upload
+    #    possible, and a missing role only surfaces when a user clicks upload.
+    check_runtime_prereqs autopilot || true
+
+    # 4) 存储桶 CORS —— 浏览器直传的必要条件
     #    Bucket CORS: required for the browser to PUT gameplay straight to GCS,
     #    which is unavoidable because Cloud Run caps a request body at 32 MiB.
     echo "$(_t "⚙️  配置存储桶 CORS (浏览器直传素材所必需)..." "⚙️  Configuring bucket CORS (required for direct uploads)...")"
@@ -304,7 +517,7 @@ CORSEOF
     fi
     rm -f "$CORS_FILE"
 
-    # 4) 可选：Cloud Scheduler 续跑 / Optional resume cron
+    # 5) 可选：Cloud Scheduler 续跑 / Optional resume cron
     echo ""
     echo "$(_t "⏰ 可选：定时唤醒停滞作业" "⏰ Optional: a cron that picks up stalled batches")"
     echo "$(_t "   即使实例被回收，也能让未完成的批次继续。等待确认头像的作业不会被唤醒。" "   Lets an unfinished batch continue even if the instance was recycled. Jobs waiting for avatar confirmation are never woken.")"
@@ -644,14 +857,15 @@ if [ "$DEPLOY_MODE" == "3" ]; then
     echo "  1) $(_t "可登录用户" "Users allowed to sign in")"
     echo "  2) $(_t "管理员 (可访问 Admin 仪表板, ADMIN_USERS)" "Admins (Admin dashboard access, ADMIN_USERS)")"
     echo "  3) $(_t "Autopilot 批量成片 (开启 / 关闭 / 查看)" "Autopilot batch production (enable / disable / view)")"
-    echo "  4) $(_t "退出" "Exit")"
+    echo "  4) $(_t "检查运行时依赖 (API 与权限)" "Check runtime prerequisites (APIs and permissions)")"
+    echo "  5) $(_t "退出" "Exit")"
     # 从旧的「模式 4」进来时直接跳到 Autopilot，不再多问一次
     # Coming in via the old "mode 4" goes straight to Autopilot without asking again
     if [ "$AUTOPILOT_DIRECT" == "yes" ]; then
         MANAGE_WHAT="3"
         echo "$(_t "→ 已选择: Autopilot" "→ Selected: Autopilot")"
     else
-        read -p "$(_t "输入选项 [1/2/3/4, 默认: 1]: " "Enter option [1/2/3/4, default: 1]: ")" MANAGE_WHAT
+        read -p "$(_t "输入选项 [1/2/3/4/5, 默认: 1]: " "Enter option [1/2/3/4/5, default: 1]: ")" MANAGE_WHAT
         MANAGE_WHAT=${MANAGE_WHAT:-1}
     fi
 
@@ -680,6 +894,12 @@ if [ "$DEPLOY_MODE" == "3" ]; then
     fi
 
     if [ "$MANAGE_WHAT" == "4" ]; then
+        check_runtime_prereqs
+        echo ""
+        exit 0
+    fi
+
+    if [ "$MANAGE_WHAT" == "5" ]; then
         exit 0
     fi
 
@@ -816,6 +1036,13 @@ fi
 
 echo ""
 echo "$(_t "🔧 正在启用必要的 GCP API (这可能需要几分钟)..." "🔧 Enabling required GCP APIs (this may take a few minutes)...")"
+# iamcredentials 曾被漏掉，代价不小：应用刻意不持有私钥，v4 签名 URL 只能通过
+# IAM Credentials API 的 signBlob 产生。缺它时部署一切正常，但用户一上传素材就报
+# "Permission iam.serviceAccounts.signBlob denied"，而且成片下载与后台文件链接一起失效。
+# iamcredentials was missing here, and it cost real debugging: the app holds no
+# private key by design, so v4 signed URLs can only come from signBlob. Without it the
+# deploy looks fine but the first upload fails with
+# "Permission iam.serviceAccounts.signBlob denied", taking download links with it.
 gcloud services enable \
   cloudbuild.googleapis.com \
   run.googleapis.com \
@@ -823,6 +1050,7 @@ gcloud services enable \
   firestore.googleapis.com \
   aiplatform.googleapis.com \
   storage.googleapis.com \
+  iamcredentials.googleapis.com \
   --project=$PROJECT_ID </dev/null
 
 # 设置服务名称 / Set service name
@@ -1129,15 +1357,33 @@ ROLES=(
   "roles/aiplatform.user"
 )
 
+# 绑定失败过去只打一行警告就继续，部署照样显示成功 —— 问题要等到用户使用时才暴露，
+# 而且报错落在浏览器里，离这一步很远。现在汇总失败项并打印可直接执行的命令。
+# A failed binding used to print one warning and carry on, so the deploy still looked
+# successful and the problem only surfaced in someone's browser much later. Collect the
+# failures instead and print commands that can be handed to an admin.
+FAILED_ROLES=()
 for ROLE in "${ROLES[@]}"; do
   gcloud projects add-iam-policy-binding $PROJECT_ID \
     --member="serviceAccount:${COMPUTE_SA}" \
     --role="$ROLE" \
     --condition=None \
-    </dev/null > /dev/null 2>&1 || echo "   ($(_t "⚠️ 无法绑定角色 $ROLE，可能是权限不足" "⚠️ Could not bind role $ROLE — insufficient permissions"))"
+    </dev/null > /dev/null 2>&1 || FAILED_ROLES+=("$ROLE")
 done
 
-echo "   ✅ $(_t "权限配置完成" "Permission configuration complete")"
+if [ ${#FAILED_ROLES[@]} -eq 0 ]; then
+  echo "   ✅ $(_t "权限配置完成" "Permission configuration complete")"
+else
+  echo ""
+  echo "   ⚠️  $(_t "有 ${#FAILED_ROLES[@]} 个角色未能绑定。部署会继续，但相关功能在运行时会报错。" "${#FAILED_ROLES[@]} role(s) could not be bound. The deploy continues, but those features will fail at runtime.")"
+  echo "   $(_t "通常是执行部署的账号缺少 resourcemanager.projects.setIamPolicy。" "Usually the account running this deploy lacks resourcemanager.projects.setIamPolicy.")"
+  echo "   $(_t "请让项目管理员执行:" "Ask a project admin to run:")"
+  for ROLE in "${FAILED_ROLES[@]}"; do
+    echo "     gcloud projects add-iam-policy-binding $PROJECT_ID \\"
+    echo "       --member=\"serviceAccount:${COMPUTE_SA}\" --role=\"$ROLE\" --condition=None"
+  done
+  echo "   $(_t "补齐后可用 ./deploy.sh → 3 → 4 复查。" "Afterwards verify with ./deploy.sh → 3 → 4.")"
+fi
 
 echo ""
 echo "$(_t "🏗️  开始部署到 Cloud Run..." "🏗️  Starting deployment to Cloud Run...")"

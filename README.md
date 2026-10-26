@@ -224,8 +224,46 @@ Detects the service's auth mode and adapts. Two things to manage:
 | **1) Users allowed to sign in** | IAP → IAM bindings · GIS → `AUTHORIZED_USERS` · Basic → prints the manual command · unprotected → warns you |
 | **2) Admins** | `ADMIN_USERS`, identical in every mode |
 | **3) Autopilot** | Enable / disable / view batch production — see below |
+| **4) Runtime prerequisites** | Checks the APIs and IAM roles the running service needs, and offers to fix what is missing — see below |
 
 Only ever uses `--update-env-vars` / `--remove-env-vars`, so unrelated variables are left alone.
+
+### Mode 3, option 4 — Check runtime prerequisites
+
+A missing API or IAM role does not fail a deployment. It surfaces much later, in
+someone's browser, as an error that points nowhere near the deploy that caused it —
+`Permission iam.serviceAccounts.signBlob denied` on the first Autopilot upload being
+the worst example. This option closes that gap.
+
+It resolves the service's **actual** runtime identity rather than assuming the default
+compute service account — if the service runs as a custom account, granting roles to
+the compute account does nothing — then reports on:
+
+| | Needed for |
+|---|---|
+| `run`, `storage`, `firestore`, `aiplatform` APIs | the app at all |
+| `iamcredentials` API | **signed URLs**: gameplay upload, download links, previews |
+| `roles/aiplatform.user` | Gemini and Veo |
+| `roles/datastore.user` | project history and job state |
+| `roles/storage.objectAdmin` | bucket objects |
+| `roles/iam.serviceAccountTokenCreator` | **`signBlob`**, which is what signs the URLs |
+
+Anything missing can be fixed in place; declining prints copy-pasteable commands for
+an administrator instead. `roles/iam.serviceAccountTokenCreator` is bound on the
+service account itself rather than at project level, so it can only sign for itself.
+
+A role already granted at either scope counts, and `roles/owner` / `roles/editor` are
+honoured as implying the rest — otherwise the check would cry wolf on a project that
+is actually fine.
+
+The same check runs automatically when Autopilot is enabled, because that is the
+feature which cannot work without URL signing.
+
+**Why signing needs a role at all.** The app holds no private key anywhere by design,
+so the storage client cannot sign a v4 URL locally; it calls the IAM Credentials API
+to have the service account sign for itself. That is also why `iamcredentials` has to
+be enabled — it was missing from mode 1's API list for a long time, and every fresh
+project hit it.
 
 ### Mode 3, option 3 — Configure Autopilot
 
@@ -1053,6 +1091,12 @@ Storage grows with every clip and export and is never pruned automatically. A li
 **Save failed in the header.** Hover for the reason and check `gcloud run services logs read gamerheads --region=us-central1 --limit=50 | grep Projects`. A 413 means the project exceeded 900 KB — trim the script or the number of clips.
 
 **Signed-URL request returns `URI is outside the configured application bucket`.** Intentional: signing is limited to `GCS_BUCKET_NAME`.
+
+**`Permission iam.serviceAccounts.signBlob denied` on an Autopilot upload.** The
+runtime service account cannot sign URLs. Run `./deploy.sh` → 3 → 4, which diagnoses
+and offers to fix it; [SIGNED_URL_PERMISSIONS.md](SIGNED_URL_PERMISSIONS.md) has the
+manual commands and the reasoning. Affects every signed URL, so finished-video links
+and admin downloads fail the same way.
 
 **Session keeps expiring.** ID tokens last about an hour and GIS silent refresh is unreliable under FedCM, so the app raises a `gh:session-expired` overlay instead of unmounting — sign in again and your work is still there. Under IAP, re-authentication needs a full page load, which the overlay offers. To lengthen IAP sessions, configure `gcloud iap settings set` with reauth settings.
 

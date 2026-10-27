@@ -583,55 +583,45 @@ test('the image and video measurements agree on the same content', async () => {
 // ── subtitles in the compositing pass, and the static PiP frame ──────────────
 
 /**
- * An ASS file that draws one solid white block in the middle of a 1280x720 track.
- * A drawing rather than text, so the assertion does not depend on fonts: if the
- * block shows up, the subtitle filter ran on the streamer track.
+ * ASS content drawing one solid white block at frame coordinates. A drawing rather
+ * than text, so the assertions do not depend on fonts. Returned as the callback
+ * composeVideo expects, which receives the real output size.
  */
-const writeBlockAss = (name) => {
-    const file = path.join(TMP, name);
-    fs.writeFileSync(file, [
-        '[Script Info]', 'ScriptType: v4.00+', 'PlayResX: 1280', 'PlayResY: 720', '',
-        '[V4+ Styles]',
-        'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-        'Style: Default,Arial,40,&H00FFFFFF,&H000000FF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
-        '', '[Events]',
-        'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
-        'Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\pos(400,200)\\p1}m 0 0 l 480 0 480 320 0 320{\\p0}',
-        '',
-    ].join('\n'));
-    return file;
-};
+const blockAss = ({ x, y, w, h }) => ({ width, height }) => [
+    '[Script Info]', 'ScriptType: v4.00+', `PlayResX: ${width}`, `PlayResY: ${height}`, '',
+    '[V4+ Styles]',
+    'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+    'Style: Default,Arial,40,&H00FFFFFF,&H000000FF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
+    '', '[Events]',
+    'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+    `Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\pos(${x},${y})\\p1}m 0 0 l ${w} 0 ${w} ${h} 0 ${h}{\\p0}`,
+    '',
+].join('\n');
 
-test('subtitles are burned onto the streamer track inside the composite', async () => {
+test('subtitles are burned onto the full frame, not into the PiP box', async () => {
     const gameplay = await makeClip('gp-sub.mp4', { color: 'red', width: 1280, height: 720, seconds: 4, freq: 220 });
     const streamer = await makeClip('st-sub.mp4', { color: 'blue', width: 1280, height: 720, seconds: 4, freq: 660 });
-    const ass = writeBlockAss('block.ass');
-
-    const withSubs = path.join(TMP, 'pip-sub.mp4');
+    const out = path.join(TMP, 'pip-sub.mp4');
+    // A block in the gameplay area, well clear of the bottom-left PiP box.
     const result = await composeVideo({
-        gameplayPath: gameplay, streamerPath: streamer, outputPath: withSubs,
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
         layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
-        subtitlesPath: ass,
+        subtitlesAss: blockAss({ x: 1200, y: 600, w: 400, h: 200 }),
     });
     const { streamer: box } = result.geometry;
-    const cx = box.x + box.w / 2;
-    const cy = box.y + box.h / 2;
 
-    const centre = await samplePixel(withSubs, cx, cy);
-    assert.ok(centre.every((c) => c > 200),
-        `the subtitle block should cover the PiP centre, got rgb(${centre.join(',')})`);
-
-    // On the streamer track, not the frame: the gameplay is untouched…
-    assertColour(await samplePixel(withSubs, 1600, 200), RED, 'gameplay is not subtitled');
-    // …and the streamer is still visible around the block.
-    assertColour(await samplePixel(withSubs, box.x + box.w * 0.1, cy), BLUE, 'streamer still visible beside the block');
+    // Placed in frame coordinates: the ASS was sized to the 1920x1080 output.
+    const onFrame = await samplePixel(out, 1400, 700);
+    assert.ok(onFrame.every((c) => c > 200), `subtitle block on the frame, got rgb(${onFrame.join(',')})`);
+    // Not scaled into the PiP: the streamer there is untouched.
+    assertColour(await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2), BLUE, 'PiP is not subtitled');
+    // And the rest of the gameplay is untouched.
+    assertColour(await samplePixel(out, 300, 200), RED, 'gameplay away from the block');
     // The frame survives the extra filter.
-    const edge = await samplePixel(withSubs, cx, box.y + 1);
-    assertColour(edge, strokeOver(BLUE), 'border still drawn');
-    assertColour(await samplePixel(withSubs, box.x + 2, box.y + 2), RED, 'corner still rounded', 60);
+    assertColour(await samplePixel(out, box.x + box.w / 2, box.y + 1), strokeOver(BLUE), 'border still drawn');
 });
 
-test('without subtitles nothing is drawn over the streamer', async () => {
+test('without subtitles nothing is drawn on the frame', async () => {
     const gameplay = await makeClip('gp-nosub.mp4', { color: 'red', width: 1280, height: 720, seconds: 3, freq: 220 });
     const streamer = await makeClip('st-nosub.mp4', { color: 'blue', width: 1280, height: 720, seconds: 3, freq: 660 });
     const out = path.join(TMP, 'pip-nosub.mp4');
@@ -640,21 +630,51 @@ test('without subtitles nothing is drawn over the streamer', async () => {
         layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
     });
     const { streamer: box } = result.geometry;
+    assertColour(await samplePixel(out, 1400, 700), RED, 'gameplay is plain');
     assertColour(await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2), BLUE, 'PiP centre is plain streamer');
+});
+
+test('subtitles may cross the PiP box and are drawn over it', async () => {
+    // The subtitle layer is the last thing drawn, so it sits above the streamer.
+    const gameplay = await makeClip('gp-over.mp4', { color: 'red', width: 1280, height: 720, seconds: 3, freq: 220 });
+    const streamer = await makeClip('st-over.mp4', { color: 'blue', width: 1280, height: 720, seconds: 3, freq: 660 });
+    const out = path.join(TMP, 'pip-over.mp4');
+    const probe = computeLayout({ layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
+        gameplayWidth: 1280, gameplayHeight: 720, streamerWidth: 1280, streamerHeight: 720 }).streamer;
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
+        subtitlesAss: blockAss({ x: Math.round(probe.x + probe.w / 2 - 40), y: Math.round(probe.y + probe.h / 2 - 40), w: 80, h: 80 }),
+    });
+    const { streamer: box } = result.geometry;
+    const px = await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2);
+    assert.ok(px.every((c) => c > 200), `subtitle drawn above the streamer, got rgb(${px.join(',')})`);
 });
 
 test('cutout mode keeps burned-in subtitles', async () => {
     const gameplay = await makeClip('gp-cut-sub.mp4', { color: 'red', width: 1280, height: 720, seconds: 3, freq: 220 });
     const streamer = await makeGreenScreenClip('st-cut-sub.mp4', { seconds: 3 });
     const out = path.join(TMP, 'cut-sub.mp4');
-    const result = await composeVideo({
+    await composeVideo({
         gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
         layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
-        removeBackground: true, subtitlesPath: writeBlockAss('block-cut.ass'),
+        removeBackground: true, subtitlesAss: blockAss({ x: 1200, y: 600, w: 400, h: 200 }),
     });
-    const { streamer: box } = result.geometry;
-    const px = await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2);
-    assert.ok(px.every((c) => c > 200), `white subtitles are not keyed away, got rgb(${px.join(',')})`);
+    const px = await samplePixel(out, 1400, 700);
+    assert.ok(px.every((c) => c > 200), `white subtitles survive cutout mode, got rgb(${px.join(',')})`);
+});
+
+test('stacked layouts carry subtitles too', async () => {
+    const gameplay = await makeClip('gp-stk-sub.mp4', { color: 'red', width: 1280, height: 720, seconds: 3, freq: 220 });
+    const streamer = await makeClip('st-stk-sub.mp4', { color: 'blue', width: 720, height: 1280, seconds: 3, freq: 660 });
+    const out = path.join(TMP, 'stk-sub.mp4');
+    await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'stacked', targetRatio: '16:9', stackedPlacement: 'left',
+        subtitlesAss: blockAss({ x: 1200, y: 600, w: 400, h: 200 }),
+    });
+    const px = await samplePixel(out, 1400, 700);
+    assert.ok(px.every((c) => c > 200), `subtitle block on the stacked frame, got rgb(${px.join(',')})`);
 });
 
 test('the rounded frame lasts the whole composite, after the streamer ends too', async () => {

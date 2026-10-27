@@ -251,3 +251,56 @@ test('a very long name is truncated rather than emitted whole', () => {
     const quoted = h.match(/filename="([^"]*)"/)[1];
     assert.ok(quoted.length <= 120, `fallback should be bounded, got ${quoted.length}`);
 });
+
+// ── script length follows the gameplay ───────────────────────────────────────
+
+import { scriptTargetSeconds, fitSegmentsToTotal } from '../lib/autopilot.js';
+
+const shots = (...d) => d.map((duration, i) => ({
+    id: i + 1, startTime: '0:00', endTime: '0:00', duration, prompt: 'p',
+    dialogue: i === d.length - 1 ? 'Tap below to download now and claim your free pack' : 'short line',
+}));
+const total = (s) => s.reduce((n, x) => n + x.duration, 0);
+
+test('the target never cuts into the last shot by more than half a second', () => {
+    assert.strictEqual(scriptTargetSeconds(31.381), 30, 'the 30 s demo: 32 would cut the CTA by 0.6 s');
+    assert.strictEqual(scriptTargetSeconds(14.613), 14, 'the 15 s demo');
+    assert.strictEqual(scriptTargetSeconds(15.6), 16, 'within half a second, round up');
+    assert.strictEqual(scriptTargetSeconds(30), 30);
+    assert.strictEqual(scriptTargetSeconds(2), 4, 'one shot is the minimum');
+    assert.strictEqual(scriptTargetSeconds(0), null);
+    assert.strictEqual(scriptTargetSeconds(undefined), null);
+});
+
+test('a short script is stretched to the target', () => {
+    // The production case: 6+6+4+6 = 22 s against a 31 s recording.
+    const out = fitSegmentsToTotal(shots(6, 6, 4, 6), 30);
+    assert.strictEqual(total(out), 30);
+    assert.ok(out.every((s) => [4, 6, 8].includes(s.duration)));
+    assert.deepStrictEqual(out.map((s) => s.dialogue), shots(6, 6, 4, 6).map((s) => s.dialogue), 'dialogue untouched');
+});
+
+test('a long script is trimmed without touching the call to action', () => {
+    // The production case: 6+6+6+6 = 24 s against a 14.6 s recording.
+    const four = shots(6, 6, 6, 6);
+    const out = fitSegmentsToTotal(four, 14);
+    assert.strictEqual(total(out), 14);
+    assert.strictEqual(out.length, 3, 'four shots cannot fit 14 s, so one middle shot is dropped');
+    assert.strictEqual(out[0].dialogue, four[0].dialogue, 'the opening hook is kept');
+    assert.strictEqual(out[2].dialogue, four[3].dialogue, 'the call to action is kept');
+    assert.strictEqual(out[2].duration, 6, 'and keeps its length');
+    const three = fitSegmentsToTotal(shots(6, 6, 6), 14);
+    assert.strictEqual(total(three), 14);
+    assert.strictEqual(three[2].duration, 6);
+});
+
+test('times are rewritten to match the new lengths', () => {
+    const out = fitSegmentsToTotal(shots(4, 4, 4), 16);
+    assert.deepStrictEqual(out.map((s) => [s.startTime, s.endTime]),
+        [['0:00', '0:06'], ['0:06', '0:12'], ['0:12', '0:16']]);
+});
+
+test('a script that already fits is returned as is', () => {
+    const out = fitSegmentsToTotal(shots(8, 8, 8, 6), 30);
+    assert.deepStrictEqual(out.map((s) => s.duration), [8, 8, 8, 6]);
+});

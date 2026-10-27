@@ -22,6 +22,8 @@ import {
     parseOwnBucketUri,
     attachmentDisposition,
     IMAGE_UPLOAD_MAX_BYTES,
+    scriptTargetSeconds,
+    fitSegmentsToTotal,
 } from './lib/autopilot.js';
 import {
     JOB_STATUS,
@@ -2540,8 +2542,37 @@ const DEVICE_HINTS = {
     'Hands-free (No device)': 'They hold no device at all; both hands are free to gesture.',
 };
 
+/**
+ * Gameplay length in seconds, read straight from the bucket through a short-lived
+ * signed URL. ffprobe only fetches the container index, not the file, so this costs
+ * a few hundred KB whatever the upload size. Cached per object: every variant of a
+ * batch shares one gameplay file.
+ */
+const gameplayDurationCache = new Map();
+const gameplayDurationOf = async (gcsUri) => {
+    if (gameplayDurationCache.has(gcsUri)) return gameplayDurationCache.get(gcsUri);
+    const parsed = parseOwnBucketUri(gcsUri, GCS_BUCKET_NAME);
+    if (!parsed.ok) throw new Error(parsed.error);
+    const [url] = await getStorage().bucket(parsed.bucket).file(parsed.object).getSignedUrl({
+        version: 'v4', action: 'read', expires: Date.now() + 5 * 60 * 1000,
+    });
+    const { duration } = await probeMedia(url);
+    if (duration > 0) gameplayDurationCache.set(gcsUri, duration);
+    return duration;
+};
+
 const generateAutopilotScript = async (job, variantIdx) => {
     const s = job.spec;
+    // The composite lasts as long as the gameplay, so the script must too. A probe
+    // failure falls back to the old open range rather than failing the variant.
+    let target = null;
+    if (s.layoutType !== 'streamer-only' && s.gameplayGcsUri) {
+        try {
+            target = scriptTargetSeconds(await gameplayDurationOf(s.gameplayGcsUri));
+        } catch (err) {
+            console.warn(`[Autopilot] ${job.id} could not read the gameplay length:`, err.message);
+        }
+    }
     const angles = [
         'lead with the core gameplay hook',
         'lead with a bold claim about how it feels to play',
@@ -2586,7 +2617,13 @@ const generateAutopilotScript = async (job, variantIdx) => {
         'Anything in brackets or parentheses is a vocal-effect direction, not speech,',
         'and does not count towards these limits.',
         '',
-        'Keep the whole video between 16 and 40 seconds. Return JSON only.',
+        target
+            ? `TOTAL LENGTH: the gameplay this plays over is ${target} seconds long, so the `
+              + `durations must add up to exactly ${target} seconds — no more, no less. A `
+              + 'shorter script leaves the end of the video with no streamer; a longer one '
+              + 'cuts off the final shot, which carries the call to action.'
+            : 'Keep the whole video between 16 and 40 seconds.',
+        'Return JSON only.',
     ].filter(Boolean).join('\n');
 
     const ai = getVertexAIGlobalClient();
@@ -2641,7 +2678,15 @@ const generateAutopilotScript = async (job, variantIdx) => {
             };
         });
     if (!segments.length) throw new Error('Every shot came back without dialogue');
-    return segments;
+    if (!target) return segments;
+    const fitted = fitSegmentsToTotal(segments, target);
+    const before = segments.reduce((n, x) => n + x.duration, 0);
+    const after = fitted.reduce((n, x) => n + x.duration, 0);
+    if (before !== after || fitted.length !== segments.length) {
+        console.log(`[Autopilot] ${job.id} v${variantIdx} script ${before}s/${segments.length} shots `
+            + `→ ${after}s/${fitted.length} shots (gameplay target ${target}s)`);
+    }
+    return fitted;
 };
 
 /** Poll a video handle until it resolves, reusing the interactive read paths. */
@@ -2787,19 +2832,19 @@ const deliverAutopilotVariant = async (job, variantIdx) => {
 
         // 3. optional burned-in subtitles, built server-side from the shot list.
         //
-        // For a composite they are burned inside the compositing encode rather than
-        // in a pass of their own: same look (ASS sized to the streamer track, which
-        // is where they always went), one encode fewer. Streamer-only has no
-        // composite to ride on, so it keeps the dedicated pass.
+        // For a composite they are burned onto the finished frame inside the
+        // compositing encode, styled for the real output size by the same
+        // buildAssFromSrt the wizard's subtitle pass uses — so both paths produce the
+        // same subtitles, and there is no extra encode. Streamer-only has no
+        // composite to ride on; there the streamer track *is* the frame, so it keeps
+        // the dedicated pass.
         const wantSubtitles = Boolean(job.spec.subtitles);
         const isComposite = job.spec.layoutType !== 'streamer-only';
-        let subtitlesPath = null;
+        let subtitlesAss = null;
         if (wantSubtitles) {
             const srt = segmentsToSrt(variant.scriptSegments);
             if (isComposite) {
-                const dimensions = await probeVideoDimensions(streamerTrack);
-                subtitlesPath = path.join(tmpDir, 'streamer-subs.ass');
-                await writeFile(subtitlesPath, buildAssFromSrt(srt, dimensions), 'utf8');
+                subtitlesAss = (dimensions) => buildAssFromSrt(srt, dimensions);
             } else {
                 streamerTrack = await burnSrtIntoVideo(streamerTrack, srt, tmpDir, 'streamer-sub.mp4');
             }
@@ -2821,7 +2866,7 @@ const deliverAutopilotVariant = async (job, variantIdx) => {
                 stackedPlacement: job.spec.stackedPlacement,
                 volumes: job.spec.volumes,
                 removeBackground: Boolean(job.spec.removeBackground),
-                subtitlesPath,
+                subtitlesAss,
             });
         } else {
             // Validation gate still applies: the concatenation must be playable.

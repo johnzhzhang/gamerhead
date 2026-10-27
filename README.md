@@ -643,6 +643,18 @@ worker, the poll-driven `tick` and the `resume` sweep all consult one function
 that yields "wait" in that state, so a front-end bug cannot trigger the expensive
 half of the run.
 
+### Script length follows the gameplay
+
+The composite lasts exactly as long as the gameplay, so each script is told the
+gameplay's length and must add up to it. Shots are 4, 6 or 8 s, so only even totals
+exist; the target rounds down unless that would leave more than half a second spare,
+because rounding up cuts the last shot — the call to action. Whatever the model
+returns is then made exact: short shots are lengthened first, long ones trimmed from
+the sparsest line and never from the last, and if there are more shots than the
+length can hold a middle one is dropped. Before this the model was only told
+"16–40 s": a 31 s recording got 22–24 s scripts, and a 14.6 s one got 24 s and lost
+its call to action.
+
 ### Variants
 
 A batch is one brief rendered several ways. Each variant gets its own script with
@@ -734,9 +746,10 @@ Two things keep it fast. The rounded-corner mask and the white stroke never chan
 so each is rendered once and looped; expressed as a full-length `geq` they were
 re-evaluated for every pixel of every frame and took 84 of 102 seconds of a 31 s
 composite on 2 vCPU. The loop is pixel-identical (PSNR ∞ over all 941 frames).
-Subtitles, when enabled, are burned onto the streamer track inside the same encode
-rather than in a pass of their own — same look, one encode fewer, one generation of
-compression fewer. Together that took a composite from about 122 s to about 20 s
+Subtitles, when enabled, are burned onto the finished frame inside the same encode
+rather than in a pass of their own, styled for the real output size by the same code
+as the wizard's subtitle pass — so both paths caption alike, with one encode and one
+generation of compression fewer. Together that took a composite from about 122 s to about 20 s
 locally. Streamer-only has no composite to ride on and keeps the separate pass.
 
 ### Measured batch times

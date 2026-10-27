@@ -47,11 +47,17 @@ const LAYOUTS = [
     ['stacked', '16:9', 'left'],
     ['stacked', '16:9', 'right'],
 ];
+// The streamer clip's orientation follows the layout (picture-in-picture matches the
+// output, stacked is the opposite), and the PiP box keeps that aspect ratio — so the
+// box captions must avoid depends on it.
+const portraitClip = (layout, ratio) => (layout === 'stacked' ? ratio === '16:9' : ratio === '9:16');
 const geoFor = ([layout, ratio, place]) => computeLayout({
     layout, targetRatio: ratio,
     pipPlacement: layout === 'classic-pip' ? place : undefined,
     stackedPlacement: layout === 'stacked' ? place : undefined,
-    gameplayWidth: 720, gameplayHeight: 1280, streamerWidth: 1280, streamerHeight: 720,
+    gameplayWidth: 720, gameplayHeight: 1280,
+    streamerWidth: portraitClip(layout, ratio) ? 720 : 1280,
+    streamerHeight: portraitClip(layout, ratio) ? 1280 : 720,
 });
 
 // ── layout rules ─────────────────────────────────────────────────────────────
@@ -196,5 +202,25 @@ test('rendered width matches the estimate the line breaking relies on', { skip: 
         const [band] = measure(file, W, H, 1, size);
         const ratio = (band.x1 - band.x0) / (textWidthEm(s.slice(0, 40)) * size);
         assert.ok(ratio > 0.9 && ratio < 1.06, `rendered/estimated width ${ratio.toFixed(3)} for "${s.slice(0, 40)}"`);
+    }
+});
+
+// ── the wizard path derives the streamer box from the layout alone ───────────
+
+test('the box derived from a layout matches the compositor, in every layout', () => {
+    // server.js has no exports; take the function verbatim so the test checks the
+    // code that runs.
+    const src = fs.readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+    const i = src.indexOf('const streamerBoxFor = ');
+    const j = src.indexOf('\n};\n', i) + 3;
+    const streamerBoxFor = new Function('computeLayout', `${src.slice(i, j)}\nreturn streamerBoxFor;`)(computeLayout);
+    for (const L of LAYOUTS) {
+        const [layoutType, targetRatio, place] = L;
+        const real = geoFor(L);
+        const truth = real.streamer;
+        const got = streamerBoxFor({ layoutType, targetRatio, pipPlacement: place, stackedPlacement: place }, real.width, real.height);
+        for (const k of ['x', 'y', 'w', 'h']) {
+            assert.ok(Math.abs(got[k] - truth[k]) < 1, `${L.join(' ')} ${k}: ${got[k]} vs ${truth[k]}`);
+        }
     }
 });

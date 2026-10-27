@@ -1913,10 +1913,17 @@ const streamerBoxFor = (layout, width, height) => {
     if (!layout || !layout.layoutType || layout.layoutType === 'streamer-only') return null;
     try {
         const targetRatio = layout.targetRatio || (width >= height ? '16:9' : '9:16');
+        // The PiP box keeps the streamer clip's own aspect ratio, and the clip's
+        // orientation follows the layout exactly as avatarRatioFor decides it:
+        // picture-in-picture matches the output, stacked is the opposite. Assuming a
+        // landscape clip put a 9:16 frame's PiP box in the wrong place, and captions
+        // landed on the streamer.
+        const streamerPortrait = layout.layoutType === 'stacked' ? targetRatio === '16:9' : targetRatio === '9:16';
         const geo = computeLayout({
             layout: layout.layoutType, targetRatio,
             pipPlacement: layout.pipPlacement, stackedPlacement: layout.stackedPlacement,
-            gameplayWidth: width, gameplayHeight: height, streamerWidth: 1280, streamerHeight: 720,
+            gameplayWidth: width, gameplayHeight: height,
+            streamerWidth: streamerPortrait ? 720 : 1280, streamerHeight: streamerPortrait ? 1280 : 720,
         });
         if (!geo.streamer) return null;
         const k = width / geo.width;

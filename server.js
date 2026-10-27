@@ -45,6 +45,12 @@ import {
     canUseVeo,
     summarise,
     actionKey,
+    activeLeaseKeys,
+    acquireLease,
+    renewLease,
+    releaseLease,
+    failAction,
+    reserveVeo,
 } from './lib/autopilot-job.js';
 import { composeVideo, probeMedia, measureGreenScreenImage } from './lib/compose.js';
 
@@ -1504,8 +1510,10 @@ const beginVideoJob = async (ctx) => {
         return { operationName: interactionId, api: 'interactions', model: usedModel, fallback: usedModel !== chain[0] };
     }
 
-    // Every Omni candidate is out of quota → Veo safety net.
-    if (VIDEO_MODEL_LAST_RESORT) {
+    // Every Omni candidate is out of quota → Veo safety net. Autopilot opts out
+    // (noLastResort) because it has to reserve Veo against the batch budget first;
+    // falling through here silently would bypass that budget.
+    if (VIDEO_MODEL_LAST_RESORT && !ctx.noLastResort) {
         const imageBase64 = ctx.rawImageBase64 || (frameUri ? await gcsObjectToBase64(frameUri) : null);
         if (!imageBase64) throw new Error('No image available for Veo fallback');
         const veoOp = await startVeoOperation({
@@ -2707,6 +2715,7 @@ const produceAutopilotClip = async (job, variantIdx, clipIdx) => {
                 wantedResolution: VIDEO_RESOLUTION_DEFAULT,
                 durationSeconds: segment.duration,
                 blockRetries: 0,
+                noLastResort: true,
             });
             const { gcsUri } = await awaitVideoHandle(started);
             return { gcsUri, usedVeo: started.api === 'veo' };
@@ -2721,9 +2730,21 @@ const produceAutopilotClip = async (job, variantIdx, clipIdx) => {
 
     // Veo honours personGeneration: allow_adult, which is why it is kept as the
     // rescue — but it is pay-as-you-go, so the batch budget gates it.
-    if (VIDEO_MODEL_LAST_RESORT && canUseVeo(job)) {
+    // The budget is reserved in a transaction before Veo is called. Checking the
+    // worker's own copy of the job let every concurrent worker see budget left.
+    let reserved = null;
+    if (VIDEO_MODEL_LAST_RESORT) {
+        let granted = false;
+        reserved = await commitJobUpdate(job.id, (cur) => {
+            const r = reserveVeo(cur);
+            granted = r.ok;
+            return r.ok ? r.job : null;
+        });
+        if (!granted) reserved = null;
+    }
+    if (reserved) {
         console.log(`[Autopilot] ${job.id} v${variantIdx} clip ${clipIdx} → Veo rescue `
-            + `(${job.counters.veoUsed + 1}/${job.veoBudget})`);
+            + `(${reserved.counters.veoUsed}/${reserved.veoBudget})`);
         const imageBase64 = await gcsObjectToBase64(frameUri);
         const op = await startVeoOperation({
             modelId: VIDEO_MODEL_LAST_RESORT,
@@ -2733,10 +2754,10 @@ const produceAutopilotClip = async (job, variantIdx, clipIdx) => {
             durationSeconds: segment.duration,
         });
         const { gcsUri } = await awaitVideoHandle({ operationName: op, api: 'veo' });
-        return { gcsUri, usedVeo: true };
+        return { gcsUri, usedVeo: true, veoReserved: true };
     }
 
-    if (VIDEO_MODEL_LAST_RESORT && !canUseVeo(job)) {
+    if (VIDEO_MODEL_LAST_RESORT) {
         throw new Error(`${lastErr?.message || 'clip failed'} — the Veo budget for this batch `
             + `(${job.veoBudget} clips) is spent, so no further pay-as-you-go retries were made`);
     }
@@ -2847,10 +2868,11 @@ const jobToEntity = (job) => ({
         avatar: JSON.stringify(job.avatar),
         variants: JSON.stringify(job.variants),
         counters: JSON.stringify(job.counters || {}),
+        leases: JSON.stringify(job.leases || {}),
         veoBudget: job.veoBudget || 0,
         error: job.error ? String(job.error).slice(0, 500) : null,
     },
-    excludeFromIndexes: ['spec', 'avatar', 'variants', 'counters', 'error'],
+    excludeFromIndexes: ['spec', 'avatar', 'variants', 'counters', 'leases', 'error'],
 });
 
 const entityToJob = (entity) => {
@@ -2869,6 +2891,7 @@ const entityToJob = (entity) => {
         avatar: parse(entity.avatar, { candidates: [], approvedIdx: [], regenCount: 0 }),
         variants: parse(entity.variants, []),
         counters: parse(entity.counters, { veoUsed: 0 }),
+        leases: parse(entity.leases, {}),
         veoBudget: Number(entity.veoBudget) || 0,
         error: entity.error || null,
     };
@@ -2999,16 +3022,35 @@ const avatarRatioFor = (spec) => {
  * nextAction never yields work at the gate, so this function is safe to call
  * from the poll endpoint and the resume sweep alike.
  */
+// Identifies this process in leases. Each action also gets its own token, so two
+// workers on the same instance cannot mistake each other's lease for their own.
+const INSTANCE_ID = randomUUID().slice(0, 8);
+const LEASE_RENEW_MS = 60 * 1000;
+
+/** Actions nobody should pick: claimed here, or leased by any instance. */
+const takenActions = (job) => {
+    const local = [...claimedActions]
+        .filter((k) => k.startsWith(`${job.id}#`))
+        .map((k) => k.slice(job.id.length + 1));
+    return new Set([...local, ...activeLeaseKeys(job)]);
+};
+
+/**
+ * Advance a job by one step.
+ *
+ * Returns the (possibly unchanged) job. `awaiting_avatar` returns immediately —
+ * nextAction never yields work at the gate, so this function is safe to call
+ * from the poll endpoint and the resume sweep alike.
+ *
+ * The action is leased on the job entity before any work starts, so only one
+ * worker on any instance performs it; the result and the release are written in
+ * one transaction.
+ */
 const tickJob = async (jobId, presetAction = null) => {
     let job = await loadJob(jobId);
     if (!job) return { skipped: 'missing' };
 
-    const claimedForJob = new Set(
-        [...claimedActions]
-            .filter((k) => k.startsWith(`${jobId}#`))
-            .map((k) => k.slice(jobId.length + 1))
-    );
-    const action = presetAction || nextAction(job, { exclude: claimedForJob });
+    const action = presetAction || nextAction(job, { exclude: takenActions(job) });
     if (action.type === ACTION.WAIT_APPROVAL || action.type === ACTION.NOTHING) {
         return { action: action.type, job };
     }
@@ -3016,15 +3058,42 @@ const tickJob = async (jobId, presetAction = null) => {
     const key = claimKey(jobId, action);
     if (claimedActions.has(key)) return { skipped: 'in-flight' };
     claimedActions.add(key);
+
+    const owner = `${INSTANCE_ID}:${randomUUID().slice(0, 8)}`;
+    let heartbeat = null;
     try {
+        let leaseResult = null;
+        const leased = await commitJobUpdate(jobId, (cur) => {
+            leaseResult = acquireLease(cur, action, owner);
+            return leaseResult.ok ? leaseResult.job : null;
+        });
+        if (!leased || !leaseResult?.ok) {
+            return { skipped: leaseResult?.reason || 'leased', job: leased };
+        }
+        job = leased;
+
+        // Keep the lease alive while the work runs. If it is lost (an instance
+        // stalled past the TTL and another took over) the work still finishes,
+        // but the guarded commits below make sure only the first result counts.
+        heartbeat = setInterval(() => {
+            commitJobUpdate(jobId, (cur) => {
+                const r = renewLease(cur, action, owner);
+                if (!r.ok) console.warn(`[Autopilot] ${jobId} lost lease on ${actionKey(action)}`);
+                return r.ok ? r.job : null;
+            }).catch((err) => console.warn(`[Autopilot] ${jobId} lease renewal failed:`, err.message));
+        }, LEASE_RENEW_MS);
+        heartbeat.unref?.();
+
+        const finish = (apply) => commitJobUpdate(jobId, (cur) => releaseLease(apply(cur) || cur, action, owner));
+
         if (action.type === ACTION.GENERATE_AVATAR) {
             const candidates = await renderAvatarCandidates(job, 1);
-            const updated = await commitJobUpdate(jobId, (cur) => setAvatarCandidates(cur, candidates));
+            const updated = await finish((cur) => setAvatarCandidates(cur, candidates));
             return { action: action.type, job: updated };
         }
 
         if (action.type === ACTION.FINALISE) {
-            const updated = await commitJobUpdate(jobId, (cur) => finalise(cur));
+            const updated = await finish((cur) => finalise(cur));
             if (updated) console.log(`[Autopilot] ${updated.id} → ${updated.status}`);
             return { action: action.type, job: updated };
         }
@@ -3034,7 +3103,7 @@ const tickJob = async (jobId, presetAction = null) => {
             if (action.type === ACTION.GENERATE_SCRIPT) {
                 const segments = await generateAutopilotScript(job, idx);
                 let scriptError = null;
-                const updated = await commitJobUpdate(jobId, (cur) => {
+                const updated = await finish((cur) => {
                     const r = applyScript(cur, idx, segments, {
                         maxClipsPerJob: AUTOPILOT_MAX_CLIPS_PER_JOB,
                     });
@@ -3047,27 +3116,29 @@ const tickJob = async (jobId, presetAction = null) => {
             }
 
             if (action.type === ACTION.GENERATE_CLIP) {
-                const { gcsUri, usedVeo } = await produceAutopilotClip(job, idx, action.clipIdx);
-                const updated = await commitJobUpdate(
-                    jobId,
-                    (cur) => applyClip(cur, idx, action.clipIdx, gcsUri, { usedVeo })
+                const { gcsUri, usedVeo, veoReserved } = await produceAutopilotClip(job, idx, action.clipIdx);
+                const updated = await finish(
+                    (cur) => applyClip(cur, idx, action.clipIdx, gcsUri, { usedVeo, veoReserved })
                 );
                 return { action: action.type, job: updated };
             }
 
             if (action.type === ACTION.COMPOSE) {
                 const finalUri = await deliverAutopilotVariant(job, idx);
-                const updated = await commitJobUpdate(jobId, (cur) => applyCompose(cur, idx, finalUri));
+                const updated = await finish((cur) => applyCompose(cur, idx, finalUri));
                 return { action: action.type, job: updated };
             }
         } catch (err) {
             console.error(`[Autopilot] ${jobId} variant ${idx} failed:`, err.message);
-            const updated = await commitJobUpdate(jobId, (cur) => failVariant(cur, idx, err.message));
+            // failAction ignores a failure for work that is no longer this worker's
+            // to report — another worker may already have succeeded at it.
+            const updated = await finish((cur) => failAction(cur, action, owner, err.message));
             return { action: action.type, job: updated, error: err.message };
         }
 
         return { action: action.type, job };
     } finally {
+        if (heartbeat) clearInterval(heartbeat);
         claimedActions.delete(key);
     }
 };
@@ -3147,13 +3218,9 @@ const driveJob = async (jobId) => {
         const job = await loadJob(jobId);
         if (!job || isTerminal(job)) return;
 
-        // Skip whatever peers are already doing so each worker takes fresh work.
-        const claimedForJob = new Set(
-            [...claimedActions]
-                .filter((k) => k.startsWith(`${jobId}#`))
-                .map((k) => k.slice(jobId.length + 1))
-        );
-        const action = nextAction(job, { exclude: claimedForJob });
+        // Skip whatever peers are already doing — here or on another instance — so
+        // each worker takes fresh work.
+        const action = nextAction(job, { exclude: takenActions(job) });
         if (action.type === ACTION.WAIT_APPROVAL || action.type === ACTION.NOTHING) return;
 
         const isCompose = action.type === ACTION.COMPOSE;
@@ -3167,11 +3234,17 @@ const driveJob = async (jobId) => {
         }
 
         bump(map, jobId, 1);
+        let result = null;
         try {
-            const result = await tickJob(jobId, action);
+            result = await tickJob(jobId, action);
             if (result?.skipped === 'missing') return;
         } finally {
             bump(map, jobId, -1);
+        }
+        // Lost the race for this action: someone else is doing it. Re-read rather
+        // than retry, after a short pause so contending workers spread out.
+        if (result?.skipped === 'leased' || result?.skipped === 'not-needed') {
+            await new Promise((r) => setTimeout(r, 300 + Math.floor(Math.random() * 400)));
         }
     }
 };

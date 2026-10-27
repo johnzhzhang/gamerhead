@@ -36,6 +36,14 @@ import {
     actionKey,
     GAMING_DEVICES,
     DIALOGUE_PACING,
+    LEASE_TTL_MS,
+    activeLeaseKeys,
+    acquireLease,
+    renewLease,
+    releaseLease,
+    failAction,
+    reserveVeo,
+    isActionOutstanding,
 } from '../lib/autopilot-job.js';
 
 const BUCKET = 'test-bucket';
@@ -694,4 +702,127 @@ test('cutout mode is dropped for layouts where it cannot work', () => {
 
 test('cutout mode defaults to off', () => {
     assert.strictEqual(validateJobSpec(goodSpec(), LIMITS).spec.removeBackground, false);
+});
+
+
+// ── cross-instance leases ────────────────────────────────────────────────────
+//
+// These model the production failure: several Cloud Run instances each running
+// workers on one job, with only an in-process claim set to keep them apart.
+
+const clip = (v, c) => ({ type: ACTION.GENERATE_CLIP, variantIdx: v, clipIdx: c });
+
+test('only one worker anywhere can lease an action', () => {
+    const job = runningJob(1, 2);
+    const a = acquireLease(job, clip(0, 0), 'inst-A:1', { now: 1000 });
+    assert.strictEqual(a.ok, true);
+    // Instance B sees the committed lease and is refused.
+    const b = acquireLease(a.job, clip(0, 0), 'inst-B:1', { now: 2000 });
+    assert.strictEqual(b.ok, false);
+    assert.strictEqual(b.reason, 'leased');
+    // A different clip is free.
+    assert.strictEqual(acquireLease(a.job, clip(0, 1), 'inst-B:1', { now: 2000 }).ok, true);
+});
+
+test('leased actions are skipped by nextAction on every instance', () => {
+    let job = runningJob(1, 2);
+    job = acquireLease(job, clip(0, 0), 'inst-A:1', { now: Date.now() }).job;
+    const next = nextAction(job, { exclude: activeLeaseKeys(job) });
+    assert.deepStrictEqual([next.type, next.clipIdx], [ACTION.GENERATE_CLIP, 1]);
+});
+
+test('an expired lease is taken over, so a vanished instance does not strand work', () => {
+    const job = runningJob(1, 1);
+    const a = acquireLease(job, clip(0, 0), 'inst-A:1', { now: 0 });
+    assert.strictEqual(acquireLease(a.job, clip(0, 0), 'inst-B:1', { now: LEASE_TTL_MS - 1 }).ok, false);
+    assert.strictEqual(acquireLease(a.job, clip(0, 0), 'inst-B:1', { now: LEASE_TTL_MS + 1 }).ok, true);
+    assert.strictEqual(activeLeaseKeys(a.job, { now: LEASE_TTL_MS + 1 }).size, 0);
+});
+
+test('renewal keeps a long action leased and fails once the lease is someone else’s', () => {
+    const job = runningJob(1, 1);
+    let j = acquireLease(job, clip(0, 0), 'inst-A:1', { now: 0 }).job;
+    j = renewLease(j, clip(0, 0), 'inst-A:1', { now: LEASE_TTL_MS - 10 }).job;
+    assert.strictEqual(acquireLease(j, clip(0, 0), 'inst-B:1', { now: LEASE_TTL_MS + 10 }).ok, false,
+        'renewed lease still holds past the original expiry');
+    const takenOver = acquireLease(j, clip(0, 0), 'inst-B:1', { now: 3 * LEASE_TTL_MS }).job;
+    assert.strictEqual(renewLease(takenOver, clip(0, 0), 'inst-A:1', { now: 3 * LEASE_TTL_MS }).ok, false);
+});
+
+test('releasing removes only the caller’s own lease', () => {
+    const job = runningJob(1, 2);
+    let j = acquireLease(job, clip(0, 0), 'inst-A:1', { now: 0 }).job;
+    j = acquireLease(j, clip(0, 1), 'inst-B:1', { now: 0 }).job;
+    j = releaseLease(j, clip(0, 1), 'inst-A:1', { now: 1 });
+    assert.strictEqual(activeLeaseKeys(j, { now: 1 }).size, 2, 'A cannot release B’s lease');
+    j = releaseLease(j, clip(0, 0), 'inst-A:1', { now: 1 });
+    assert.deepStrictEqual([...activeLeaseKeys(j, { now: 1 })], [actionKey(clip(0, 1))]);
+});
+
+test('no lease is granted for work that is already done', () => {
+    let job = runningJob(1, 1);
+    job = applyClip(job, 0, 0, `gs://${BUCKET}/c.mp4`);
+    const r = acquireLease(job, clip(0, 0), 'inst-B:1', { now: 0 });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.reason, 'not-needed');
+    assert.strictEqual(isActionOutstanding(job, { type: ACTION.COMPOSE, variantIdx: 0 }), true);
+});
+
+test('a late duplicate clip does not replace the first one', () => {
+    let job = runningJob(1, 2);
+    job = applyClip(job, 0, 0, `gs://${BUCKET}/first.mp4`);
+    job = applyClip(job, 0, 0, `gs://${BUCKET}/duplicate.mp4`, { usedVeo: true });
+    assert.strictEqual(job.variants[0].clipUris[0], `gs://${BUCKET}/first.mp4`);
+    assert.strictEqual(job.counters.veoUsed, 0, 'a discarded duplicate is not counted');
+});
+
+test('a late duplicate composite does not overwrite the delivered video', () => {
+    let job = runningJob(1, 1);
+    job = applyClip(job, 0, 0, `gs://${BUCKET}/c.mp4`);
+    job = applyCompose(job, 0, `gs://${BUCKET}/final-1.mp4`);
+    job = applyCompose(job, 0, `gs://${BUCKET}/final-2.mp4`);
+    assert.strictEqual(job.variants[0].finalUri, `gs://${BUCKET}/final-1.mp4`);
+});
+
+test('a duplicate worker’s failure cannot fail a variant that already moved on', () => {
+    // The observed failure: clips all done, variant in compose, then a duplicate
+    // worker's Veo error marked the whole variant failed.
+    let job = runningJob(1, 1);
+    job = acquireLease(job, clip(0, 0), 'inst-A:1', { now: Date.now() }).job;
+    job = applyClip(job, 0, 0, `gs://${BUCKET}/c.mp4`);
+    assert.strictEqual(job.variants[0].stage, VARIANT_STAGE.COMPOSE);
+    assert.strictEqual(failAction(job, clip(0, 0), 'inst-B:1', 'Veo returned no video'), null);
+    assert.strictEqual(failAction(job, clip(0, 0), 'inst-A:1', 'too late'), null,
+        'even the holder cannot fail work that is already complete');
+});
+
+test('the lease holder still fails a variant when its own work fails', () => {
+    let job = runningJob(1, 2);
+    job = acquireLease(job, clip(0, 0), 'inst-A:1', { now: Date.now() }).job;
+    const failed = failAction(job, clip(0, 0), 'inst-A:1', 'blocked');
+    assert.strictEqual(failed.variants[0].stage, VARIANT_STAGE.FAILED);
+    assert.strictEqual(failAction(job, clip(0, 0), 'inst-B:1', 'blocked'), null,
+        'a non-holder cannot, while the lease is live');
+});
+
+test('Veo is reserved against the budget before it is called', () => {
+    // Every worker reads the same job; reservations are serialised by the
+    // transaction, so the budget holds however many ask at once.
+    let job = runningJob(3, 4);
+    assert.ok(job.veoBudget > 0);
+    let granted = 0;
+    for (let i = 0; i < 12; i += 1) {
+        const r = reserveVeo(job);
+        if (r.ok) { granted += 1; job = r.job; }
+    }
+    assert.strictEqual(granted, job.veoBudget);
+    assert.strictEqual(job.counters.veoUsed, job.veoBudget);
+});
+
+test('a reserved Veo clip is not counted a second time when it lands', () => {
+    let job = runningJob(1, 2);
+    job = reserveVeo(job).job;
+    job = applyClip(job, 0, 0, `gs://${BUCKET}/v.mp4`, { usedVeo: true, veoReserved: true });
+    assert.strictEqual(job.counters.veoUsed, 1);
+    assert.strictEqual(job.variants[0].veoClips, 1, 'the variant still records it came from Veo');
 });

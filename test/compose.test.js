@@ -293,26 +293,45 @@ test('classic-pip renders the streamer in the right corner, with a white border'
     assertColour(corner, RED, 'rounded corner lets the background through', 60);
 });
 
-test('pip slot goes black once the streamer ends', async () => {
+test('the streamer\'s last frame is held once it ends', async () => {
     const gameplay = await makeClip('gp2.mp4', { color: 'red', width: 1280, height: 720, seconds: 6, freq: 220 });
     const streamer = await makeClip('st2.mp4', { color: 'blue', width: 1280, height: 720, seconds: 2, freq: 660 });
     const out = path.join(TMP, 'pip-tail.mp4');
-
     const result = await composeVideo({
         gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
         layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'top-right',
     });
     const { streamer: box } = result.geometry;
+    const at = (t) => samplePixel(out, box.x + box.w / 2, box.y + box.h / 2, t);
+    assertColour(await at(1.0), BLUE, 'streamer visible at t=1s');
+    assertColour(await at(4.5), BLUE, 'last frame held at t=4.5s, not a black slot');
+    assertColour(await at(5.8), BLUE, 'and still held at the very end');
+});
 
-    // while the streamer plays
-    assertColour(
-        await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2, 1.0),
-        BLUE, 'streamer visible at t=1s'
-    );
-    // after it ends the browser paints the slot black
-    const after = await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2, 4.5);
-    assert.ok(after[0] < 60 && after[1] < 60 && after[2] < 60,
-        `pip slot should be black at t=4.5s, got rgb(${after.join(',')})`);
+test('stacked layouts hold the last frame too', async () => {
+    const gameplay = await makeClip('gp-stk-tail.mp4', { color: 'red', width: 1280, height: 720, seconds: 5, freq: 220 });
+    const streamer = await makeClip('st-stk-tail.mp4', { color: 'blue', width: 720, height: 1280, seconds: 2, freq: 660 });
+    const out = path.join(TMP, 'stk-tail.mp4');
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'stacked', targetRatio: '16:9', stackedPlacement: 'left',
+    });
+    const { streamer: box } = result.geometry;
+    assertColour(await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2, 4.0), BLUE, 'stacked slot holds');
+});
+
+test('cutout mode holds the keyed streamer instead of letting it vanish', async () => {
+    const gameplay = await makeClip('gp-cut-tail.mp4', { color: 'red', width: 1280, height: 720, seconds: 5, freq: 220 });
+    const streamer = await makeGreenScreenClip('st-cut-tail.mp4', { seconds: 2 });
+    const out = path.join(TMP, 'cut-tail.mp4');
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left', removeBackground: true,
+    });
+    const { streamer: box } = result.geometry;
+    const before = await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2, 1.0);
+    const after = await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2, 4.0);
+    assertColour(after, before, 'the subject is still there after the clip ends', 30);
 });
 
 test('stacked 16:9 puts the streamer in its slot and gameplay beside it', async () => {
@@ -690,9 +709,8 @@ test('the rounded frame lasts the whole composite, after the streamer ends too',
     const { streamer: box } = result.geometry;
     for (const at of [0.1, 3.0, 5.8]) {
         const edge = await samplePixel(out, box.x + box.w / 2, box.y + 1, at);
-        // over the streamer while it plays, over the black slot once it has ended
-        const under = at < 2 ? BLUE : [0, 0, 0];
-        assertColour(edge, strokeOver(under), `border drawn at t=${at}s`);
+        // over the streamer throughout: its last frame is held after it ends
+        assertColour(edge, strokeOver(BLUE), `border drawn at t=${at}s`);
         assertColour(await samplePixel(out, box.x + 2, box.y + 2, at), RED, `corner rounded at t=${at}s`, 60);
     }
 });

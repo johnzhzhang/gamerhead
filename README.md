@@ -549,9 +549,9 @@ thresholds. If they drifted, one avatar would look different depending on which
 path produced the video. The browser version costs 6.67 ms per frame including the gameplay draw, 5×
 inside the 30 fps budget, so the per-pixel work is affordable.
 
-One difference from framed mode: when the streamer clip ends, nothing is drawn and
-the gameplay shows through. Filling black — which is right for a webcam box —
-would leave a hard rectangle on screen.
+When the streamer clip ends before the gameplay, its last frame is held — in both
+modes and both compositors — rather than blanking the slot. Scripts are fitted to
+the gameplay length but come in 4/6/8 s steps, so a short tail is normal.
 
 ### Known limits
 
@@ -739,8 +739,8 @@ picture-in-picture with Canvas and `MediaRecorder`, which cannot work with no ta
 open. `lib/compose.js` is a port of that geometry: same canvas sizes, the same
 cover-fit crop, a picture-in-picture box at 10% of the frame area with 2% padding,
 20 px rounded corners and a 6 px white stroke, the 30% / 35% stacked splits, and
-the same rule that output length follows the gameplay while the streamer's slot
-turns black once it ends. The only omission is the drop shadow behind the PiP box.
+the same rule that output length follows the gameplay while the streamer's last
+frame is held once it ends. The only omission is the drop shadow behind the PiP box.
 
 Two things keep it fast. The rounded-corner mask and the white stroke never change,
 so each is rendered once and looped; expressed as a full-length `geq` they were

@@ -703,7 +703,9 @@ export const compositePipVideo = async (
              // fields are never flat (they carry the subject's lighting), so a
              // distance-to-one-colour key leaves part of the ramp behind. Measured at
              // 1.57ms per PiP-sized frame, ~21x inside the 30fps budget.
-             if (!overlayVideo.ended) {
+             // Keyed every frame, including after the clip ends: the ended video
+             // keeps its final frame, so the cutout holds rather than vanishing.
+             {
                  // Key and choke at the picture-in-picture size, then draw 1:1.
                  //
                  // The model draws a dark contour between the subject and the green
@@ -799,8 +801,6 @@ export const compositePipVideo = async (
                      ctx.drawImage(keyCanvas, overlayX, overlayY);
                  }
              }
-             // When the streamer ends nothing is drawn: the gameplay shows through.
-             // Filling black here would leave a hard rectangle on screen.
          } else if (layout === 'classic-pip') {
              // Rounded Corners & White Border
              ctx.save();
@@ -826,12 +826,9 @@ export const compositePipVideo = async (
              // Clip and Draw Image
              ctx.save();
              ctx.clip();
-             if (!overlayVideo.ended) {
-                 ctx.drawImage(overlayVideo, overlayX, overlayY, overlayWidth, overlayHeight);
-             } else {
-                 ctx.fillStyle = 'black';
-                 ctx.fillRect(overlayX, overlayY, overlayWidth, overlayHeight);
-             }
+             // An ended video keeps presenting its final frame, so drawing it
+             // unconditionally holds the last frame — matching lib/compose.js.
+             ctx.drawImage(overlayVideo, overlayX, overlayY, overlayWidth, overlayHeight);
              ctx.restore();
              
              // Draw Border
@@ -870,12 +867,8 @@ export const compositePipVideo = async (
              ctx.rect(overlayX, overlayY, overlayWidth, overlayHeight);
              ctx.clip();
              
-             if (!overlayVideo.ended) {
-                 ctx.drawImage(overlayVideo, sOffsetX, sOffsetY, sDrawWidth, sDrawHeight);
-             } else {
-                 ctx.fillStyle = 'black';
-                 ctx.fillRect(sOffsetX, sOffsetY, sDrawWidth, sDrawHeight);
-             }
+             // Hold the final frame once the streamer ends (see classic-pip).
+             ctx.drawImage(overlayVideo, sOffsetX, sOffsetY, sDrawWidth, sDrawHeight);
              
              ctx.restore();
              

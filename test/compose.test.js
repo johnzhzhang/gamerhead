@@ -574,3 +574,98 @@ test('the image and video measurements agree on the same content', async () => {
     assert.ok(Math.abs(fromImage.fraction - fromVideo.fraction) < 0.05,
         `image ${fromImage.fraction.toFixed(3)} vs video ${fromVideo.fraction.toFixed(3)}`);
 });
+
+// ── subtitles in the compositing pass, and the static PiP frame ──────────────
+
+/**
+ * An ASS file that draws one solid white block in the middle of a 1280x720 track.
+ * A drawing rather than text, so the assertion does not depend on fonts: if the
+ * block shows up, the subtitle filter ran on the streamer track.
+ */
+const writeBlockAss = (name) => {
+    const file = path.join(TMP, name);
+    fs.writeFileSync(file, [
+        '[Script Info]', 'ScriptType: v4.00+', 'PlayResX: 1280', 'PlayResY: 720', '',
+        '[V4+ Styles]',
+        'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+        'Style: Default,Arial,40,&H00FFFFFF,&H000000FF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
+        '', '[Events]',
+        'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+        'Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\pos(400,200)\\p1}m 0 0 l 480 0 480 320 0 320{\\p0}',
+        '',
+    ].join('\n'));
+    return file;
+};
+
+test('subtitles are burned onto the streamer track inside the composite', async () => {
+    const gameplay = await makeClip('gp-sub.mp4', { color: 'red', width: 1280, height: 720, seconds: 4, freq: 220 });
+    const streamer = await makeClip('st-sub.mp4', { color: 'blue', width: 1280, height: 720, seconds: 4, freq: 660 });
+    const ass = writeBlockAss('block.ass');
+
+    const withSubs = path.join(TMP, 'pip-sub.mp4');
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: withSubs,
+        layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
+        subtitlesPath: ass,
+    });
+    const { streamer: box } = result.geometry;
+    const cx = box.x + box.w / 2;
+    const cy = box.y + box.h / 2;
+
+    const centre = await samplePixel(withSubs, cx, cy);
+    assert.ok(centre.every((c) => c > 200),
+        `the subtitle block should cover the PiP centre, got rgb(${centre.join(',')})`);
+
+    // On the streamer track, not the frame: the gameplay is untouched…
+    assertColour(await samplePixel(withSubs, 1600, 200), RED, 'gameplay is not subtitled');
+    // …and the streamer is still visible around the block.
+    assertColour(await samplePixel(withSubs, box.x + box.w * 0.1, cy), BLUE, 'streamer still visible beside the block');
+    // The frame survives the extra filter.
+    const edge = await samplePixel(withSubs, cx, box.y + 1);
+    assert.ok(edge.every((c) => c > 150), `border still white, got rgb(${edge.join(',')})`);
+    assertColour(await samplePixel(withSubs, box.x + 2, box.y + 2), RED, 'corner still rounded', 60);
+});
+
+test('without subtitles nothing is drawn over the streamer', async () => {
+    const gameplay = await makeClip('gp-nosub.mp4', { color: 'red', width: 1280, height: 720, seconds: 3, freq: 220 });
+    const streamer = await makeClip('st-nosub.mp4', { color: 'blue', width: 1280, height: 720, seconds: 3, freq: 660 });
+    const out = path.join(TMP, 'pip-nosub.mp4');
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
+    });
+    const { streamer: box } = result.geometry;
+    assertColour(await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2), BLUE, 'PiP centre is plain streamer');
+});
+
+test('cutout mode keeps burned-in subtitles', async () => {
+    const gameplay = await makeClip('gp-cut-sub.mp4', { color: 'red', width: 1280, height: 720, seconds: 3, freq: 220 });
+    const streamer = await makeGreenScreenClip('st-cut-sub.mp4', { seconds: 3 });
+    const out = path.join(TMP, 'cut-sub.mp4');
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
+        removeBackground: true, subtitlesPath: writeBlockAss('block-cut.ass'),
+    });
+    const { streamer: box } = result.geometry;
+    const px = await samplePixel(out, box.x + box.w / 2, box.y + box.h / 2);
+    assert.ok(px.every((c) => c > 200), `white subtitles are not keyed away, got rgb(${px.join(',')})`);
+});
+
+test('the rounded frame lasts the whole composite, after the streamer ends too', async () => {
+    // The mask and stroke are now a single rendered frame on loop, so check they
+    // still cover the tail rather than stopping after the first frame or second.
+    const gameplay = await makeClip('gp-tailframe.mp4', { color: 'red', width: 1280, height: 720, seconds: 6, freq: 220 });
+    const streamer = await makeClip('st-tailframe.mp4', { color: 'blue', width: 1280, height: 720, seconds: 2, freq: 660 });
+    const out = path.join(TMP, 'pip-tailframe.mp4');
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
+    });
+    const { streamer: box } = result.geometry;
+    for (const at of [0.1, 3.0, 5.8]) {
+        const edge = await samplePixel(out, box.x + box.w / 2, box.y + 1, at);
+        assert.ok(edge.every((c) => c > 150), `border white at t=${at}s, got rgb(${edge.join(',')})`);
+        assertColour(await samplePixel(out, box.x + 2, box.y + 2, at), RED, `corner rounded at t=${at}s`, 60);
+    }
+});

@@ -2764,15 +2764,29 @@ const deliverAutopilotVariant = async (job, variantIdx) => {
         let streamerTrack = path.join(tmpDir, 'streamer.mp4');
         await concatClipFiles(localClips, streamerTrack, tmpDir);
 
-        // 3. optional burned-in subtitles, built server-side from the shot list
-        if (job.spec.subtitles) {
+        // 3. optional burned-in subtitles, built server-side from the shot list.
+        //
+        // For a composite they are burned inside the compositing encode rather than
+        // in a pass of their own: same look (ASS sized to the streamer track, which
+        // is where they always went), one encode fewer. Streamer-only has no
+        // composite to ride on, so it keeps the dedicated pass.
+        const wantSubtitles = Boolean(job.spec.subtitles);
+        const isComposite = job.spec.layoutType !== 'streamer-only';
+        let subtitlesPath = null;
+        if (wantSubtitles) {
             const srt = segmentsToSrt(variant.scriptSegments);
-            streamerTrack = await burnSrtIntoVideo(streamerTrack, srt, tmpDir, 'streamer-sub.mp4');
+            if (isComposite) {
+                const dimensions = await probeVideoDimensions(streamerTrack);
+                subtitlesPath = path.join(tmpDir, 'streamer-subs.ass');
+                await writeFile(subtitlesPath, buildAssFromSrt(srt, dimensions), 'utf8');
+            } else {
+                streamerTrack = await burnSrtIntoVideo(streamerTrack, srt, tmpDir, 'streamer-sub.mp4');
+            }
         }
 
         // 4. composite (or not, for streamer-only)
         let deliverable = streamerTrack;
-        if (job.spec.layoutType !== 'streamer-only') {
+        if (isComposite) {
             const gameplayLocal = path.join(tmpDir, 'gameplay.src');
             await downloadGcsToFile(job.spec.gameplayGcsUri, gameplayLocal);
             deliverable = path.join(tmpDir, 'final.mp4');
@@ -2786,6 +2800,7 @@ const deliverAutopilotVariant = async (job, variantIdx) => {
                 stackedPlacement: job.spec.stackedPlacement,
                 volumes: job.spec.volumes,
                 removeBackground: Boolean(job.spec.removeBackground),
+                subtitlesPath,
             });
         } else {
             // Validation gate still applies: the concatenation must be playable.

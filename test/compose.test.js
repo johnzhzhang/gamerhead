@@ -92,6 +92,13 @@ const assertColour = (got, want, label, tol = 40) => {
     );
 };
 
+
+/**
+ * The PiP stroke is semi-transparent white over whatever is beneath it, so the
+ * expected colour is a blend, not white.
+ */
+const strokeOver = (under) => under.map((c) => Math.round(c + (255 - c) * constants.PIP_BORDER_OPACITY));
+
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
 // ── 1. geometry, hand-derived from the browser formulas ──────────────────────
@@ -278,8 +285,7 @@ test('classic-pip renders the streamer in the right corner, with a white border'
 
     // On the stroke → white. Sample mid-edge to avoid the corner radius.
     const edge = await samplePixel(out, box.x + box.w / 2, box.y + 1);
-    assert.ok(edge[0] > 150 && edge[1] > 150 && edge[2] > 150,
-        `pip border should be white-ish, got rgb(${edge.join(',')})`);
+    assertColour(edge, strokeOver(BLUE), 'pip border is semi-transparent white over the streamer');
 
     // Just outside the rounded corner the background must show through, proving
     // the corners really are rounded rather than square.
@@ -536,8 +542,7 @@ test('framed mode is untouched by the new option', async () => {
     assert.strictEqual(result.key, null);
     const { streamer: box } = result.geometry;
     const edge = await samplePixel(out, box.x + box.w / 2, box.y + 1);
-    assert.ok(edge[0] > 150 && edge[1] > 150 && edge[2] > 150,
-        'the white webcam border still renders when background removal is off');
+    assertColour(edge, strokeOver(BLUE), 'the webcam border still renders when background removal is off');
 });
 
 test('measureGreenScreenImage judges an in-memory image the same way', async () => {
@@ -622,7 +627,7 @@ test('subtitles are burned onto the streamer track inside the composite', async 
     assertColour(await samplePixel(withSubs, box.x + box.w * 0.1, cy), BLUE, 'streamer still visible beside the block');
     // The frame survives the extra filter.
     const edge = await samplePixel(withSubs, cx, box.y + 1);
-    assert.ok(edge.every((c) => c > 150), `border still white, got rgb(${edge.join(',')})`);
+    assertColour(edge, strokeOver(BLUE), 'border still drawn');
     assertColour(await samplePixel(withSubs, box.x + 2, box.y + 2), RED, 'corner still rounded', 60);
 });
 
@@ -665,7 +670,23 @@ test('the rounded frame lasts the whole composite, after the streamer ends too',
     const { streamer: box } = result.geometry;
     for (const at of [0.1, 3.0, 5.8]) {
         const edge = await samplePixel(out, box.x + box.w / 2, box.y + 1, at);
-        assert.ok(edge.every((c) => c > 150), `border white at t=${at}s, got rgb(${edge.join(',')})`);
+        // over the streamer while it plays, over the black slot once it has ended
+        const under = at < 2 ? BLUE : [0, 0, 0];
+        assertColour(edge, strokeOver(under), `border drawn at t=${at}s`);
         assertColour(await samplePixel(out, box.x + 2, box.y + 2, at), RED, `corner rounded at t=${at}s`, 60);
     }
+});
+
+test('the PiP stroke is semi-transparent, not opaque white', async () => {
+    const gameplay = await makeClip('gp-alpha.mp4', { color: 'red', width: 1280, height: 720, seconds: 2, freq: 220 });
+    const streamer = await makeClip('st-alpha.mp4', { color: 'black', width: 1280, height: 720, seconds: 2, freq: 660 });
+    const out = path.join(TMP, 'pip-alpha.mp4');
+    const result = await composeVideo({
+        gameplayPath: gameplay, streamerPath: streamer, outputPath: out,
+        layout: 'classic-pip', targetRatio: '16:9', pipPlacement: 'bottom-left',
+    });
+    const { streamer: box } = result.geometry;
+    const edge = await samplePixel(out, box.x + box.w / 2, box.y + 1);
+    // Over a black streamer, opaque white would read ~255; half-white reads ~128.
+    assert.ok(edge.every((c) => c > 90 && c < 170), `stroke should be mid-grey over black, got rgb(${edge.join(',')})`);
 });

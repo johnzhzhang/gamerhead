@@ -19,6 +19,13 @@ const CUTOUT_EDGE_CHOKE = 3;
  * being upscaled; the ceiling keeps the per-frame budget in reach on a slow machine.
  * See the note where the canvas is sized.
  */
+/**
+ * Opacity of the white picture-in-picture stroke. Opaque white read as a hard frame,
+ * worst on a light streamer background. Must match PIP_BORDER_OPACITY in lib/compose.js
+ * so the wizard and Autopilot render the same frame.
+ */
+const PIP_BORDER_OPACITY = 0.5;
+
 const MIN_COMPOSITE_SHORT_SIDE = 1080;
 const MAX_COMPOSITE_SHORT_SIDE = 1440;
 
@@ -829,7 +836,7 @@ export const compositePipVideo = async (
              
              // Draw Border
              ctx.shadowBlur = 0;
-             ctx.strokeStyle = "white";
+             ctx.strokeStyle = `rgba(255, 255, 255, ${PIP_BORDER_OPACITY})`;
              ctx.lineWidth = 6;
              ctx.stroke();
              

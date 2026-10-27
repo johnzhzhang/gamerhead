@@ -376,11 +376,14 @@ export const burnSubtitlesServer = async (
     srt: string,
     onProgress?: (msg: string) => void,
     saveToGcs = false,
+    // Layout of the composite, so the server can keep subtitles off the streamer.
+    layout?: { layoutType: string; targetRatio: string; pipPlacement?: string; stackedPlacement?: string },
 ): Promise<RenderResult> => {
     const formData = new FormData();
     const ext = videoBlob.type.includes('webm') ? 'webm' : 'mp4';
     formData.append('video', videoBlob, `input.${ext}`);
     formData.append('srt', srt);
+    if (layout) formData.append('layout', JSON.stringify(layout));
     if (saveToGcs) formData.append('saveToGcs', 'true');
     if (onProgress) onProgress('Burning subtitles into final video...');
 

@@ -2,7 +2,9 @@
 FROM node:20-slim
 
 # 安装 FFmpeg 用于服务端视频拼接
-RUN apt-get update && apt-get install -y ffmpeg --no-install-recommends \
+# fonts-liberation：字幕按 Arial 字宽排版，Liberation Sans 与 Arial 等宽兼容。
+# 不装的话 fontconfig 会把 Arial 映射到更宽的 DejaVu Sans Bold，行宽估算就不准了。
+RUN apt-get update && apt-get install -y ffmpeg fonts-liberation --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 设置工作目录

@@ -508,7 +508,9 @@ const Studio: React.FC<StudioProps> = ({
               if (srt.trim()) {
                   // The subtitle pass runs server-side, so it can persist the
                   // result in the same round trip.
-                  const burned = await burnSubtitlesServer(compositeBlob, srt, setExportProgress, true);
+                  const burned = await burnSubtitlesServer(compositeBlob, srt, setExportProgress, true, {
+                      layoutType, targetRatio: targetAspectRatio, pipPlacement, stackedPlacement,
+                  });
                   finalBlob = burned.blob;
                   gcsUri = burned.gcsUri;
               }

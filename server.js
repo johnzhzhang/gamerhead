@@ -54,7 +54,8 @@ import {
     failAction,
     reserveVeo,
 } from './lib/autopilot-job.js';
-import { composeVideo, probeMedia, measureGreenScreenImage } from './lib/compose.js';
+import { composeVideo, probeMedia, measureGreenScreenImage, computeLayout } from './lib/compose.js';
+import { buildSubtitleAss } from './lib/subtitles.js';
 
 const require = createRequire(import.meta.url);
 const multer = require('multer');
@@ -1901,71 +1902,41 @@ const upload = multer({
 
 const escapeSubtitleFilterPath = (p) => p.replace(/\\/g, '/').replace(/'/g, "\\'").replace(/:/g, '\\:');
 
-// Parse SRT timestamps (HH:MM:SS,mmm) into ASS timestamps (H:MM:SS.cc).
-const srtTimeToAss = (t) => {
-    const m = t.trim().match(/^(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})$/);
-    if (!m) return '0:00:00.00';
-    const [, h, mm, ss, ms] = m;
-    const cs = Math.round(parseInt(ms.padEnd(3, '0'), 10) / 10);
-    return `${parseInt(h, 10)}:${mm}:${ss}.${String(cs).padStart(2, '0')}`;
-};
-
-// Convert SRT text to ASS dialogue lines. Uses \N for line breaks.
-const srtToAssDialogues = (srt) => {
-    const blocks = srt.replace(/\r\n/g, '\n').split(/\n{2,}/);
-    const lines = [];
-    for (const block of blocks) {
-        const parts = block.trim().split('\n');
-        if (parts.length < 2) continue;
-        const timeLine = parts.find(l => l.includes('-->'));
-        if (!timeLine) continue;
-        const timeIdx = parts.indexOf(timeLine);
-        const [startRaw, endRaw] = timeLine.split('-->').map(s => s.trim());
-        const text = parts.slice(timeIdx + 1).join('\\N').replace(/\{/g, '\\{').replace(/\}/g, '\\}');
-        if (!text.trim()) continue;
-        lines.push(`Dialogue: 0,${srtTimeToAss(startRaw)},${srtTimeToAss(endRaw)},Default,,0,0,0,,${text}`);
+/**
+ * The streamer's box in a `width` x `height` frame, for subtitles to keep clear of.
+ * `layout` is { layoutType, targetRatio, pipPlacement, stackedPlacement } as the
+ * client and Autopilot specs carry it; the box is computed by the compositor's own
+ * geometry and scaled to the frame, since the wizard's canvas follows the gameplay
+ * resolution. Returns null for streamer-only or when the layout is unknown.
+ */
+const streamerBoxFor = (layout, width, height) => {
+    if (!layout || !layout.layoutType || layout.layoutType === 'streamer-only') return null;
+    try {
+        const targetRatio = layout.targetRatio || (width >= height ? '16:9' : '9:16');
+        const geo = computeLayout({
+            layout: layout.layoutType, targetRatio,
+            pipPlacement: layout.pipPlacement, stackedPlacement: layout.stackedPlacement,
+            gameplayWidth: width, gameplayHeight: height, streamerWidth: 1280, streamerHeight: 720,
+        });
+        if (!geo.streamer) return null;
+        const k = width / geo.width;
+        const b = geo.streamer;
+        return { x: b.x * k, y: b.y * k, w: b.w * k, h: b.h * k };
+    } catch {
+        return null;
     }
-    return lines.join('\n');
 };
 
 /**
- * Build a complete ASS subtitle file with the video's real dimensions as
- * PlayResX/Y. This bypasses the SRT→ASS conversion inside libass that would
- * otherwise use PlayResY=288 and blow up our pixel-sized FontSize.
- *
- * Rules of thumb for streaming-variety look, all in pixels:
- *   fontSize = ~4.2% of height (clamped 26..64)
- *   outline  = ~10% of fontSize (min 3)
- *   shadow   = ~6% of fontSize  (min 2)
- *   marginV  = ~7% of height    (min 40)
+ * ASS for an SRT on a frame of `dimensions`, keeping clear of the streamer when a
+ * layout is given. All sizing, line breaking and placement lives in
+ * lib/subtitles.js so every subtitle pass looks the same.
  */
-const buildAssFromSrt = (srt, dimensions) => {
+const buildAssFromSrt = (srt, dimensions, { layout = null, avoid = undefined } = {}) => {
     const width = dimensions?.width || 1920;
     const height = dimensions?.height || 1080;
-    const fontSize = Math.max(26, Math.min(64, Math.round(height * 0.042)));
-    const outline = Math.max(3, Math.round(fontSize * 0.10));
-    const shadow = Math.max(2, Math.round(fontSize * 0.06));
-    const marginV = Math.max(40, Math.round(height * 0.07));
-
-    const styleLine = `Style: Default,Arial,${fontSize},&H00FFFFFF,&H000000FF,` +
-        `&H00000000,&H80000000,1,0,0,0,100,100,0.4,0,1,${outline},${shadow},` +
-        `2,80,80,${marginV},1`;
-
-    return `[Script Info]
-ScriptType: v4.00+
-PlayResX: ${width}
-PlayResY: ${height}
-ScaledBorderAndShadow: yes
-WrapStyle: 0
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-${styleLine}
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-${srtToAssDialogues(srt)}
-`;
+    const box = avoid !== undefined ? avoid : streamerBoxFor(layout, width, height);
+    return buildSubtitleAss(srt, { width, height, avoid: box });
 };
 
 /**
@@ -2000,9 +1971,9 @@ const probeVideoDimensions = async (videoPath) => {
  * (video_height / 288) → 3.75x at 1080p, 6.67x at 1920p, wrapping text and
  * blowing letters off-screen.
  */
-const burnSrtIntoVideo = async (inputPath, srt, tmpDir, outputName = 'final.mp4') => {
+const burnSrtIntoVideo = async (inputPath, srt, tmpDir, outputName = 'final.mp4', { layout = null } = {}) => {
     const dimensions = await probeVideoDimensions(inputPath);
-    const assContent = buildAssFromSrt(srt, dimensions);
+    const assContent = buildAssFromSrt(srt, dimensions, { layout });
     const assPath = path.join(tmpDir, `subs-${randomUUID()}.ass`);
     await writeFile(assPath, assContent, 'utf8');
 
@@ -2139,6 +2110,9 @@ apiRouter.post('/gemini/burn-subtitles', upload.any(), async (req, res) => {
         return res.status(400).json({ error: 'srt field is required and non-empty' });
     }
     const saveToGcs = String(req.body?.saveToGcs || '') === 'true';
+    // Optional layout of the composite, so subtitles can keep clear of the streamer.
+    let layout = null;
+    try { layout = req.body?.layout ? JSON.parse(req.body.layout) : null; } catch { layout = null; }
 
     const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'burn-'));
 
@@ -2147,7 +2121,7 @@ apiRouter.post('/gemini/burn-subtitles', upload.any(), async (req, res) => {
         const inputPath = path.join(tmpDir, `input.${ext}`);
         await writeFile(inputPath, videoFile.buffer);
 
-        const finalPath = await burnSrtIntoVideo(inputPath, srt, tmpDir, 'final.mp4');
+        const finalPath = await burnSrtIntoVideo(inputPath, srt, tmpDir, 'final.mp4', { layout });
 
         if (saveToGcs) {
             const gcsUri = await uploadExportToBucket({
@@ -2844,7 +2818,7 @@ const deliverAutopilotVariant = async (job, variantIdx) => {
         if (wantSubtitles) {
             const srt = segmentsToSrt(variant.scriptSegments);
             if (isComposite) {
-                subtitlesAss = (dimensions) => buildAssFromSrt(srt, dimensions);
+                subtitlesAss = ({ width, height, avoid }) => buildAssFromSrt(srt, { width, height }, { avoid });
             } else {
                 streamerTrack = await burnSrtIntoVideo(streamerTrack, srt, tmpDir, 'streamer-sub.mp4');
             }

@@ -551,6 +551,27 @@ configure_autopilot() {
         done
     fi
 
+    # 合并而不是覆盖：--cors-file 会整体替换桶上的规则。同一个桶被两个服务共用、
+    # 或者客户已经为自定义域名加过 Origin 时，覆盖会让那些来源的上传静默失败 ——
+    # 实测从老版本升级一个测试服务时，正是这样把线上服务的两个 Origin 冲掉了。
+    # 已有 Origin 全部保留，只追加本服务需要的。
+    #
+    # Merge rather than replace: --cors-file replaces the bucket's whole rule set. When
+    # two services share a bucket, or a custom-domain origin was added by hand, a
+    # replace silently breaks uploads from those origins — upgrading a test service
+    # did exactly that to the production service's two origins. Existing origins are
+    # kept; only this service's are added.
+    AP_EXISTING_ORIGINS=$(gcloud storage buckets describe "gs://${AP_BUCKET}" --format="value(cors_config)" \
+        2>/dev/null </dev/null | tr -d "'\"[]" | tr ',' '\n' | grep -oE 'https?://[A-Za-z0-9._:-]+' | sort -u)
+    if [ -n "$AP_EXISTING_ORIGINS" ]; then
+        echo "   $(_t "保留桶上已有的 Origin:" "Keeping origins already on the bucket:")"
+        while read -r O; do
+            [ -z "$O" ] && continue
+            echo "     $O"
+            case ", ${AP_ORIGINS}," in *"\"${O}\","*) ;; *) AP_ORIGINS="${AP_ORIGINS}, \"${O}\"" ;; esac
+        done <<< "$AP_EXISTING_ORIGINS"
+    fi
+
     CORS_FILE=$(mktemp)
     cat > "$CORS_FILE" <<CORSEOF
 [

@@ -349,6 +349,40 @@ Nothing about an older deployment blocks this. Firestore in Datastore mode is
 schemaless, so the new `AutopilotJob` kind needs no migration and no index — a
 database created before Autopilot existed accepts the first job as-is.
 
+### How far back an upgrade reaches
+
+Verified again from the oldest release that mode 2 can upgrade: `659708f`
+(2026-04-03, the first Vertex AI / signed-URL version). A service was deployed with
+*that* commit's own `deploy.sh` — Basic auth, `--allow-unauthenticated`, five env
+vars, no Autopilot — and then upgraded with the current script's mode 2:
+
+| | Before | After mode 2 |
+|---|---|---|
+| Config | 5 env vars, 2 vCPU, `max-instances=10` | identical — only the image changed |
+| Access | `allUsers` invoker (Basic auth in-app) | unchanged |
+| `/api/me`, `/api/projects` | 404 (did not exist) | 200, project history reads and writes |
+| Admin | 404 | 403 — correctly closed, no `ADMIN_USERS` set |
+| Signed URLs | — | issued |
+| Autopilot | absent | still off (404) until enabled |
+
+Then mode 3 → Autopilot → enable on that same service: the prerequisite check passed,
+CORS was written, a 15 s gameplay file was PUT straight to the bucket (200), and the
+job stopped at the confirmation gate through three `tick`s.
+
+What this does **not** cover, because those releases cannot be reached by mode 2:
+
+- **Before 2026-04-03** (`GEMINI_API_KEY` era): the old script had no mode 2, and the
+  service has no `GCS_BUCKET_NAME` or `DATASTORE_DATABASE`. Run mode 1 instead. The
+  old API key is ignored by the current code, so it can be removed afterwards.
+- **A project where mode 1 ran before `iamcredentials` was added** (every deployment
+  before 2026-10-26): mode 2 deliberately does not touch APIs or IAM. Run mode 3 → 4
+  once after upgrading; it reports and offers to fix the missing API.
+
+One fix came out of this test. Enabling Autopilot used to *replace* the bucket's CORS
+rule with this service's two origins. With two services on one bucket — exactly the
+test setup — that removed the other service's origins and would have broken its
+uploads. Existing origins are now kept and this service's are added.
+
 ### The upgrade path, verified end to end
 
 Checked against a service deployed from the pre-Autopilot commit with the *old*
@@ -663,6 +697,22 @@ transaction, because a plain read-modify-write loses updates when workers overla
 in testing that showed up as the clip count going backwards and a failed variant
 reverting to running.
 
+**One action, one worker — across instances.** Every poll starts workers on
+whichever instance it lands on, and Cloud Run adds instances under CPU load, so an
+in-process claim was not enough: one measured batch delivered 15 composites for 3
+variants across 6 instances, and another sent 72 Omni requests in a minute for 12
+clips, exhausted the quota and failed. Each action is therefore leased on the
+`AutopilotJob` entity itself, inside the same transaction as every other write. A
+lease lasts 3 minutes and its holder renews it every minute, so a vanished instance
+strands its work for at most 3 minutes. Results are first-come: a late duplicate
+clip or composite is discarded, and only the live lease holder can mark a variant
+failed. Verified with three warm instances forced on: every variant delivered
+exactly once, and 24 Omni requests for 24 clips, spread evenly across the three.
+
+With duplicates gone, extra instances now share real work instead of repeating it
+— the same 30 s batch finished in 1m59s with three warm instances against 2m57s with
+one. That is a cost decision, not a default.
+
 ### Two things Autopilot needs that the wizard does not
 
 **Gameplay is uploaded straight to Cloud Storage.** Cloud Run caps an HTTP/1
@@ -680,6 +730,32 @@ cover-fit crop, a picture-in-picture box at 10% of the frame area with 2% paddin
 the same rule that output length follows the gameplay while the streamer's slot
 turns black once it ends. The only omission is the drop shadow behind the PiP box.
 
+Two things keep it fast. The rounded-corner mask and the white stroke never change,
+so each is rendered once and looped; expressed as a full-length `geq` they were
+re-evaluated for every pixel of every frame and took 84 of 102 seconds of a 31 s
+composite on 2 vCPU. The loop is pixel-identical (PSNR ∞ over all 941 frames).
+Subtitles, when enabled, are burned onto the streamer track inside the same encode
+rather than in a pass of their own — same look, one encode fewer, one generation of
+compression fewer. Together that took a composite from about 122 s to about 20 s
+locally. Streamer-only has no composite to ride on and keeps the separate pass.
+
+### Measured batch times
+
+Three videos per batch, Gossip Harbor brief, 9:16 picture-in-picture, subtitles and
+Google Search on, a supplied streamer image; time from confirming the streamer to
+the last download link. Production service, default configuration — 2 vCPU, 2 GiB,
+`min-instances=1`, `AUTOPILOT_CONCURRENCY=4`, `AUTOPILOT_COMPOSE_CONCURRENCY=2`:
+
+| Gameplay | Before the compositor and lease fixes | Now |
+|---|---|---|
+| 15 s | 6m58s | **2m55s** |
+| 30 s | 8m12s | **2m57s** |
+
+Script ~20 s, clips ~45 s–2 min, composite ~30 s–2 min per variant. Clip generation
+is now the longer stage. Raising `AUTOPILOT_CONCURRENCY` to 12 halved it in testing
+but did not shorten a batch while the compositor was the bottleneck; 4 vCPU halved
+the composite before it was optimised. Neither is the default.
+
 ### Costs
 
 A batch is the most expensive thing this app does. Three guards, in order of
@@ -690,7 +766,11 @@ effectiveness:
 2. **`AUTOPILOT_VEO_CLIP_BUDGET`** — Veo stays available as the rescue for a
    safety-blocked clip (it honours `personGeneration: allow_adult`), but it is
    pay-as-you-go, so only a fraction of a batch may fall through to it. Without
-   this, "Omni is out of quota" would quietly become a whole batch of Veo renders
+   this, "Omni is out of quota" would quietly become a whole batch of Veo renders.
+   Each Veo clip is reserved against the budget in a transaction *before* Veo is
+   called, and Autopilot turns off the generic quota-exhaustion fallback to Veo so
+   that path is budgeted too — checking a worker's own copy of the job once let a
+   batch with a budget of 4 start 13 Veo jobs in the same second
 3. **`AUTOPILOT_MAX_CLIPS_PER_JOB`** — refuses an oversized job up front, and again
    once the real shot count is known from the first script
 

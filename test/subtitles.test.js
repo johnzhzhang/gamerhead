@@ -62,13 +62,25 @@ const geoFor = ([layout, ratio, place]) => computeLayout({
 
 // ── layout rules ─────────────────────────────────────────────────────────────
 
-test('captions go above a bottom PiP on portrait and beside it on landscape', () => {
-    const tall = geoFor(['classic-pip', '9:16', 'bottom-left']);
-    const r1 = captionRegion({ width: tall.width, height: tall.height, avoid: tall.streamer });
-    assert.ok(tall.height - r1.marginV < tall.streamer.y, 'baseline sits above the PiP box');
-    const wide = geoFor(['classic-pip', '16:9', 'bottom-left']);
-    const r2 = captionRegion({ width: wide.width, height: wide.height, avoid: wide.streamer });
-    assert.ok(r2.marginL > wide.streamer.x + wide.streamer.w, 'band starts right of the PiP box');
+test('with a bottom PiP captions stay at the bottom, beside the box, on both orientations', () => {
+    for (const L of [['classic-pip', '9:16', 'bottom-left'], ['classic-pip', '9:16', 'bottom-right'],
+        ['classic-pip', '16:9', 'bottom-left'], ['classic-pip', '16:9', 'bottom-right']]) {
+        const g = geoFor(L);
+        const r = captionRegion({ width: g.width, height: g.height, avoid: g.streamer });
+        assert.ok(r.marginV < g.height * 0.1, `${L.join(' ')}: baseline near the bottom (marginV ${r.marginV})`);
+        if (L[2].endsWith('left')) assert.ok(r.marginL > g.streamer.x + g.streamer.w, `${L.join(' ')}: band right of the box`);
+        else assert.ok(g.width - r.marginR < g.streamer.x, `${L.join(' ')}: band left of the box`);
+    }
+});
+
+test('beside a landscape PiP type stays full size; beside a portrait one it shrinks to keep lines single', () => {
+    const size = (L, avoid) => { const g = geoFor(L);
+        return captionFontSize({ width: g.width, height: g.height, region: captionRegion({ width: g.width, height: g.height, avoid: avoid ? g.streamer : null }) }); };
+    const wide = ['classic-pip', '16:9', 'bottom-left'];
+    assert.strictEqual(size(wide, true), size(wide, false));
+    const tall = ['classic-pip', '9:16', 'bottom-left'];
+    assert.ok(size(tall, true) < size(tall, false));
+    assert.ok(size(tall, true) >= 36, `still legible: ${size(tall, true)}px`);
 });
 
 test('captions stay clear of a stacked streamer slot', () => {

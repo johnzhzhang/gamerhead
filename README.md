@@ -36,7 +36,7 @@ Every AI call runs server-side through Vertex AI with Application Default Creden
 
 | Capability | Detail |
 |---|---|
-| **Script generation** | `gemini-3.7-flash` reads your gameplay video plus the project details and returns a timed shot list (start/end, duration, streamer action, dialogue) as structured JSON. Optional Google Search grounding pulls in real facts about the game. |
+| **Script generation** | `gemini-3.8-flash` reads your gameplay video plus the project details and returns a timed shot list (start/end, duration, streamer action, dialogue) as structured JSON. Optional Google Search grounding pulls in real facts about the game. |
 | **Avatar generation** | `gemini-3.1-flash-image` renders the streamer at the exact aspect ratio the layout needs. You can supply a reference image to lock the character's look and only describe the pose. Every generated avatar is persisted to `gs://<bucket>/avatars/` and listed in the Avatar Lab so it can be reused without paying for a new generation. |
 | **Clip generation** | `gemini-omni-1.1-flash-preview` animates the avatar per shot, with speech. The model is not user-selectable: the server transparently falls back to `gemini-omni-flash-preview` (on quota) and to Veo 3.1 (on quota exhaustion or a content-safety block). Generate one take or two in parallel and pick the better one. Clips can chain from the previous clip's last frame for continuity. |
 | **Composition** | FFmpeg concatenates the clips server-side; the browser then composites the streamer over your gameplay as picture-in-picture, stacked, or streamer-only, with an audio mix slider. |
@@ -145,7 +145,7 @@ gcloud beta iap web add-iam-policy-binding \
 | `AUTHORIZED_USERS` | no | GIS mode email allowlist. Empty means anyone who clears the consent screen gets in. |
 | `AUTHORIZED_DOMAIN` | no | GIS mode single-domain restriction, e.g. `example.com`. |
 | `BASIC_AUTH_USERS` | conditional | `user:pass,user2:pass2`. Setting it switches the app into Basic-Auth mode. |
-| `SCRIPT_MODEL` | no | Overrides the script / shot-list model. Defaults to `gemini-3.7-flash` (GA). Must support system instructions, structured output, Google Search grounding and video input on the `global` endpoint. |
+| `SCRIPT_MODEL` | no | Overrides the script / shot-list model. Defaults to `gemini-3.8-flash` (GA; replaces 3.7 Flash, which retires 2027-01-28). Runs at its default thinking level: `LOW` was 6× faster but kept only 42% of shots within their word counts, and over-long lines are cut off mid-sentence. Must support system instructions, structured output, Google Search grounding and video input on the `global` endpoint. |
 | `VIDEO_MODEL` | no | Primary clip-generation model. Defaults to `gemini-omni-1.1-flash-preview`. Any id starting with `veo-` routes to the Veo API instead of the Interactions API. |
 | `VIDEO_MODEL_FALLBACK` | no | Omni model used when the primary is out of quota. Defaults to `gemini-omni-flash-preview` (720p only). |
 | `VIDEO_MODEL_LAST_RESORT` | no | Model used when every Omni candidate is unavailable or the output is safety-blocked. Defaults to `veo-3.1-fast-generate-001`; set to empty to disable the net. |
@@ -655,11 +655,35 @@ length can hold a middle one is dropped. Before this the model was only told
 "16–40 s": a 31 s recording got 22–24 s scripts, and a 14.6 s one got 24 s and lost
 its call to action.
 
-### Variants
+### Variants and recordings
 
 A batch is one brief rendered several ways. Each variant gets its own script with
 a different opening angle (the temperature climbs with the index); all variants
-share the confirmed streamer and the single uploaded gameplay file.
+share the confirmed streamer.
+
+A batch can also carry **several recordings**. Each recording gets the requested
+number of variants, so the batch holds recordings × variants videos — still at most
+10 (`AUTOPILOT_MAX_BATCH`), and the clip ceiling and Veo budget scale with the total.
+Every script is written against its own recording: the model reads the footage
+straight from the bucket by `gs://` URI (about 2.9k input tokens for 31 s, covered by
+the existing `aiplatform.user` role) and is told to react to what is on screen. On a
+15 s and a 30 s cut of the same game, only the 30 s scripts mention the
+coin-unlocked clouds that appear after 20 s. Script length follows each recording,
+so a 15 s and a 30 s recording in one batch get 14 s and 30 s scripts.
+
+Recordings may be of different games. Each can override the game title, store page
+and call to action; whatever it leaves blank is taken from the batch's brief, so
+several recordings of one game need nothing filled in per row. Google Search
+grounding is decided per recording by whether it ends up with a store page.
+
+A single recording is sent exactly as before (`gameplayGcsUri`), and batches stored
+before multi-recording support read as one recording, so nothing needs migrating.
+Downloads are named `<game>-v<n>.mp4` for one recording and `<game>-r<recording>-v<n>.mp4`
+for several, matching how the console groups them.
+
+Measured on production, default configuration, 9:16 with subtitles and Search: one
+30 s recording × 3 finished in 4m10s; a 15 s and a 30 s recording × 2 (4 videos, the
+second with its own call to action) in 3m01s. Every video was delivered exactly once.
 
 ### Getting back to a batch
 
@@ -920,7 +944,7 @@ Only the first hyphen is replaced, so the vendor prefix survives: `veo-3.1-fast-
 userId      browser-generated UUID (localStorage)
 userEmail   resolved server-side from the auth mode
 type        'script' | 'image' | 'video' | 'export'
-model       e.g. 'gemini-3.7-flash', 'veo-3.1-generate-001', 'composite'
+model       e.g. 'gemini-3.8-flash', 'veo-3.1-generate-001', 'composite'
 status      'success' | 'failed'
 timestamp, _serverTime
 meta        { duration?, gcsUri?, aspectRatio?, layout?, subtitles?, error? }

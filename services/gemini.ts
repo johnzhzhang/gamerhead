@@ -8,8 +8,20 @@ import {
 } from "./prompts";
 import { compressVideo } from "../utils/videoUtils";
 
-/** Kept in sync with SCRIPT_MODEL / GEMINI_SCRIPT_MODEL on the server. */
-const SCRIPT_MODEL_LABEL = 'gemini-3.7-flash';
+/**
+ * The script model, for activity logging. The server decides it (SCRIPT_MODEL), so
+ * this follows what the server last reported rather than being hard-coded — a
+ * hard-coded name went stale the moment the server default moved on.
+ */
+let scriptModelLabel = 'script-model';
+const scriptModel = async (): Promise<string> => {
+  if (scriptModelLabel !== 'script-model') return scriptModelLabel;
+  try {
+    const cfg = await (await fetch('/api/config')).json();
+    if (cfg?.scriptModel) scriptModelLabel = cfg.scriptModel;
+  } catch { /* logging only; keep the placeholder */ }
+  return scriptModelLabel;
+};
 import { logEvent } from "./logging";
 import { apiFetch as authFetch } from "./auth";
 
@@ -103,7 +115,8 @@ export const generateStreamerScript = async (
     });
 
     if (onStatusUpdate) onStatusUpdate("Finalizing...", 100);
-    logEvent('script', SCRIPT_MODEL_LABEL, 'success');
+    if (result.model) scriptModelLabel = result.model;
+    logEvent('script', scriptModelLabel, 'success');
     return {
       fullText: result.fullText,
       segments: result.segments,
@@ -112,7 +125,7 @@ export const generateStreamerScript = async (
       inlineData: result.inlineData || inlineData
     };
   } catch (error: any) {
-    logEvent('script', SCRIPT_MODEL_LABEL, 'failed', { error: error.message });
+    logEvent('script', await scriptModel(), 'failed', { error: error.message });
     throw error;
   }
 };
@@ -183,10 +196,10 @@ export const analyzeScriptForVeo = async (script: string): Promise<VeoSegment[]>
       body: JSON.stringify({ prompt })
     });
 
-    logEvent('script', SCRIPT_MODEL_LABEL, 'success', { segments: segments.length });
+    logEvent('script', await scriptModel(), 'success', { segments: segments.length });
     return segments;
   } catch (error: any) {
-    logEvent('script', SCRIPT_MODEL_LABEL, 'failed', { error: error.message });
+    logEvent('script', await scriptModel(), 'failed', { error: error.message });
     throw new Error(`Failed to analyze script for video generation: ${error.message}`);
   }
 };

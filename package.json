@@ -10,7 +10,7 @@
     "dev": "node server.js",
     "build": "vite build",
     "start": "cross-env NODE_ENV=production node server.js",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "@google-cloud/datastore": "^9.1.0",

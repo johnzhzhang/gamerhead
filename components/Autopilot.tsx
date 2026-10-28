@@ -34,9 +34,25 @@ import {
   useUploadedAvatar,
   type AutopilotConfig,
   type AutopilotJobView,
+  type AutopilotGameplaySpec,
 } from '../services/autopilot';
 
 const POLL_MS = 6000;
+
+interface RecordingRow {
+  key: string;
+  file: File | null;
+  /** Optional per-recording brief; blank means "use the batch's". */
+  gameTitle: string;
+  gameUrl: string;
+  callToAction: string;
+  /** Whether the per-recording fields are shown. */
+  custom: boolean;
+}
+let recordingSeq = 0;
+const newRecording = (): RecordingRow => ({
+  key: `rec-${(recordingSeq += 1)}`, file: null, gameTitle: '', gameUrl: '', callToAction: '', custom: false,
+});
 
 /**
  * Fixed choices, same as the wizard. Neither is free text: the device decides how
@@ -328,7 +344,13 @@ const Autopilot: React.FC = () => {
   const [removeBackground, setRemoveBackground] = useState(false);
   const [searchGrounding, setSearchGrounding] = useState(false);
   const [variantCount, setVariantCount] = useState(3);
-  const [gameplayFile, setGameplayFile] = useState<File | null>(null);
+  // One or more recordings. Each row may override the game it shows; blank fields
+  // fall back to the brief above, so the common case — several recordings of the
+  // same game — needs nothing filled in per row.
+  const [recordings, setRecordings] = useState<RecordingRow[]>([newRecording()]);
+  const updateRecording = useCallback((key: string, patch: Partial<RecordingRow>) => {
+    setRecordings((rows) => rows.map((r) => (r.key === key ? { ...r, ...patch } : r)));
+  }, []);
   // Two optional images, both uploaded rather than referenced by URI:
   //   reference — pins the streamer's look while it is generated
   //   streamer  — a finished streamer, which skips generation altogether
@@ -442,11 +464,29 @@ const Autopilot: React.FC = () => {
   const needsGameplay = layoutType !== 'streamer-only';
   const imageAccept = (config?.allowedImageTypes || ['image/png', 'image/jpeg', 'image/webp']).join(',');
   // Grounding has nothing to search without a store page, so the toggle follows it.
-  const groundingAvailable = brief.gameUrl.trim().length > 0;
+  const groundingAvailable = brief.gameUrl.trim().length > 0
+    || (needsGameplay && recordings.some((r) => r.gameUrl.trim().length > 0));
   // Keying only works in a picture-in-picture box: stacked fills its whole slot
   // with the streamer, and streamer-only has no gameplay to sit on.
   const cutoutAvailable = layoutType === 'classic-pip';
-  const estimatedClips = variantCount * 4;
+  const recordingCount = needsGameplay ? recordings.length : 1;
+  // How a batch's videos are named on screen. Single-recording batches keep the
+  // plain "Video n"; with several recordings each is "Recording r · n", numbered
+  // within its recording, matching the download names the server gives them.
+  const jobRecordings = job?.gameplays || [];
+  const multiRecording = jobRecordings.length > 1;
+  const perRecording = job?.variantsPerGameplay || job?.variantCount || 1;
+  const recordingName = (gi: number) => {
+    const g = jobRecordings[gi];
+    const title = g?.gameTitle && g.gameTitle !== job?.gameTitle ? ` — ${g.gameTitle}` : '';
+    return `Recording ${gi + 1}${title}${g?.label ? ` (${g.label})` : ''}`;
+  };
+  const videoName = (idx: number, gi = 0) => (multiRecording
+    ? `R${gi + 1} · ${(idx % perRecording) + 1}`
+    : `Video ${idx + 1}`);
+  const totalVideos = variantCount * recordingCount;
+  const estimatedClips = totalVideos * 4;
+  const overBatch = !!config && totalVideos > config.maxBatch;
 
   // A streamer has to come from somewhere: either a description to generate from,
   // or a finished image the user supplies.
@@ -454,20 +494,36 @@ const Autopilot: React.FC = () => {
   const formValid = useMemo(() => (
     brief.gameTitle.trim().length > 0
     && hasStreamerSource
-    && (!needsGameplay || !!gameplayFile)
+    && (!needsGameplay || recordings.every((r) => !!r.file))
     && variantCount >= 1
-    && (!config || variantCount <= config.maxBatch)
-  ), [brief.gameTitle, hasStreamerSource, needsGameplay, gameplayFile, variantCount, config]);
+    && !overBatch
+  ), [brief.gameTitle, hasStreamerSource, needsGameplay, recordings, variantCount, overBatch]);
 
   const submit = useCallback(async () => {
     setError(null);
     setBusy('Preparing');
     setUploadPct(0);
     try {
+      // Recordings are uploaded one after another so the progress bar means
+      // something; each goes straight to storage.
       let gameplayGcsUri: string | null = null;
-      if (needsGameplay && gameplayFile) {
-        setBusy('Uploading gameplay');
-        gameplayGcsUri = await uploadGameplay(gameplayFile, setUploadPct);
+      const gameplays: AutopilotGameplaySpec[] = [];
+      if (needsGameplay) {
+        for (let i = 0; i < recordings.length; i += 1) {
+          const r = recordings[i];
+          if (!r.file) continue;
+          setBusy(recordings.length > 1 ? `Uploading recording ${i + 1} of ${recordings.length}` : 'Uploading gameplay');
+          setUploadPct(0);
+          const uri = await uploadGameplay(r.file, setUploadPct);
+          gameplays.push({
+            gcsUri: uri,
+            label: r.file.name,
+            gameTitle: r.gameTitle.trim(),
+            gameUrl: r.gameUrl.trim(),
+            callToAction: r.callToAction.trim(),
+          });
+        }
+        gameplayGcsUri = gameplays[0]?.gcsUri || null;
       }
 
       let avatarRefGcsUri: string | null = null;
@@ -496,7 +552,9 @@ const Autopilot: React.FC = () => {
         removeBackground: removeBackground && cutoutAvailable,
         searchGrounding: searchGrounding && groundingAvailable,
         variantCount,
-        gameplayGcsUri,
+        // One recording is sent exactly as before, so single-recording batches
+        // are unchanged end to end.
+        ...(gameplays.length > 1 ? { gameplays } : { gameplayGcsUri }),
         avatarPrompt: brief.avatarPrompt.trim(),
         avatarRefGcsUri,
         avatarImageGcsUri,
@@ -510,7 +568,7 @@ const Autopilot: React.FC = () => {
       setBusy(null);
     }
   }, [
-    needsGameplay, gameplayFile, refFile, ownFile, brief, gamingDevice, dialoguePacing,
+    needsGameplay, recordings, refFile, ownFile, brief, gamingDevice, dialoguePacing,
     targetRatio, layoutType,
     pipPlacement, stackedPlacement, subtitles, removeBackground, cutoutAvailable,
     searchGrounding, groundingAvailable,
@@ -554,6 +612,7 @@ const Autopilot: React.FC = () => {
 
   /** Back to a blank brief. The batch itself is untouched and stays in the list. */
   const reset = useCallback(() => {
+    setRecordings([newRecording()]);
     setJob(null);
     setJobId(null);
     setError(null);
@@ -728,13 +787,20 @@ const Autopilot: React.FC = () => {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-6 items-end">
             <div>
               <label htmlFor="ap-count" className="block text-xs text-gray-400 mb-1.5">
-                How many videos ({config.maxBatch} max)
+                {recordingCount > 1
+                  ? `Videos per recording (${config.maxBatch} max in total)`
+                  : `How many videos (${config.maxBatch} max)`}
               </label>
               <input id="ap-count" type="number" min={1} max={config.maxBatch} value={variantCount}
                      onChange={(e) => setVariantCount(Math.max(1, Math.min(config.maxBatch, Number(e.target.value) || 1)))}
-                     className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200" />
-              <p className="text-[11px] text-gray-500 mt-1.5">
-                Each gets its own script and angle; they share the streamer you confirm next.
+                     aria-invalid={overBatch}
+                     className={`w-full bg-gray-800 border rounded-lg px-3 py-2 text-sm text-gray-200 ${overBatch ? 'border-red-500' : 'border-gray-600'}`} />
+              <p className={`text-[11px] mt-1.5 ${overBatch ? 'text-red-400' : 'text-gray-500'}`} role={overBatch ? 'alert' : undefined}>
+                {recordingCount > 1
+                  ? `${recordingCount} recordings × ${variantCount} = ${totalVideos} video${totalVideos === 1 ? '' : 's'}`
+                    + (overBatch ? ` — over the ${config.maxBatch}-video limit. Lower this or remove a recording.` : '.')
+                    + ' Each gets its own script; all share the streamer you confirm next.'
+                  : 'Each gets its own script and angle; they share the streamer you confirm next.'}
               </p>
             </div>
             <div className="flex flex-col gap-3 pb-1">
@@ -776,24 +842,82 @@ const Autopilot: React.FC = () => {
 
           {needsGameplay && (
             <div className="mt-6">
-              <label htmlFor="ap-file" className="block text-xs text-gray-400 mb-1.5">
-                Gameplay footage (up to {maxMb} MB)
-              </label>
-              <input id="ap-file" type="file" accept={config.allowedGameplayTypes.join(',')}
-                     onChange={(e) => setGameplayFile(e.target.files?.[0] || null)}
-                     className="w-full text-sm text-gray-400 file:mr-3 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:bg-gray-700 file:text-gray-200 hover:file:bg-gray-600" />
-              {gameplayFile && (
-                <p className="text-[11px] text-gray-500 mt-1.5">
-                  {gameplayFile.name} — {(gameplayFile.size / 1048576).toFixed(1)} MB.
-                  Uploaded straight to storage, not through the app.
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="block text-xs text-gray-400">
+                  Gameplay footage (up to {maxMb} MB each)
+                </span>
+                {recordings.length < config.maxBatch && (
+                  <button type="button" onClick={() => setRecordings((rows) => [...rows, newRecording()])}
+                          className="text-xs text-google-blue hover:underline">
+                    + Add another recording
+                  </button>
+                )}
+              </div>
+              <div className="space-y-3">
+                {recordings.map((r, i) => (
+                  <div key={r.key} className={recordings.length > 1 ? 'bg-gray-900/60 border border-gray-700 rounded-lg p-3' : ''}>
+                    <div className="flex items-center gap-3">
+                      {recordings.length > 1 && (
+                        <span className="text-xs text-gray-500 w-6 shrink-0">#{i + 1}</span>
+                      )}
+                      <input id={i === 0 ? 'ap-file' : `ap-file-${r.key}`} type="file"
+                             aria-label={`Gameplay recording ${i + 1}`}
+                             accept={config.allowedGameplayTypes.join(',')}
+                             onChange={(e) => updateRecording(r.key, { file: e.target.files?.[0] || null })}
+                             className="flex-1 min-w-0 text-sm text-gray-400 file:mr-3 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:bg-gray-700 file:text-gray-200 hover:file:bg-gray-600" />
+                      {recordings.length > 1 && (
+                        <button type="button" aria-label={`Remove recording ${i + 1}`}
+                                onClick={() => setRecordings((rows) => rows.filter((x) => x.key !== r.key))}
+                                className="text-xs text-gray-500 hover:text-red-400 shrink-0">
+                          Remove
+                        </button>
+                      )}
+                    </div>
+                    {r.file && (
+                      <p className="text-[11px] text-gray-500 mt-1.5">
+                        {r.file.name} — {(r.file.size / 1048576).toFixed(1)} MB.
+                        {recordings.length === 1 && ' Uploaded straight to storage, not through the app.'}
+                      </p>
+                    )}
+                    {recordings.length > 1 && (
+                      <div className="mt-2">
+                        <label className="flex items-center gap-2 text-xs text-gray-400">
+                          <input type="checkbox" checked={r.custom}
+                                 onChange={(e) => updateRecording(r.key, { custom: e.target.checked })}
+                                 className="w-3.5 h-3.5 accent-google-blue" />
+                          This recording is a different game
+                        </label>
+                        {r.custom && (
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mt-2">
+                            {([
+                              ['gameTitle', 'Game title', brief.gameTitle],
+                              ['gameUrl', 'Store page URL', brief.gameUrl],
+                              ['callToAction', 'Call to action', brief.callToAction],
+                            ] as const).map(([field, label, fallback]) => (
+                              <input key={field} type="text" aria-label={`${label} for recording ${i + 1}`}
+                                     value={r[field]} placeholder={fallback ? `${label} (default: ${fallback})` : label}
+                                     onChange={(e) => updateRecording(r.key, { [field]: e.target.value } as Partial<RecordingRow>)}
+                                     className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-1.5 text-xs text-gray-200 placeholder-gray-500" />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+              {recordings.length > 1 && (
+                <p className="text-[11px] text-gray-500 mt-2">
+                  Each recording gets its own scripts written against its own footage. Fields left
+                  blank use the brief above.
                 </p>
               )}
             </div>
           )}
 
-          {busy === 'Uploading gameplay' && (
+          {busy && busy.startsWith('Uploading') && busy !== 'Uploading your streamer image' && busy !== 'Uploading the reference image' && (
             <div className="mt-4">
-              <p className="text-xs text-gray-400 mb-1.5">Uploading… {Math.round(uploadPct * 100)}%</p>
+              <p className="text-xs text-gray-400 mb-1.5">{busy}… {Math.round(uploadPct * 100)}%</p>
               <Bar value={uploadPct * 100} total={100} />
             </div>
           )}
@@ -920,7 +1044,7 @@ const Autopilot: React.FC = () => {
           <ul className="divide-y divide-gray-700/60">
             {job.variants.map((v) => (
               <li key={v.idx} className="py-3 flex items-center gap-4">
-                <span className="text-xs text-gray-500 w-16 flex-shrink-0">Video {v.idx + 1}</span>
+                <span className="text-xs text-gray-500 w-16 flex-shrink-0">{videoName(v.idx, v.gameplayIdx ?? 0)}</span>
                 <span className={`text-sm flex-shrink-0 w-32 ${
                   v.stage === 'done' ? 'text-google-blue'
                     : v.stage === 'failed' ? 'text-google-red' : 'text-gray-300'
@@ -958,21 +1082,32 @@ const Autopilot: React.FC = () => {
       {job && (job.outputs?.length || 0) > 0 && (
         <Section step="4" title="Your videos"
                  hint="Links stay valid for an hour; reload this page to refresh them.">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {job.outputs!.map((o) => (
-              <div key={o.idx} className="bg-gray-900 rounded-xl border border-gray-700 overflow-hidden">
-                <video src={o.url} controls preload="metadata" className="w-full bg-black" />
-                <div className="p-3 flex items-center justify-between gap-3">
-                  <span className="text-xs text-gray-400">Video {o.idx + 1}</span>
-                  <a href={o.downloadUrl || o.url}
-                     download={o.downloadName || `video-${o.idx + 1}.mp4`}
-                     className="text-xs text-google-blue hover:underline">
-                    Download
-                  </a>
+          {(multiRecording ? jobRecordings.map((g) => g.idx) : [0]).map((gi) => {
+            const items = job.outputs!.filter((o) => !multiRecording || (o.gameplayIdx ?? 0) === gi);
+            if (!items.length) return null;
+            return (
+              <div key={gi} className={multiRecording ? 'mb-8' : ''}>
+                {multiRecording && (
+                  <h4 className="text-sm text-gray-300 mb-3">{recordingName(gi)}</h4>
+                )}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {items.map((o) => (
+                    <div key={o.idx} className="bg-gray-900 rounded-xl border border-gray-700 overflow-hidden">
+                      <video src={o.url} controls preload="metadata" className="w-full bg-black" />
+                      <div className="p-3 flex items-center justify-between gap-3">
+                        <span className="text-xs text-gray-400">{videoName(o.idx, o.gameplayIdx ?? 0)}</span>
+                        <a href={o.downloadUrl || o.url}
+                           download={o.downloadName || `video-${o.idx + 1}.mp4`}
+                           className="text-xs text-google-blue hover:underline">
+                          Download
+                        </a>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
-            ))}
-          </div>
+            );
+          })}
 
           {finished && (
             <div className="mt-8 flex items-center gap-4">

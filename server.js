@@ -53,6 +53,9 @@ import {
     releaseLease,
     failAction,
     reserveVeo,
+    gameplaysOf,
+    gameplayForVariant,
+    briefForVariant,
 } from './lib/autopilot-job.js';
 import { composeVideo, probeMedia, measureGreenScreenImage, computeLayout } from './lib/compose.js';
 import { buildSubtitleAss } from './lib/subtitles.js';
@@ -228,7 +231,8 @@ app.get('/api/health', (req, res) => {
 
 // Public config endpoint — returns non-secret settings needed by the frontend
 app.get('/api/config', (req, res) => {
-    res.json({ googleClientId: GOOGLE_CLIENT_ID || null });
+    // scriptModel is non-secret and lets the client log the model that actually ran.
+    res.json({ googleClientId: GOOGLE_CLIENT_ID || null, scriptModel: GEMINI_SCRIPT_MODEL });
 });
 
 // Token verification endpoint — called by frontend after Google Sign-In
@@ -787,13 +791,20 @@ const getVertexAIGlobalClient = () => {
 //   * gemini-omni-flash-preview     — 720p only, has quota by default
 // The 1.1 model is the primary; if the project has not been granted quota for
 // it, the server transparently falls back to gemini-omni-flash-preview.
-// Script / shot-list model. Gemini 3.7 Flash (GA, released 2026-08-13) supports
-// everything this app needs: system instructions, structured output
-// (responseMimeType + responseSchema), Google Search grounding, and video input,
-// on the `global` endpoint. Note it is a thinking model with MEDIUM by default;
-// thinking_level="MINIMAL" is rejected, so we simply never set it.
-// https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-7-flash
-const GEMINI_SCRIPT_MODEL = process.env.SCRIPT_MODEL || 'gemini-3.7-flash';
+// Script / shot-list model. Gemini 3.8 Flash (GA 2026-09-02, supported to at least
+// 2027-09-02) supports everything this app needs on the `global` endpoint: system
+// instructions, structured output, Google Search grounding, and video input —
+// including reading a recording straight from Cloud Storage by gs:// URI, which
+// Autopilot relies on to write each recording its own dialogue.
+//
+// It replaces 3.7 Flash, which retires on 2027-01-28. Measured on this app's own
+// prompts the two scored the same (duration, word counts, call to action and
+// grounding all 6/6); 3.8 thinks more and took a median 40 s against 24 s. It runs
+// at its default MEDIUM level on purpose: LOW was 6 s but kept only 42% of shots
+// inside their word-count range, and a shot that runs long is cut off mid-sentence.
+// MINIMAL is rejected by 3.8, so thinking is never set at all.
+// https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-8-flash
+const GEMINI_SCRIPT_MODEL = process.env.SCRIPT_MODEL || 'gemini-3.8-flash';
 
 const GEMINI_VIDEO_MODEL = 'gemini-omni-1.1-flash-preview';
 const GEMINI_VIDEO_FALLBACK = 'gemini-omni-flash-preview';
@@ -1214,7 +1225,7 @@ apiRouter.post('/gemini/generate-script', async (req, res) => {
             });
         }
 
-        res.json({ fullText, segments: validatedSegments, groundingUrls, inlineData: inlineData || null });
+        res.json({ fullText, segments: validatedSegments, groundingUrls, inlineData: inlineData || null, model: GEMINI_SCRIPT_MODEL });
     } catch (err) {
         console.error('[Gemini] generate-script error:', err);
         res.status(500).json({ error: err.message });
@@ -2542,14 +2553,24 @@ const gameplayDurationOf = async (gcsUri) => {
     return duration;
 };
 
+/** MIME type of an uploaded recording, from the extension the upload gave it. */
+const gameplayMimeOf = (gcsUri) => {
+    const ext = String(gcsUri).split('.').pop().toLowerCase();
+    return { mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', mkv: 'video/x-matroska', avi: 'video/x-msvideo' }[ext] || 'video/mp4';
+};
+
 const generateAutopilotScript = async (job, variantIdx) => {
     const s = job.spec;
+    // Game, store page, call to action and footage all come from the recording
+    // this variant is composited over, so a batch can mix recordings — and games.
+    const brief = briefForVariant(job, variantIdx);
+    const gameplayUri = s.layoutType !== 'streamer-only' ? brief.gameplayGcsUri : null;
     // The composite lasts as long as the gameplay, so the script must too. A probe
     // failure falls back to the old open range rather than failing the variant.
     let target = null;
-    if (s.layoutType !== 'streamer-only' && s.gameplayGcsUri) {
+    if (gameplayUri) {
         try {
-            target = scriptTargetSeconds(await gameplayDurationOf(s.gameplayGcsUri));
+            target = scriptTargetSeconds(await gameplayDurationOf(gameplayUri));
         } catch (err) {
             console.warn(`[Autopilot] ${job.id} could not read the gameplay length:`, err.message);
         }
@@ -2566,15 +2587,25 @@ const generateAutopilotScript = async (job, variantIdx) => {
         'lead with the atmosphere and mood',
         'lead with a surprising detail a new player would miss',
     ];
-    const angle = angles[variantIdx % angles.length];
+    // The angle follows the variant's position within its recording, so every
+    // recording gets the same spread of openings rather than the later recordings
+    // only ever getting the later angles.
+    const angleIdx = brief.angleIdx;
+    const angle = angles[angleIdx % angles.length];
     const pacing = PACING_WORD_RANGES[s.dialoguePacing] ? s.dialoguePacing : 'Normal';
     const ranges = PACING_WORD_RANGES[pacing];
 
     const promptText = [
-        `You are scripting a short promotional video for the game "${s.gameTitle}".`,
-        s.gameUrl ? `Official store page: ${s.gameUrl}` : '',
-        s.searchGrounding && s.gameUrl
-            ? `Use Google Search to look up "${s.gameTitle}" and its store page above. `
+        `You are scripting a short promotional video for the game "${brief.gameTitle}".`,
+        brief.gameUrl ? `Official store page: ${brief.gameUrl}` : '',
+        gameplayUri
+            ? 'The attached video is the actual gameplay the streamer appears over. Watch it '
+              + 'and react to what happens on screen — the moments, mechanics and rewards it '
+              + 'shows, roughly in the order they appear — so the dialogue belongs to this '
+              + 'footage rather than to the game in general.'
+            : '',
+        brief.searchGrounding
+            ? `Use Google Search to look up "${brief.gameTitle}" and its store page above. `
               + 'Work real, verifiable details into the dialogue — actual mechanics, '
               + 'setting, platforms or standout features — so it sounds like someone who '
               + 'has played it. Do not invent facts you did not find.'
@@ -2582,7 +2613,7 @@ const generateAutopilotScript = async (job, variantIdx) => {
         s.gamingDevice
             ? `Platform / device: ${s.gamingDevice}. ${DEVICE_HINTS[s.gamingDevice] || ''}`
             : '',
-        s.callToAction ? `The video must end on this call to action: ${s.callToAction}` : '',
+        brief.callToAction ? `The video must end on this call to action: ${brief.callToAction}` : '',
         s.extraInstructions ? `Additional direction: ${s.extraInstructions}` : '',
         '',
         `Creative direction for this version: ${angle}.`,
@@ -2610,16 +2641,26 @@ const generateAutopilotScript = async (job, variantIdx) => {
     const ai = getVertexAIGlobalClient();
     const response = await ai.models.generateContent({
         model: GEMINI_SCRIPT_MODEL,
-        contents: [{ role: 'user', parts: [{ text: promptText }] }],
+        // The model reads the recording straight from the bucket, so nothing is
+        // downloaded or re-encoded here; the runtime account's aiplatform.user role
+        // covers it. Measured: ~2.9k input tokens for a 31 s recording.
+        contents: [{
+            role: 'user',
+            parts: [
+                ...(gameplayUri ? [{ fileData: { fileUri: gameplayUri, mimeType: gameplayMimeOf(gameplayUri) } }] : []),
+                { text: promptText },
+            ],
+        }],
         config: {
-            // Nudge each variant apart; index 0 stays the most predictable.
-            temperature: Math.min(1.3, 0.7 + variantIdx * 0.12),
+            // Nudge each variant apart; the first of each recording stays the most
+            // predictable.
+            temperature: Math.min(1.3, 0.7 + angleIdx * 0.12),
             systemInstruction: 'You are an expert content creator scriptwriter. '
                 + 'Adhere strictly to the duration rules.',
             // Grounding lets the script cite real details about the game instead of
             // plausible-sounding invention — worth more in a batch, where ten
             // variants would otherwise repeat the same guesses.
-            tools: (s.searchGrounding && s.gameUrl) ? [{ googleSearch: {} }] : undefined,
+            tools: brief.searchGrounding ? [{ googleSearch: {} }] : undefined,
             responseMimeType: 'application/json',
             responseSchema: {
                 type: Type.ARRAY,
@@ -2835,7 +2876,9 @@ const deliverAutopilotVariant = async (job, variantIdx) => {
         let deliverable = streamerTrack;
         if (isComposite) {
             const gameplayLocal = path.join(tmpDir, 'gameplay.src');
-            await downloadGcsToFile(job.spec.gameplayGcsUri, gameplayLocal);
+            const recording = gameplayForVariant(job, variantIdx);
+            if (!recording) throw new Error('No recording for this variant');
+            await downloadGcsToFile(recording.gcsUri, gameplayLocal);
             deliverable = path.join(tmpDir, 'final.mp4');
             await composeVideo({
                 gameplayPath: gameplayLocal,
@@ -3334,18 +3377,20 @@ apiRouter.post('/autopilot/jobs', autopilotOnly, async (req, res) => {
     });
     if (!check.ok) return res.status(check.status).json({ error: check.error });
 
-    // The gameplay object is validated for real before anything is spent: a URI
-    // that does not resolve, or is not decodable video, fails the job now.
-    if (check.spec.gameplayGcsUri) {
-        const parsed = parseOwnBucketUri(check.spec.gameplayGcsUri, GCS_BUCKET_NAME);
-        if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    // Every recording is validated for real before anything is spent: a URI that
+    // does not resolve fails the job now, naming which one.
+    const recordings = gameplaysOf(check.spec);
+    for (let i = 0; i < recordings.length; i += 1) {
+        const which = recordings.length > 1 ? `Recording ${i + 1}: ` : '';
+        const parsed = parseOwnBucketUri(recordings[i].gcsUri, GCS_BUCKET_NAME);
+        if (!parsed.ok) return res.status(400).json({ error: which + parsed.error });
         try {
             const [exists] = await getStorage().bucket(parsed.bucket).file(parsed.object).exists();
             if (!exists) {
-                return res.status(400).json({ error: 'gameplayGcsUri does not exist — finish the upload first' });
+                return res.status(400).json({ error: `${which}gameplayGcsUri does not exist — finish the upload first` });
             }
         } catch (err) {
-            return res.status(400).json({ error: 'Could not read gameplayGcsUri: ' + err.message });
+            return res.status(400).json({ error: `${which}Could not read gameplayGcsUri: ${err.message}` });
         }
     }
 
@@ -3390,8 +3435,9 @@ apiRouter.post('/autopilot/jobs', autopilotOnly, async (req, res) => {
         }
         await saveJob(job);
 
-        const plannedClips = check.spec.variantCount * 4;
-        console.log(`[Autopilot] created ${job.id} (${check.spec.variantCount} variants) for ${owner}`);
+        const plannedClips = job.variants.length * 4;
+        console.log(`[Autopilot] created ${job.id} (${job.variants.length} videos: `
+            + `${recordings.length || 1} recording(s) × ${check.spec.variantCount}) for ${owner}`);
         // Sign the candidate here rather than leaving it to the first poll: with a
         // user-supplied streamer the response is instant, so the gate would
         // otherwise sit blank for a polling interval.
@@ -3427,15 +3473,24 @@ const signJobMedia = async (job) => {
     // player needs a plain response, while a download needs
     // Content-Disposition: attachment (the `download` attribute does nothing
     // cross-origin, so without this the browser just plays the video).
+    const recordings = gameplaysOf(job.spec);
+    const multi = recordings.length > 1;
+    const slug = (t) => String(t || '').trim().replace(/\s+/g, '-').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 60);
     const outputs = await Promise.all(job.variants.map(async (v) => {
         if (!v.finalUri) return null;
-        const downloadName = `${titleBase}-v${v.idx + 1}.mp4`;
+        // With several recordings the name says which one it came from, and the
+        // variant number restarts per recording, matching how the console groups them.
+        const g = recordings[v.gameplayIdx ?? 0];
+        const base = slug(g?.gameTitle) || titleBase;
+        const downloadName = multi
+            ? `${base}-r${(v.gameplayIdx ?? 0) + 1}-v${(v.angleIdx ?? 0) + 1}.mp4`
+            : `${titleBase}-v${v.idx + 1}.mp4`;
         const [url, downloadUrl] = await Promise.all([
             signedReadUrl(v.finalUri),
             signedReadUrl(v.finalUri, { downloadAs: downloadName }),
         ]);
         if (!url) return null;
-        return { idx: v.idx, url, downloadUrl: downloadUrl || url, downloadName };
+        return { idx: v.idx, gameplayIdx: v.gameplayIdx ?? 0, url, downloadUrl: downloadUrl || url, downloadName };
     }));
 
     return {

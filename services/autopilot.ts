@@ -32,6 +32,8 @@ export interface AutopilotConfig {
 
 export interface AutopilotVariantView {
   idx: number;
+  /** Which recording this video is composited over (0 for single-recording batches). */
+  gameplayIdx?: number;
   stage: AutopilotStage;
   shots: number;
   clipsReady: number;
@@ -41,6 +43,7 @@ export interface AutopilotVariantView {
 
 export interface AutopilotOutput {
   idx: number;
+  gameplayIdx?: number;
   /** Plain signed URL, for the inline player. */
   url: string;
   /**
@@ -64,7 +67,10 @@ export interface AutopilotJobView {
   layoutType: string | null;
   targetRatio: string | null;
   awaitingApproval: boolean;
+  /** Total videos in the batch: variants per recording × recordings. */
   variantCount: number;
+  variantsPerGameplay?: number;
+  gameplays?: { idx: number; label: string; gameTitle: string }[];
   doneCount: number;
   failedCount: number;
   clipProgress: { ready: number; total: number };
@@ -87,6 +93,14 @@ export interface AutopilotJobView {
   jobId?: string;
 }
 
+export interface AutopilotGameplaySpec {
+  gcsUri: string;
+  label?: string;
+  gameTitle?: string;
+  gameUrl?: string;
+  callToAction?: string;
+}
+
 export interface AutopilotSubmitSpec {
   gameTitle: string;
   gameUrl?: string;
@@ -103,8 +117,16 @@ export interface AutopilotSubmitSpec {
   removeBackground?: boolean;
   /** Look the game up with Google Search; needs gameUrl to be set. */
   searchGrounding?: boolean;
+  /** Variants per recording. */
   variantCount: number;
+  /** Single-recording form, unchanged. */
   gameplayGcsUri?: string | null;
+  /**
+   * Several recordings, each scripted against its own footage. Fields left blank
+   * fall back to the batch's game title, store page and call to action, so a
+   * batch can mix recordings of the same game or of different games.
+   */
+  gameplays?: AutopilotGameplaySpec[];
   avatarPrompt: string;
   avatarRefGcsUri?: string | null;
   /** Supply a finished streamer image instead of generating one. */

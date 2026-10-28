@@ -44,6 +44,10 @@ import {
     failAction,
     reserveVeo,
     isActionOutstanding,
+    gameplaysOf,
+    totalVariants,
+    gameplayForVariant,
+    briefForVariant,
 } from '../lib/autopilot-job.js';
 
 const BUCKET = 'test-bucket';
@@ -825,4 +829,114 @@ test('a reserved Veo clip is not counted a second time when it lands', () => {
     job = applyClip(job, 0, 0, `gs://${BUCKET}/v.mp4`, { usedVeo: true, veoReserved: true });
     assert.strictEqual(job.counters.veoUsed, 1);
     assert.strictEqual(job.variants[0].veoClips, 1, 'the variant still records it came from Veo');
+});
+
+
+// ── several recordings in one batch ──────────────────────────────────────────
+
+const gp = (n, over = {}) => ({ gcsUri: `gs://${BUCKET}/autopilot/uploads/u${n}/gameplay.mp4`, ...over });
+const multiSpec = (over = {}) => goodSpec({ gameplayGcsUri: undefined, gameplays: [gp(1), gp(2), gp(3)], variantCount: 3, ...over });
+
+test('a single gameplayGcsUri is still accepted and means one recording', () => {
+    const r = validateJobSpec(goodSpec({ variantCount: 3 }), LIMITS);
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.spec.gameplays.length, 1);
+    assert.strictEqual(r.spec.gameplays[0].gcsUri, goodSpec().gameplayGcsUri);
+    assert.strictEqual(r.spec.gameplayGcsUri, goodSpec().gameplayGcsUri, 'legacy field kept for old readers');
+    const job = createJob({ id: 'j', ownerEmail: 'a@b.c', spec: r.spec });
+    assert.strictEqual(job.variants.length, 3);
+    assert.ok(job.variants.every((v) => v.gameplayIdx === 0));
+    assert.deepStrictEqual(job.variants.map((v) => v.angleIdx), [0, 1, 2], 'angles as before');
+});
+
+test('several recordings each get the requested variants', () => {
+    const r = validateJobSpec(multiSpec(), LIMITS);
+    assert.strictEqual(r.ok, true);
+    const job = createJob({ id: 'j', ownerEmail: 'a@b.c', spec: r.spec });
+    assert.strictEqual(job.variants.length, 9);
+    assert.deepStrictEqual(job.variants.map((v) => v.gameplayIdx), [0, 0, 0, 1, 1, 1, 2, 2, 2]);
+    assert.deepStrictEqual(job.variants.map((v) => v.angleIdx), [0, 1, 2, 0, 1, 2, 0, 1, 2],
+        'each recording gets the same spread of creative angles');
+    assert.strictEqual(gameplayForVariant(job, 4).gcsUri, gp(2).gcsUri);
+    assert.strictEqual(summarise(job).variantCount, 9);
+    assert.strictEqual(summarise(job).variantsPerGameplay, 3);
+    assert.deepStrictEqual(summarise(job).variants.map((v) => v.gameplayIdx), [0, 0, 0, 1, 1, 1, 2, 2, 2]);
+});
+
+test('the 10-video ceiling counts recordings × variants', () => {
+    assert.strictEqual(validateJobSpec(multiSpec({ variantCount: 3 }), LIMITS).ok, true, '3 × 3 = 9');
+    const over = validateJobSpec(multiSpec({ variantCount: 4 }), LIMITS);
+    assert.strictEqual(over.ok, false);
+    assert.match(over.error, /3 recordings × 4 variants = 12 videos/);
+    const many = validateJobSpec(goodSpec({ gameplayGcsUri: undefined, gameplays: Array.from({ length: 11 }, (_, i) => gp(i)), variantCount: 1 }), LIMITS);
+    assert.strictEqual(many.ok, false);
+    assert.strictEqual(validateJobSpec(goodSpec({ gameplayGcsUri: undefined, gameplays: Array.from({ length: 10 }, (_, i) => gp(i)), variantCount: 1 }), LIMITS).ok, true);
+});
+
+test('every recording must be an uploaded object, and none may repeat', () => {
+    const bad = validateJobSpec(multiSpec({ gameplays: [gp(1), { gcsUri: 'gs://other/x.mp4' }] }), LIMITS);
+    assert.match(bad.error, /Recording 2: .*application bucket/);
+    assert.match(validateJobSpec(multiSpec({ gameplays: [gp(1), gp(1)] }), LIMITS).error, /more than once/);
+});
+
+test('a recording can be of a different game, and inherits what it does not set', () => {
+    const r = validateJobSpec(multiSpec({
+        gameplays: [gp(1), gp(2, { gameTitle: 'Royal Match', gameUrl: 'https://example.com/royal', callToAction: 'Play Royal Match free' }), gp(3, { gameTitle: 'Blockfall 2' })],
+        variantCount: 1, searchGrounding: true,
+    }), LIMITS);
+    assert.strictEqual(r.ok, true);
+    const job = createJob({ id: 'j', ownerEmail: 'a@b.c', spec: r.spec });
+    const b0 = briefForVariant(job, 0); const b1 = briefForVariant(job, 1); const b2 = briefForVariant(job, 2);
+    assert.deepStrictEqual([b0.gameTitle, b0.gameUrl, b0.callToAction], ['Blockfall', 'https://example.com/blockfall', 'Play free now'], 'job brief');
+    assert.deepStrictEqual([b1.gameTitle, b1.gameUrl, b1.callToAction], ['Royal Match', 'https://example.com/royal', 'Play Royal Match free'], 'own brief');
+    assert.deepStrictEqual([b2.gameTitle, b2.gameUrl, b2.callToAction], ['Blockfall 2', 'https://example.com/blockfall', 'Play free now'], 'title overridden, rest inherited');
+    assert.strictEqual(b1.gameplayGcsUri, gp(2).gcsUri);
+    assert.ok([b0, b1, b2].every((b) => b.searchGrounding));
+    assert.deepStrictEqual(summarise(job).gameplays.map((g) => g.gameTitle), ['Blockfall', 'Royal Match', 'Blockfall 2']);
+});
+
+test('grounding is decided per recording by whether it has a store page', () => {
+    const r = validateJobSpec(multiSpec({
+        gameUrl: '', searchGrounding: true, variantCount: 1,
+        gameplays: [gp(1), gp(2, { gameUrl: 'https://example.com/other' })],
+    }), LIMITS);
+    assert.strictEqual(r.spec.searchGrounding, true, 'kept: one recording has a store page');
+    const job = createJob({ id: 'j', ownerEmail: 'a@b.c', spec: r.spec });
+    assert.strictEqual(briefForVariant(job, 0).searchGrounding, false);
+    assert.strictEqual(briefForVariant(job, 1).searchGrounding, true);
+});
+
+test('a job stored before multi-recording support reads as one recording', () => {
+    // The shape Datastore holds for every existing batch: no gameplays, no
+    // gameplayIdx or angleIdx on the variants.
+    const legacy = {
+        id: 'old', ownerEmail: 'a@b.c', status: 'running', spec: { ...goodSpec({ variantCount: 2 }), gameplays: undefined },
+        avatar: { candidates: [], approvedIdx: [] },
+        variants: [0, 1].map((idx) => ({ idx, stage: 'pending', scriptSegments: null, clipUris: [], finalUri: null, error: null, veoClips: 0 })),
+        counters: { veoUsed: 0 }, veoBudget: 4,
+    };
+    assert.strictEqual(gameplaysOf(legacy.spec).length, 1);
+    assert.strictEqual(totalVariants(legacy.spec), 2);
+    assert.strictEqual(gameplayForVariant(legacy, 1).gcsUri, legacy.spec.gameplayGcsUri);
+    assert.strictEqual(briefForVariant(legacy, 1).angleIdx, 1, 'idx stands in for the angle');
+    assert.strictEqual(summarise(legacy).variantCount, 2);
+    assert.strictEqual(summarise(legacy).variants[1].gameplayIdx, 0);
+});
+
+test('the clip ceiling and Veo budget scale with every video in the batch', () => {
+    const job = createJob({ id: 'j', ownerEmail: 'a@b.c', spec: validateJobSpec(multiSpec(), LIMITS).spec });
+    const single = createJob({ id: 's', ownerEmail: 'a@b.c', spec: validateJobSpec(goodSpec({ variantCount: 3 }), LIMITS).spec });
+    assert.ok(job.veoBudget > single.veoBudget, 'nine videos get more Veo headroom than three');
+    let j = setAvatarCandidates(job, [{ gcsUri: `gs://${BUCKET}/a.png` }]);
+    j = approveAvatar(j, [0]).job;
+    const r = applyScript(j, 0, segments(7), { maxClipsPerJob: 60 });
+    assert.strictEqual(r.ok, false, '7 shots × 9 videos = 63 clips, over 60');
+    assert.match(r.error, /9 videos/);
+});
+
+test('streamer-only needs no recording at all', () => {
+    const r = validateJobSpec(goodSpec({ layoutType: 'streamer-only', gameplayGcsUri: undefined, variantCount: 4 }), LIMITS);
+    assert.strictEqual(r.ok, true);
+    assert.deepStrictEqual(r.spec.gameplays, []);
+    assert.strictEqual(createJob({ id: 'j', ownerEmail: 'a@b.c', spec: r.spec }).variants.length, 4);
 });

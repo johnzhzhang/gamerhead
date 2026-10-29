@@ -352,7 +352,7 @@ Autopilot 让用户填一次表单、确认一次主播形象，然后一次拿�
 | `BASIC_AUTH_USERS` | 条件必需 | 固定密码模式下的账号列表，格式 `user:pass,user2:pass2` |
 | `AUTOPILOT_ENABLED` | 否 | 设为 `1` 才开放批量成片。未设置时所有 `/api/autopilot/*` 返回 404，界面不显示入口 |
 | `AUTOPILOT_MAX_BATCH` | 否 | 单批最多几个成片，默认 `10` |
-| `AUTOPILOT_CONCURRENCY` | 否 | 并发生成的片段数，默认 `4`，上限受模型每分钟配额约束 |
+| `AUTOPILOT_CONCURRENCY` | 否 | 每个实例并发生成的片段数，默认 `8`，上限受 Omni 每分钟 50 次（每项目每模型）配额约束；实测 4→5m06s、8→3m48s、12→2m54s，12 在多实例时更易触及配额 |
 | `AUTOPILOT_COMPOSE_CONCURRENCY` | 否 | 并发 ffmpeg 合成数，默认 `2`，受容器 CPU 约束 |
 | `AUTOPILOT_MAX_CLIPS_PER_JOB` | 否 | 成本熔断：单作业片段总数上限，默认 `60` |
 | `AUTOPILOT_VEO_CLIP_BUDGET` | 否 | 一批中最多多少片段可落到按量付费的 Veo，默认为总数的 25%（最低 4） |

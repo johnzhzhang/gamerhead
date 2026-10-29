@@ -454,8 +454,8 @@ configure_autopilot() {
     echo ""
     read -p "$(_t "单次批量最多几个成片 [默认: 10]: " "Maximum videos per batch [default: 10]: ")" AP_MAX_BATCH
     AP_MAX_BATCH=${AP_MAX_BATCH:-10}
-    read -p "$(_t "并发片段生成数 (受模型配额约束) [默认: 4]: " "Concurrent clip generations (bounded by model quota) [default: 4]: ")" AP_CONC
-    AP_CONC=${AP_CONC:-4}
+    read -p "$(_t "并发片段生成数 (受模型配额约束) [默认: 8]: " "Concurrent clip generations (bounded by model quota) [default: 8]: ")" AP_CONC
+    AP_CONC=${AP_CONC:-8}
     read -p "$(_t "单个作业片段总数上限 (成本熔断) [默认: 60]: " "Clip ceiling per job (cost breaker) [default: 60]: ")" AP_MAX_CLIPS
     AP_MAX_CLIPS=${AP_MAX_CLIPS:-60}
 

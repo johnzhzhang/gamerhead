@@ -822,7 +822,13 @@ const VIDEO_RESOLUTION_DEFAULT = process.env.VIDEO_RESOLUTION || '720p';
 // 404s and the existing wizard is untouched.
 const AUTOPILOT_ENABLED = /^(1|true|yes|on)$/i.test(String(process.env.AUTOPILOT_ENABLED || ''));
 const AUTOPILOT_MAX_BATCH = Math.max(1, Number(process.env.AUTOPILOT_MAX_BATCH) || 10);
-const AUTOPILOT_CONCURRENCY = Math.max(1, Number(process.env.AUTOPILOT_CONCURRENCY) || 4);
+// Clips generated in parallel, per instance. 8 measured as the best trade-off on a
+// 6-video, 23-clip batch: 4 → 5m06s, 8 → 3m48s, 12 → 2m54s. 12 is faster but sent
+// all 23 requests in one minute across two instances, against Omni's 50 requests a
+// minute per project and base model; a full 10-video batch (~45-50 clips) would
+// press that limit and spill into pay-as-you-go Veo. Beyond 8 the compositor (2
+// vCPU) becomes the bottleneck anyway.
+const AUTOPILOT_CONCURRENCY = Math.max(1, Number(process.env.AUTOPILOT_CONCURRENCY) || 8);
 const AUTOPILOT_COMPOSE_CONCURRENCY = Math.max(1, Number(process.env.AUTOPILOT_COMPOSE_CONCURRENCY) || 2);
 const AUTOPILOT_MAX_CLIPS_PER_JOB = Math.max(1, Number(process.env.AUTOPILOT_MAX_CLIPS_PER_JOB) || 60);
 // Veo is kept as the safety net (it honours personGeneration: allow_adult, the

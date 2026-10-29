@@ -153,7 +153,7 @@ gcloud beta iap web add-iam-policy-binding \
 | `VIDEO_RESOLUTION` | no | Gemini Omni output resolution: `360p` / `720p` / `1080p` / `4k`. Defaults to `720p`. |
 | `AUTOPILOT_ENABLED` | no | Set to `1` to expose Autopilot. Unset means every `/api/autopilot/*` route returns 404 and the tab is hidden. |
 | `AUTOPILOT_MAX_BATCH` | no | Videos per batch. Defaults to `10`. |
-| `AUTOPILOT_CONCURRENCY` | no | Clips generated in parallel. Defaults to `4`; bounded by the Omni per-minute quota. |
+| `AUTOPILOT_CONCURRENCY` | no | Clips generated in parallel, per instance. Defaults to `8`; bounded by the Omni quota of 50 requests a minute per project and base model. See [Measured batch times](#measured-batch-times). |
 | `AUTOPILOT_COMPOSE_CONCURRENCY` | no | Parallel ffmpeg composites. Defaults to `2`; bounded by container CPU. |
 | `AUTOPILOT_MAX_CLIPS_PER_JOB` | no | Cost breaker: refuses a job that would need more clips than this. Defaults to `60`. |
 | `AUTOPILOT_VEO_CLIP_BUDGET` | no | How many clips of one batch may fall through to pay-as-you-go Veo. Defaults to 25% of the batch, minimum 4. |
@@ -781,7 +781,7 @@ locally. Streamer-only has no composite to ride on and keeps the separate pass.
 Three videos per batch, Gossip Harbor brief, 9:16 picture-in-picture, subtitles and
 Google Search on, a supplied streamer image; time from confirming the streamer to
 the last download link. Production service, default configuration — 2 vCPU, 2 GiB,
-`min-instances=1`, `AUTOPILOT_CONCURRENCY=4`, `AUTOPILOT_COMPOSE_CONCURRENCY=2`:
+`min-instances=1`, `AUTOPILOT_CONCURRENCY=4` at the time, `AUTOPILOT_COMPOSE_CONCURRENCY=2`:
 
 | Gameplay | Before the compositor and lease fixes | Now |
 |---|---|---|
@@ -789,9 +789,25 @@ the last download link. Production service, default configuration — 2 vCPU, 2 
 | 30 s | 8m12s | **2m57s** |
 
 Script ~20 s, clips ~45 s–2 min, composite ~30 s–2 min per variant. Clip generation
-is now the longer stage. Raising `AUTOPILOT_CONCURRENCY` to 12 halved it in testing
-but did not shorten a batch while the compositor was the bottleneck; 4 vCPU halved
-the composite before it was optimised. Neither is the default.
+is now the longer stage, so the clip concurrency was measured on a heavier batch —
+a 15 s and a 30 s recording × 3, 6 videos and 22-23 clips, 9:16 with subtitles and
+Search:
+
+| `AUTOPILOT_CONCURRENCY` | Confirm → done | First video | All clips done | Peak Omni requests / min |
+|---|---|---|---|---|
+| 4 | 5m06s | 1m48s | ~4m00s | — |
+| **8 (default)** | **3m48s** | 1m28s | 2m33s | 13 |
+| 12 | 2m54s | 1m29s | 1m22s | 23 |
+
+None of the three hit a quota error, a content block or a Veo fallback. 8 is the
+default rather than 12 for two reasons. The limit is per instance and Cloud Run
+added a second one at 12, so all 23 requests landed in one minute against Omni's
+quota of 50 a minute per project and base model; a full 10-video batch (~45-50
+clips) would press that and spill into the fallback model and then pay-as-you-go
+Veo. And at 12 the clips were done at 1m22s while the last video finished at
+2m54s: the compositor (2 vCPU, two at a time) is the bottleneck beyond 8. 12 suits
+small batches on a project nobody else is generating in; 4 vCPU halved the
+composite before it was optimised. Neither is the default.
 
 ### Costs
 

@@ -940,3 +940,44 @@ test('streamer-only needs no recording at all', () => {
     assert.deepStrictEqual(r.spec.gameplays, []);
     assert.strictEqual(createJob({ id: 'j', ownerEmail: 'a@b.c', spec: r.spec }).variants.length, 4);
 });
+
+// ── a full clip queue must not hold back finished variants ───────────────────
+
+test('with clip slots full a worker is handed a composite, not the next clip', () => {
+    // The production case: variant 0's clips are done while variant 1 still has
+    // clips outstanding. Clip actions come first in the queue, so without
+    // skipTypes a worker blocked on full clip slots only ever saw clips.
+    let job = runningJob(2, 2);
+    job = applyClip(job, 0, 0, `gs://${BUCKET}/a.mp4`);
+    job = applyClip(job, 0, 1, `gs://${BUCKET}/b.mp4`);
+    assert.strictEqual(job.variants[0].stage, VARIANT_STAGE.COMPOSE);
+    assert.strictEqual(nextAction(job).type, ACTION.GENERATE_CLIP, 'default order is unchanged');
+    const a = nextAction(job, { skipTypes: new Set([ACTION.GENERATE_SCRIPT, ACTION.GENERATE_CLIP]) });
+    assert.deepStrictEqual([a.type, a.variantIdx], [ACTION.COMPOSE, 0]);
+});
+
+test('with composite slots full a worker still gets clips', () => {
+    let job = runningJob(2, 2);
+    job = applyClip(job, 0, 0, `gs://${BUCKET}/a.mp4`);
+    job = applyClip(job, 0, 1, `gs://${BUCKET}/b.mp4`);
+    const a = nextAction(job, { skipTypes: new Set([ACTION.COMPOSE]) });
+    assert.deepStrictEqual([a.type, a.variantIdx], [ACTION.GENERATE_CLIP, 1]);
+});
+
+test('skipping every available kind yields nothing, so the worker can tell "busy" from "done"', () => {
+    const job = runningJob(1, 2);
+    const all = new Set([ACTION.GENERATE_SCRIPT, ACTION.GENERATE_CLIP, ACTION.COMPOSE]);
+    assert.strictEqual(nextAction(job, { skipTypes: all }).type, ACTION.NOTHING);
+    assert.notStrictEqual(nextAction(job).type, ACTION.NOTHING, 'there is work, just no capacity');
+});
+
+test('skipped kinds never hide the approval gate or the final step', () => {
+    let gated = makeJob();
+    gated = setAvatarCandidates(gated, [{ gcsUri: `gs://${BUCKET}/a.png` }]);
+    const all = new Set([ACTION.GENERATE_SCRIPT, ACTION.GENERATE_CLIP, ACTION.COMPOSE]);
+    assert.strictEqual(nextAction(gated, { skipTypes: all }).type, ACTION.WAIT_APPROVAL);
+    let job = runningJob(1, 1);
+    job = applyClip(job, 0, 0, `gs://${BUCKET}/a.mp4`);
+    job = applyCompose(job, 0, `gs://${BUCKET}/f.mp4`);
+    assert.strictEqual(nextAction(job, { skipTypes: all }).type, ACTION.FINALISE);
+});

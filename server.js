@@ -3287,20 +3287,31 @@ const driveJob = async (jobId) => {
         const job = await loadJob(jobId);
         if (!job || isTerminal(job)) return;
 
-        // Skip whatever peers are already doing — here or on another instance — so
-        // each worker takes fresh work.
-        const action = nextAction(job, { exclude: takenActions(job) });
-        if (action.type === ACTION.WAIT_APPROVAL || action.type === ACTION.NOTHING) return;
+        // Skip whatever peers are already doing — here or on another instance — and
+        // whatever kind of work has no free slot, so a worker blocked on full clip
+        // slots composites a finished variant instead of waiting. Clips and
+        // composites have separate ceilings, so both advance side by side.
+        const exclude = takenActions(job);
+        const clipsFull = totalOf(activeClipWork) >= AUTOPILOT_CONCURRENCY;
+        const composeFull = totalOf(activeComposeWork) >= AUTOPILOT_COMPOSE_CONCURRENCY;
+        const skipTypes = new Set([
+            ...(clipsFull ? [ACTION.GENERATE_SCRIPT, ACTION.GENERATE_CLIP] : []),
+            ...(composeFull ? [ACTION.COMPOSE] : []),
+        ]);
+        const action = nextAction(job, { exclude, skipTypes });
+        if (action.type === ACTION.WAIT_APPROVAL) return;
+        if (action.type === ACTION.NOTHING) {
+            // Nothing this worker can take. If that is only because every slot is
+            // busy, wait for one; if there is genuinely nothing left, stop.
+            if (skipTypes.size && nextAction(job, { exclude }).type !== ACTION.NOTHING) {
+                await new Promise((r) => setTimeout(r, 1500));
+                continue;
+            }
+            return;
+        }
 
         const isCompose = action.type === ACTION.COMPOSE;
-        const limit = isCompose ? AUTOPILOT_COMPOSE_CONCURRENCY : AUTOPILOT_CONCURRENCY;
         const map = isCompose ? activeComposeWork : activeClipWork;
-        if (totalOf(map) >= limit) {
-            // Saturated for this kind of work; whoever frees a slot carries on.
-            // Yield rather than spin.
-            await new Promise((r) => setTimeout(r, 1500));
-            continue;
-        }
 
         bump(map, jobId, 1);
         let result = null;

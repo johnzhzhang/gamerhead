@@ -383,6 +383,25 @@ rule with this service's two origins. With two services on one bucket — exactl
 test setup — that removed the other service's origins and would have broken its
 uploads. Existing origins are now kept and this service's are added.
 
+### Upgrading to multi-recording batches and Gemini 3.8
+
+Verified from `ab35fd3` (the release before multi-recording support): deployed with
+that commit's own `deploy.sh`, Autopilot enabled on it, one batch finished and a
+second left at the confirmation gate, then upgraded with mode 2.
+
+| | Result |
+|---|---|
+| Config | identical apart from the image, including `AUTOPILOT_CONCURRENCY=4` |
+| Script model | `gemini-3.8-flash`, no variable to set |
+| Finished batch from before | still listed and readable, download links re-signed |
+| Batch left at the gate | confirmed after the upgrade and finished (2 videos) |
+| New multi-recording batch | 15 s + 30 s recordings, one with its own call to action, both delivered |
+
+The new clip-concurrency default of 8 applies only to services that never had the
+variable written. One that enabled Autopilot earlier keeps the value it was given —
+4 on older releases — because mode 2 never touches configuration. To move it to 8,
+run mode 3 → Autopilot → enable and accept the default; only that variable changes.
+
 ### The upgrade path, verified end to end
 
 Checked against a service deployed from the pre-Autopilot commit with the *old*

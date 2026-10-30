@@ -427,14 +427,16 @@ the feature — run mode 2 first. Mode 3 only changes configuration.
 
 ## Video generation models
 
-Clip generation defaults to **`gemini-omni-flash-preview`**
-([model docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-flash-preview)).
-`gemini-omni-1.1-flash-preview`
-([docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-1-1-flash))
-is also selectable. Both are served by the Interactions API — not a drop-in swap
-for Veo:
+Clips are generated with **`gemini-omni-1.1-flash-preview`**
+([docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-1-1-flash)),
+falling back to `gemini-omni-flash-preview`
+([docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-flash-preview))
+when the primary is out of quota and to Veo 3.1 as a last resort — see
+[Model chain](#model-chain). The choice is made server-side; users do not pick a
+model. Both Omni models are served by the Interactions API, which is not a drop-in
+swap for Veo:
 
-| | **Gemini Omni Flash** (default) / **Omni 1.1** | **Veo 3.1** (fallback) |
+| | **Omni 1.1** (primary) / **Omni Flash** (fallback) | **Veo 3.1** (last resort) |
 |---|---|---|
 | API | Interactions API: `POST .../locations/global/interactions` | `predictLongRunning` + `fetchPredictOperation` |
 | Region | `global` only — there is no regional host | `us-central1` only |
@@ -1177,7 +1179,7 @@ docker run -p 8080:8080 --env-file .env \
 ## Project layout
 
 ```
-server.js                  Express app: auth, projects, Vertex AI proxy, FFmpeg, GCS   (~1600 lines)
+server.js                  Express app: auth, projects, Vertex AI proxy, FFmpeg, GCS, Autopilot   (~3800 lines)
 index.tsx / index.html     Frontend entry
 App.tsx                    Shell: auth state, autosave, history, session overlay
 types.ts                   Shared types
@@ -1206,13 +1208,14 @@ utils/
 
 lib/
   compose.js               Server-side ffmpeg compositor + green-screen keying
-  autopilot.js             Upload validation, Veo budget, bucket scoping
-  autopilot-job.js         Job state machine (pure; includes the approval gate)
+  subtitles.js             Burned-in caption layout: width-based size, 1-2 lines, clear of the streamer
+  autopilot.js             Upload validation, Veo budget, bucket scoping, script length fitting
+  autopilot-job.js         Job state machine (pure; approval gate, leases, recordings)
 
 test/                      node:test suites; run with `npm test`
 
-deploy.sh                  Interactive deployment / user management  (~1150 lines)
-Dockerfile                 node:20-slim + FFmpeg
+deploy.sh                  Interactive deployment / configuration / prerequisite checks  (~1600 lines)
+Dockerfile                 node:20-slim + FFmpeg + Liberation fonts (subtitle metrics)
 DEPLOYMENT.md              Deployment guide (Chinese, more operational detail)
 ```
 

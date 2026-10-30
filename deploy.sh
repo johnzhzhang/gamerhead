@@ -1147,8 +1147,26 @@ read -p "$(_t "输入部署区域 [默认: us-central1]: " "Enter deployment reg
 REGION=${REGION:-us-central1}
 
 # 设置数据库名称 / Set database name
-read -p "$(_t "输入 Firestore 数据库名称 [默认: gamerheads]: " "Enter Firestore database name [default: gamerheads]: ")" DATASTORE_DATABASE
-DATASTORE_DATABASE=${DATASTORE_DATABASE:-gamerheads}
+#
+# 默认值优先沿用项目里已有的库。早期版本的默认名是 gamerheads，代码的默认是
+# gamerhead；直接改默认值会让在老项目上重跑模式 1 的人得到一个新的空库，历史和
+# 批次看起来就"丢了"。所以：已有 gamerheads 或 gamerhead 就用它，都没有才用
+# gamerhead（与 server.js 一致）。
+#
+# Prefer a database the project already has. Older releases defaulted to
+# "gamerheads" while the code defaults to "gamerhead"; changing the default outright
+# would hand anyone re-running mode 1 on an existing project a new, empty database.
+DEFAULT_DB="gamerhead"
+for CANDIDATE in gamerheads gamerhead; do
+  if gcloud firestore databases describe --database="$CANDIDATE" --project="$PROJECT_ID" \
+       --format="value(name)" </dev/null >/dev/null 2>&1; then
+    DEFAULT_DB="$CANDIDATE"
+    echo "   ℹ️  $(_t "项目中已有数据库 [$CANDIDATE]，默认沿用" "Found existing database [$CANDIDATE]; using it by default")"
+    break
+  fi
+done
+read -p "$(_t "输入 Firestore 数据库名称 [默认: ${DEFAULT_DB}]: " "Enter Firestore database name [default: ${DEFAULT_DB}]: ")" DATASTORE_DATABASE
+DATASTORE_DATABASE=${DATASTORE_DATABASE:-$DEFAULT_DB}
 
 echo ""
 echo "$(_t "🗄️  检查并创建 Datastore Mode 数据库 [$DATASTORE_DATABASE]..." "🗄️  Checking/creating Datastore Mode database [$DATASTORE_DATABASE]...")"
